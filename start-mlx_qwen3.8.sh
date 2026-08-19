@@ -10,7 +10,7 @@
 #     auto      (Default) waehlt anhand des Working-Sets
 #
 # Die MESSWERTE in diesem Skript stammen alle von der 48-GB-Maschine (M5 Pro,
-# mlx-vlm 0.6.13), auf der das "roomy"-Profil ueber Wochen lief. Fuer 32 GB
+# mlx-vlm 0.6.13/0.6.15), auf der das "roomy"-Profil ueber Wochen lief. Fuer 32 GB
 # uebernommen sind die hardwareunabhaengigen Erkenntnisse (MTP-SpecDec lohnt,
 # APC lohnt, KV-Fensterung halluziniert); die SPEICHER-Parameter sind gerechnet.
 #
@@ -283,7 +283,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 SITE_PACKAGES=$("$VENV_PY" -c "import mlx_vlm,os;print(os.path.dirname(os.path.dirname(mlx_vlm.__file__)))")
 MLX_VLM_VER=$("$VENV_PY" -c "import importlib.metadata as m;print(m.version('mlx-vlm'))" 2>/dev/null || echo "?")
 
-# APC-Faehigkeit: 0.6.13 bringt semantic_extra_hash() mit. Fehlt sie (Downgrade),
+# APC-Faehigkeit: ab 0.6.13 gibt es semantic_extra_hash(). Fehlt sie (Downgrade),
 # trifft der Prefix-Cache nur bei byte-identischen Prompts — kostet aber trotzdem
 # Speicher, und Speicher ist hier die knappe Ressource.
 if [[ "$ENABLE_APC" == "1" ]] && ! grep -q "def semantic_extra_hash" "$SITE_PACKAGES/mlx_vlm/apc.py" 2>/dev/null; then

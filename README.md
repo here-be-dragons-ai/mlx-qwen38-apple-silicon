@@ -73,10 +73,12 @@ Pfade sind über Env steuerbar: `MLX_HOME` (Default `~/src/mlx`), `MLX_MODELS`,
 `PYTHON_VERSION`.
 
 **Gepinnter, verifizierter Stand:** `mlx 0.32.0`, `mlx-lm 0.31.3`,
-**`mlx-vlm 0.6.13`**, `transformers 5.15.0`, `numpy 2.5.2`,
+**`mlx-vlm 0.6.15`**, `transformers 5.15.0`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 `mlx-vlm >= 0.6.13` ist Pflicht — erst dort ist Prefix-Caching upstream korrekt
-(`semantic_extra_hash()`); davor trifft der Cache nur bei byte-identischen Prompts.
+(`semantic_extra_hash()`); davor trifft der Cache nur bei byte-identischen
+Prompts. Ab `0.6.14` ist zusätzlich der Kurzprompt-Fix (PR #1901) enthalten,
+der vorher als lokaler Patch nötig war.
 
 ### Wired-Limit persistent machen
 
@@ -316,6 +318,39 @@ Stiller Qualitätsverlust ist schlimmer als ein sauberer kleiner Kontext.
 
 ---
 
+## DFlash2 — Stand 2026-08-19: nicht nutzbar
+
+[DFlash 2](https://inco.ai/blog/dflash2/) ist ein Block-Diffusion-Drafter mit
+2,7–3,4× Durchsatz auf genau diesem Modell. Für Qwen3.8-27B gibt es einen
+fertigen Drafter (`z-lab/Qwen3.8-27B-DFlash2`, 3,58 GiB bf16). Trotzdem läuft er
+hier **nicht**:
+
+- mlx-vlm hat zwar die Drafter-Klasse `speculative/drafters/qwen3_dflash` und
+  das Zielmodell liefert die nötigen Hidden States (`capture_layer_ids`) — aber
+  implementiert ist nur **DFlash v1**. Die beiden v2-Neuerungen (Kandidaten-Pfad-
+  Selektor, Two-Tap-Dynamic-Convolutions) fehlen in `0.6.13`, `0.6.15` **und**
+  auf upstream `main`; der Config-Parser ignoriert `selector_rank`,
+  `selector_top_k`, `conv_group_size`, `conv_kernel_size`.
+- Ein Versuch endet im **harten Startabbruch**: `load_model()` lädt mit
+  `strict=True`, die Selector-/Conv-Tensoren sind unerwartete Keys.
+- Eine brauchbare MLX-Konversion existiert nicht (der einzige Treffer hat keine
+  `config.json`).
+
+Ob sich das geändert hat, prüft man so:
+
+```sh
+curl -sL https://raw.githubusercontent.com/Blaizzy/mlx-vlm/main/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py | grep -c selector
+# > 0  →  DFlash2 ist da, Drafter nach MLX konvertieren und A/B gegen MTP messen
+```
+
+**Und selbst dann lohnt erst eine Messung:** die 2,7–3,4× gelten gegen *reines
+autoregressives* Decoding. Mit dem MTP-Drafter (0,23 GiB) liegen wir gemessen
+schon bei +58…132 % und 90–93 % Acceptance auf Tool-Calls/JSON. Der DFlash2-
+Drafter kostet in 4bit ~1 GiB — auf `lean`/`balanced` ist das direkt weniger
+Kontext.
+
+---
+
 ## Diagnose
 
 ```sh
@@ -338,6 +373,7 @@ ps -o rss=,command= -p "$(pgrep -f mlx_vlm.server)" | awk '{printf "%.1f GiB\n",
 |---|---|
 | `cached_tokens=1` bei großen Prompts | Patch 0002 fehlt |
 | `cached_tokens=0` in Turn 2 | mlx-vlm < 0.6.13, oder Snapshot verdrängt (`APC_ENTRIES`, Patch 0010) |
+| `cached_tokens=1` bei großen Prompts | mlx-vlm < 0.6.14 (Kurzprompt-Bug, PR #1901) |
 | HTTP 401 / HF-Download beim Request | Modellname ≠ Alias-Symlink |
 | HTTP 500 bei jedem Request | `reasoning_effort` außerhalb `low\|medium\|xhigh` |
 | `[METAL] Insufficient Memory` | Kontext über Budget → `context_length` senken oder `KV_BITS=8` |
@@ -382,7 +418,7 @@ Zwei Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
 ## Herkunft der Zahlen
 
 Alle mit „gemessen" markierten Werte stammen von einer **M5 Pro / 48 GB**
-Maschine (mlx-vlm 0.6.13, Qwen3.8-27B-4bit, `temperature=0`). Übernommen sind
+Maschine (mlx-vlm 0.6.13/0.6.15, Qwen3.8-27B-4bit, `temperature=0`). Übernommen sind
 nur die hardwareunabhängigen Erkenntnisse:
 
 - MTP-Speculative-Decoding lohnt (Decode +58…132 %, Acceptance 42 % Prosa /

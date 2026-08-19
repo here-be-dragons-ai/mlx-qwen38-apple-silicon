@@ -14,24 +14,6 @@
 #
 # ── ENTHALTENE PATCHES ───────────────────────────────────────────────────────
 #
-# 0002-pr1901-apc-short-prompt.patch   (Upstream-PR #1901, GEMERGED 2026-08-15)
-#   "Stop a short first prompt from disabling prefix caching" — gemerged DREI
-#   TAGE NACH dem 0.6.13-Release, also nicht im PyPI-Stand von 0.6.13.
-#   Bug: ein Prompt kuerzer als APC_EXACT_PREFIX_GUARD_TOKENS (16) macht die
-#   Checkpoint-Laenge negativ; auf 1 geklammert wird ein EIN-TOKEN-Snapshot
-#   gespeichert, der auf den Anfang jedes spaeteren Prompts passt. Da ein neuer
-#   Checkpoint nur entsteht, wenn nichts wiederverwendet wurde, speichert dieser
-#   Tenant nie wieder einen brauchbaren. Signatur im Log: cached_tokens=1 bei
-#   grossen Prompts.
-#   GEMESSEN (M5 Pro, 48 GB): 13 Requests mit cached_tokens==1 = 1055 s
-#   verlorene Prefill-Zeit, ausgeloest von nur 6 kurzen Prompts. Nach dem Patch:
-#   kurzer Prompt, dann 35881-Token-Prompt zweimal → Lauf 2 cached=35865,
-#   Prefill 318 ms (vorher cached=1, 94 s).
-#   Auf einer 32-GB-/M5-Basis-Maschine wiegt das MEHR, nicht weniger: der
-#   Prefill ist dort rechenlimitiert und langsamer.
-#   ENTFERNEN, sobald mlx-vlm > 0.6.13 installiert ist — dann meldet dieses
-#   Skript "KONFLIKT", was hier "upstream schon drin" heisst.
-#
 # 0010-qwen38-apc-single-snapshot.patch   (LOKAL, kein Upstream-PR)
 #   Unterdrueckt den redundanten Voll-Snapshot pro Request. mlx-vlm legt sonst
 #   ZWEI fast identische Snapshots ab: den Checkpoint bei len-16 (Guard) und den
@@ -44,6 +26,24 @@
 #   Wird ueber QWEN38_APC_SINGLE_SNAPSHOT=1 aktiviert (setzt das Start-Skript).
 #   OHNE die Env-Variable ist der Patch inert = exaktes Upstream-Verhalten;
 #   das ist der Rollback-Pfad.
+#
+# ── ERLEDIGT / OBSOLET ───────────────────────────────────────────────────────
+#
+# 0002-pr1901-apc-short-prompt.patch   ENTFERNT 2026-08-19 beim Upgrade auf
+#   mlx-vlm 0.6.15. Der Upstream-PR #1901 wurde am 2026-08-15 gemerged, also
+#   drei Tage NACH dem 0.6.13-Release — deshalb war er in 0.6.13 noch noetig
+#   und ist ab 0.6.14 enthalten. Gegengeprueft per Reverse-Dry-Run gegen den
+#   0.6.15-Wheel: beide Hunks (apc.py, server/app.py) sind drin.
+#   Was er behob: ein Prompt kuerzer als APC_EXACT_PREFIX_GUARD_TOKENS (16)
+#   machte die Checkpoint-Laenge negativ; auf 1 geklammert wurde ein
+#   EIN-TOKEN-Snapshot gespeichert, der auf den Anfang jedes spaeteren Prompts
+#   passte. Da ein neuer Checkpoint nur entsteht, wenn nichts wiederverwendet
+#   wurde, speicherte dieser Tenant nie wieder einen brauchbaren.
+#   Signatur im Log: cached_tokens=1 bei grossen Prompts.
+#   GEMESSEN (M5 Pro, 48 GB): 13 Requests mit cached_tokens==1 = 1055 s
+#   verlorene Prefill-Zeit, ausgeloest von nur 6 kurzen Prompts.
+#   WER AUF 0.6.13 ZURUECKGEHT, braucht ihn wieder — er liegt in der
+#   Git-Historie dieses Repos.
 #
 # NICHT ENTHALTEN — bewusst:
 #   Der KV-Window-Patch (QWEN38_KV_WINDOW, Gleitfenster auf den 16 Full-Attn-
@@ -107,9 +107,9 @@ for p in "${patches[@]}"; do
 
   if ! patch -p1 --dry-run -d "$SITE_PACKAGES" < "$p" &>/dev/null; then
     echo "  ⚠️  KONFLIKT: $name laesst sich nicht anwenden."
-    echo "      Bei 0002 heisst das in der Regel: upstream gemerged (mlx-vlm > 0.6.13)"
-    echo "      → Datei aus $PATCH_DIR entfernen."
-    echo "      Bei 0010 heisst es: ar.py hat sich geaendert → Patch neu schreiben."
+    echo "      Heisst in der Regel: ar.py hat sich upstream geaendert."
+    echo "      Pruefen, ob der Effekt (Einzel-Snapshot) inzwischen upstream ist —"
+    echo "      wenn ja, Datei aus $PATCH_DIR entfernen, sonst Patch neu schreiben."
     continue
   fi
 
