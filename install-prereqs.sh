@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # ─────────────────────────────────────────────────────────────────────────────
-# Prerequisites fuer Qwen3.8-27B auf MLX  –  Apple M5 (Basis) · 32 GB
+# Prerequisites fuer Qwen3.8-27B auf MLX  –  Apple Silicon ab 32 GB
 #
 # Richtet von einem frischen macOS aus alles ein, was start-mlx_qwen3.8.sh
 # braucht: Xcode CLT → uv → venv (Python 3.12) → mlx-vlm + Patches → Modell +
@@ -16,7 +16,7 @@
 # Env-Overrides:  MLX_HOME (Default ~/src/mlx), MLX_MODELS, PYTHON_VERSION
 #
 # WAS DAS SKRIPT NICHT TUT: sudo. Das Wired-Limit (iogpu.wired_limit_mb) ist der
-# wichtigste Tuning-Schritt auf 32 GB, aendert aber Systemzustand — die noetigen
+# wichtigste Tuning-Schritt, aendert aber Systemzustand — die noetigen
 # Befehle werden am Ende nur AUSGEGEBEN, s. auch README.md.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -72,7 +72,7 @@ warn() { echo "  ⚠️  $*" >&2 }
 die()  { echo "  ✗ $*" >&2; exit 1 }
 
 echo "──────────────────────────────────────────────────────────────"
-echo "  Qwen3.8-27B / MLX  —  Setup fuer Apple Silicon, 32 GB"
+echo "  Qwen3.8-27B / MLX  —  Setup fuer Apple Silicon (32 / 48 GB)"
 echo "  Ziel-venv : $VENV_DIR"
 echo "  Modelle   : $MLX_MODELS"
 echo "──────────────────────────────────────────────────────────────"
@@ -85,11 +85,23 @@ echo "[1/8] Hardware & macOS"
 CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "?")
 RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 ok "$CHIP · ${RAM_GB} GB RAM · macOS $(sw_vers -productVersion)"
+# Empfehlung fuers Wired-Limit: so viel wie moeglich, aber 5-6 GB fuer macOS
+# lassen. Die beiden Stufen entsprechen den Profilen balanced (32 GB) und
+# roomy (48 GB) im Start-Skript.
+if (( RAM_GB >= 44 )); then
+  WIRED_SUGGEST=45056; PROFILE_HINT="roomy"
+elif (( RAM_GB >= 32 )); then
+  WIRED_SUGGEST=26624; PROFILE_HINT="balanced"
+else
+  WIRED_SUGGEST=$(( (RAM_GB - 6) * 1024 )); PROFILE_HINT="lean"
+fi
 if (( RAM_GB < 32 )); then
   warn "Nur ${RAM_GB} GB RAM. Die Gewichte allein belegen 15,2 GiB — unter 32 GB"
   warn "bleibt kein brauchbarer Kontext. Kleineres Modell/Quant waehlen."
 elif (( RAM_GB == 32 )); then
-  info "32 GB: knapp, aber tragfaehig. Kontext-Planung s. README.md."
+  info "32 GB: knapp, aber tragfaehig — Profil '$PROFILE_HINT'. S. README.md."
+else
+  info "Profil '$PROFILE_HINT' passt zu dieser Maschine (PROFILE=auto waehlt es selbst)."
 fi
 FREE_GB=$(( $(df -k "$HOME" | awk 'NR==2{print $4}') / 1048576 ))
 info "Freier Plattenplatz: ${FREE_GB} GB (gebraucht: ~${NEEDED_GB} GB fuer Modell+Drafter,"
@@ -237,8 +249,8 @@ echo
 echo "──────────────────────────────────────────────────────────────"
 echo "  Fertig. Naechste Schritte:"
 echo
-echo "  1) Wired-Limit anheben (WICHTIGSTER Schritt auf 32 GB, braucht sudo):"
-echo "       sudo sysctl -w iogpu.wired_limit_mb=26624"
+echo "  1) Wired-Limit anheben (WICHTIGSTER Schritt, braucht sudo):"
+echo "       sudo sysctl -w iogpu.wired_limit_mb=$WIRED_SUGGEST"
 echo "     Persistent (ueberlebt Neustarts):"
 echo "       sudo cp $BUNDLE_DIR/com.local.iogpu-wired-limit.plist /Library/LaunchDaemons/"
 echo "       sudo chown root:wheel /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist"
