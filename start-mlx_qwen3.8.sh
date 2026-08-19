@@ -75,6 +75,34 @@ PORT="${PORT:-8888}"
 # RELATIVEN Namen vorladen (cd auf MODELS_ROOT am Ende des Skripts).
 MODEL_ALIAS="${MODEL_ALIAS:-Qwen3.8-27B-local}"
 
+# ── Profile ───────────────────────────────────────────────────────────────────
+# Setzt nur DEFAULTS — jede einzeln gesetzte Env-Variable gewinnt weiterhin,
+# z. B.  PROFILE=lean APC_ENTRIES=2 ./start-mlx_qwen3.8.sh
+#
+#   default  Ausgewogen. Peak ~25 GiB bei 43k-Spitzenprompt → braucht
+#            iogpu.wired_limit_mb=26624.
+#   lean     Minimaler RAM. Peak ~18,8 GiB bei 29k-Spitzenprompt → passt unter
+#            das macOS-Default-Working-Set von 21,33 GiB, also OHNE sudo.
+#            Gerechnete Ersparnis gegenueber default (43k-Prompt):
+#              APC_ENTRIES 2→1 (3→2 Kopien)  -2,8 GiB   billigster Hebel: der
+#                 SSD-Tier bleibt, ein verdraengter Snapshot ist in 350 ms
+#                 zurueck statt in 90 s Vollprefill
+#              KV_BITS=8 (64→32 KiB/Token)   -4,2 GiB   Durchsatzkosten auf dem
+#                 MLX-Pfad NICHT gemessen — bei llama.cpp kostete KV-Quant an
+#                 vergleichbarer Stelle bis 8x Prefill. Vor Dauerbetrieb A/B.
+#              PREFILL_STEP 1024→512         ~-0,2 GiB  transienter Peak
+#            Dazu gehoert clientseitig context_length 32768 (s. Banner).
+PROFILE="${PROFILE:-default}"
+case "$PROFILE" in
+  default) _APC_ENTRIES=2; _KV_BITS="";  _PREFILL=1024; _VISION=4; _CTX_HINT=49152 ;;
+  # VISION_CACHE hier 1 und NICHT 0: VisionFeatureCache.put() prueft
+  # `len(cache) >= max_size` und ruft dann popitem() — bei max_size=0 also auf
+  # ein leeres OrderedDict, was den ersten Bild-Request mit KeyError killt.
+  # 1 ist das echte Minimum (vision_cache.py:60ff).
+  lean)    _APC_ENTRIES=1; _KV_BITS="8"; _PREFILL=512;  _VISION=1; _CTX_HINT=32768 ;;
+  *) echo "ERROR: unbekanntes PROFILE='$PROFILE' (gueltig: default | lean)" >&2; exit 1 ;;
+esac
+
 # ── Speculative Decoding (MTP) ────────────────────────────────────────────────
 # DEFAULT AN. Auf der 48-GB-Maschine am 2026-08-17 durchgemessen:
 #   Durchsatz : Decode 16,9-18,3 → 26,9-41,5 t/s (+58..+132 %)
@@ -97,7 +125,7 @@ ENABLE_APC="${ENABLE_APC:-1}"
 # Prompt, und dieses Modell braucht 64 KiB/Token. Auf 32 GB ist jeder weitere
 # Eintrag direkt weniger Kontext — s. Budgetrechnung im Banner.
 # Zusammen mit APC_SINGLE=1 (unten) heisst 2 == zwei Konversationen warm.
-APC_ENTRIES="${APC_ENTRIES:-2}"
+APC_ENTRIES="${APC_ENTRIES:-$_APC_ENTRIES}"
 # SSD-Tier: ueberlebt Serverneustarts, gemessen Faktor 256 auf einen kalten
 # 36k-Prefill. Auf dieser Maschine noch wertvoller, weil der Prefill langsamer
 # ist. Preis: ~2,3 GB Schreiblast pro 36k-Konversation → Deckel unten.
@@ -119,13 +147,13 @@ APC_SINGLE="${APC_SINGLE:-1}"
 # rechen- und nicht chunklimitiert ist (2048 vs 4096: 94,6 s vs 94,2 s auf
 # denselben Prompt) — die Halbierung kostet also fast nichts und kauft
 # Kopffreiheit. Bei viel Luft im Budget: PREFILL_STEP=2048 ./start-...
-PREFILL_STEP="${PREFILL_STEP:-1024}"
+PREFILL_STEP="${PREFILL_STEP:-$_PREFILL}"
 # 1 Slot. Auf einem dichten Modell wuerde Batch 2 im Aggregat fast linear
 # skalieren (gemeinsamer Gewichts-Read), aber jede zusaetzliche Sequenz kostet
 # einen kompletten KV-Satz + GDN-State — auf 32 GB nicht drin.
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 # 20 → 4: Vision-Features sind gecachte Bild-Embeddings, hier reine Speicherlast.
-VISION_CACHE="${VISION_CACHE:-4}"
+VISION_CACHE="${VISION_CACHE:-$_VISION}"
 LOG_PROGRESS="${LOG_PROGRESS:-10}"
 
 # ── KV-Quantisierung ──────────────────────────────────────────────────────────
@@ -141,7 +169,11 @@ LOG_PROGRESS="${LOG_PROGRESS:-10}"
 # messen, dann einschalten:
 #     A/B mit gleichem Prompt, Decode-t/s aus dem Log vergleichen.
 # Wenn der Kontext ohnehin <= 40k bleibt: aus lassen, nichts gewonnen.
-KV_BITS="${KV_BITS:-}"
+# ${VAR-...} ohne Doppelpunkt: nur wenn KV_BITS UNGESETZT ist, greift das Profil.
+# Leer ist hier ein gueltiger Wert (= f16), deshalb muss
+#   PROFILE=lean KV_BITS= ./start-mlx_qwen3.8.sh
+# die Quantisierung wieder abschalten koennen.
+KV_BITS="${KV_BITS-$_KV_BITS}"
 KV_SCHEME="${KV_SCHEME:-}"
 QUANT_KV_START="${QUANT_KV_START:-8192}"
 
@@ -297,6 +329,7 @@ KV_KIB="${REST%%|*}";  DEV_NAME="${REST#*|}"
 
 echo "──────────────────────────────────────────────────────────────"
 echo "  mlx-vlm $MLX_VLM_VER  |  Qwen3.8 27B (DENSE, MLX 4bit)  |  $DEV_NAME"
+echo "  Profil   :  $PROFILE  $([[ "$PROFILE" == "lean" ]] && echo "(minimaler RAM, empf. context_length $_CTX_HINT)" || echo "(ausgewogen, empf. context_length $_CTX_HINT)")"
 echo "  Modell   :  $MODEL_DIR"
 echo "  API-Name :  $MODEL_ALIAS  (Symlink; MUSS zum Request-Modellnamen passen)"
 echo "  Port     :  $BIND_HOST:$PORT"
