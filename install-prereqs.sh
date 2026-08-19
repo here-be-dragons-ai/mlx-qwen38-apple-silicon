@@ -43,15 +43,16 @@ for a in "$@"; do
 done
 
 # Gepinnter, auf einem M5 Pro / macOS 26 als funktionierend VERIFIZIERTER Stand
-# (2026-08-19). mlx-vlm 0.6.13 ist die Version, gegen die die Patches in
-# patches/ geschrieben sind und in der APC upstream korrekt ist (>= 0.6.13).
+# (2026-08-19). mlx-vlm 0.6.15 ist die Version, gegen die der Patch in
+# patches/ geschrieben ist. APC ist ab 0.6.13 upstream korrekt; der
+# Kurzprompt-Fix (PR #1901) ist ab 0.6.14 enthalten.
 # Mit --latest bekommt man Neueres; dann kann apply-patches.sh "KONFLIKT" melden
 # (heisst: upstream gemerged → Patch loeschen) und die Messwerte im Start-Skript
 # gelten nicht mehr unbesehen.
 PINS=(
   "mlx==0.32.0"
   "mlx-lm==0.31.3"
-  "mlx-vlm==0.6.13"
+  "mlx-vlm==0.6.15"
   "transformers==5.15.0"
   "numpy==2.5.2"
   "huggingface-hub==1.27.0"
