@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Setzt beim Boot das GPU-Wired-Limit auf 26 GiB (26624 MB).
+  Gedacht fuer eine 32-GB-Maschine: macOS defaultet dort auf 2/3 = 21,33 GiB,
+  was nach den 15,2 GiB Modellgewichten nur ~4,6 GiB fuer KV-Cache laesst.
+
+  26624 laesst ~5,5 GB fuer macOS + Apps. NICHT hoeher setzen, wenn nebenher
+  Browser/IDE laufen — zu wenig Rest-RAM tauscht Metal-OOM gegen Beachball
+  bzw. Kernel-Panic. Konservativ: 24576. Nur-Inferenz-Maschine: 28672.
+
+  Installation (braucht sudo, aendert Systemzustand):
+    sudo cp com.local.iogpu-wired-limit.plist /Library/LaunchDaemons/
+    sudo chown root:wheel /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+    sudo chmod 644       /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+    sudo launchctl load -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+
+  Pruefen:      sysctl iogpu.wired_limit_mb
+  Entfernen:    sudo launchctl unload -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+                sudo rm /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+  Einmalig ohne Daemon:  sudo sysctl -w iogpu.wired_limit_mb=26624
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.iogpu-wired-limit</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/sbin/sysctl</string>
+        <string>-w</string>
+        <string>iogpu.wired_limit_mb=26624</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
