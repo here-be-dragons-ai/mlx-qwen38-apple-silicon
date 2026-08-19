@@ -1,18 +1,28 @@
-# Qwen3.8-27B (MLX 4bit) auf Apple Silicon mit 32 GB
+# Qwen3.8-27B (MLX 4bit) auf Apple Silicon
 
 Setup- und Start-Skripte, um **Qwen3.8-27B** als lokalen, OpenAI-kompatiblen
-Server (`mlx-vlm`) auf einem Mac mit **32 GB Unified Memory** zu betreiben —
-inklusive der Speicher-Dimensionierung, die auf dieser Größe über
-„läuft brauchbar" und „stirbt an `[METAL] Insufficient Memory`" entscheidet.
+Server (`mlx-vlm`) auf einem Apple-Silicon-Mac zu betreiben — inklusive der
+Speicher-Dimensionierung, die über „läuft brauchbar" und „stirbt an
+`[METAL] Insufficient Memory`" entscheidet.
 
-**Kurzantwort auf die Ausgangsfrage: ja, 27B dense läuft auf 32 GB.** Die
-Gewichte (14,95 GiB) passen sogar in den macOS-Default. Das Nadelöhr ist der
-KV-Cache mit **64 KiB pro Token** — der bestimmt, wieviel Kontext übrig bleibt
-und damit, ob das Ding als Agent-Backend taugt.
+Die Gewichte (14,95 GiB) sind dabei **nicht** das Problem. Das Nadelöhr ist der
+KV-Cache mit **64 KiB pro Token**, der pro Kopie anfällt (laufende Sequenz +
+jeder Prefix-Cache-Snapshot). Er bestimmt, wieviel Kontext übrig bleibt — und
+damit, ob das Ding als Agent-Backend taugt.
 
-Getestet auf macOS 26, Apple Silicon. Die Defaults sind auf 32 GB getunt; das
-Start-Skript rechnet das Speicherbudget aber zur Laufzeit aus den echten Werten
-der Maschine aus und funktioniert deshalb auf jedem Apple-Silicon-Mac.
+Drei Profile decken die üblichen Maschinen ab; `PROFILE=auto` (Default) wählt
+selbst:
+
+| Profil | Zielmaschine | Peak-RAM | `context_length` |
+|---|---|---|---|
+| `lean` | 32 GB **ohne** `sudo` | ~18,8 GiB | 32768 |
+| `balanced` | 32 GB mit `wired_limit 26624` | ~25,0 GiB | 49152 |
+| `roomy` | 48 GB mit `wired_limit 45056` | ~41 GiB | 98304 |
+
+Getestet auf macOS 26. `roomy` ist das ursprüngliche, über Wochen produktiv
+gefahrene M5-Pro-Setup; die 32-GB-Profile sind daraus gerechnet. Das
+Start-Skript ermittelt das Speicherbudget zur Laufzeit aus den echten Werten
+der Maschine und warnt, wenn die Client-Konfiguration darüber liegt.
 
 ---
 
@@ -32,18 +42,22 @@ Alles Weitere (uv, venv, Python 3.12, mlx-vlm) installiert `install-prereqs.sh`.
 ## Installation
 
 ```sh
-git clone https://github.com/here-be-dragons-ai/mlx-qwen38-m5-32gb.git
-cd mlx-qwen38-m5-32gb
+git clone https://github.com/here-be-dragons-ai/mlx-qwen38-apple-silicon.git
+cd mlx-qwen38-apple-silicon
 
 # 1. Software + Modellgewichte (idempotent, Downloads sind resume-fähig)
 ./install-prereqs.sh
 
-# 2. GPU-Wired-Limit anheben — der wichtigste Schritt auf 32 GB (s.u.)
-sudo sysctl -w iogpu.wired_limit_mb=26624
+# 2. GPU-Wired-Limit anheben — der wichtigste Schritt (s.u.)
+sudo sysctl -w iogpu.wired_limit_mb=26624    # 32 GB;  48 GB → 45056
 
 # 3. Server starten (127.0.0.1:8888)
 ./start-mlx_qwen3.8.sh
 ```
+
+Schritt 2 ist auf 32 GB der Unterschied zwischen ~23k und ~48k nutzbarem
+Kontext. Ohne ihn läuft das Setup trotzdem — `PROFILE=auto` erkennt das und
+schaltet auf `lean`.
 
 `install-prereqs.sh` legt an bzw. prüft: Xcode CLT → [uv](https://astral.sh/uv)
 → venv unter `~/src/mlx/.venv` (Python 3.12) → mlx-vlm + Abhängigkeiten →
@@ -79,28 +93,43 @@ sudo launchctl load -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
 ## Betrieb
 
 ```sh
-./start-mlx_qwen3.8.sh                        # Profil default
+./start-mlx_qwen3.8.sh                        # PROFILE=auto
 PROFILE=lean ./start-mlx_qwen3.8.sh           # minimaler RAM, läuft ohne sudo
+PROFILE=roomy ./start-mlx_qwen3.8.sh          # 48-GB-Setup
 PORT=8899 ./start-mlx_qwen3.8.sh              # Laborinstanz
 ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh   # ohne Drafter
 ```
 
 ### Profile
 
-| | `default` | `lean` |
-|---|---|---|
-| `APC_ENTRIES` | 2 | 1 |
-| `KV_BITS` | — (f16) | 8 (ab 8k Token) |
-| `PREFILL_STEP` | 1024 | 512 |
-| `VISION_CACHE` | 4 | 1 |
-| **Peak-RAM** | ~25,0 GiB @ 43k Prompt | **~18,8 GiB** @ 29k Prompt |
-| braucht `wired_limit` | 26624 MB | — **läuft im macOS-Default** |
-| passendes `context_length` | 49152 | 32768 |
+| | `lean` | `balanced` | `roomy` |
+|---|---|---|---|
+| Zielmaschine | 32 GB ohne sudo | 32 GB, `wired_limit 26624` | 48 GB, `wired_limit 45056` |
+| `APC_ENTRIES` | 1 | 2 | 4 |
+| `KV_BITS` | 8 (ab 8k Token) | — (f16) | — (f16) |
+| `PREFILL_STEP` | 512 | 1024 | 2048 |
+| `VISION_CACHE` | 1 | 4 | 20 |
+| `APC_DISK_MAX_GB` | 40 | 40 | 60 |
+| **Peak-RAM** | **~18,8 GiB** @ 29k | ~25,0 GiB @ 43k | ~41 GiB @ 90k |
+| `context_length` | 32768 | 49152 | 98304 |
 
-Das Profil setzt nur *Defaults* — einzelne Env-Variablen gewinnen weiterhin,
-z. B. `PROFILE=lean APC_ENTRIES=2 …` oder `PROFILE=lean KV_BITS=` (zurück auf
-f16). Der `lean`-Preis: nur eine Konversation im RAM-Cache und ungemessene
-KV-Quantisierung (s. „Wenn es zu eng wird").
+**`PROFILE=auto`** (Default) entscheidet anhand des Metal-Working-Sets:
+≥ 30 GiB → `roomy`, ≥ 24 GiB → `balanced`, sonst `lean`. Der Working-Set wird
+dafür aus `iogpu.wired_limit_mb` bzw. dem macOS-Default (2/3 des RAM bei
+≤ 36 GB, sonst 3/4) geschätzt — die exakte Zahl aus Metal steht danach im
+Banner. `default` bleibt als Alias für `balanced` erhalten.
+
+Ein Profil setzt nur *Defaults* — einzelne Env-Variablen gewinnen weiterhin,
+z. B. `PROFILE=roomy APC_ENTRIES=2 …` oder `PROFILE=lean KV_BITS=` (zurück auf
+f16).
+
+> **Warum `roomy` 98304 empfiehlt, obwohl das 48-GB-Setup produktiv mit 131072
+> lief:** die Budgetrechnung ist ein Worst Case — alle vier Snapshots
+> gleichzeitig auf voller Promptlänge. Bei 44 GiB Working-Set und 5 Kopien sind
+> das ~87k Token. Dass 131072 in der Praxis trug, liegt daran, dass die
+> Snapshots real nie alle gleichzeitig am Anschlag stehen; es ist Glück, keine
+> Garantie. Wer 131072 fahren will, nimmt `APC_ENTRIES=2` dazu (3 Kopien →
+> Budget ~145k).
 
 Beim Start druckt das Skript das errechnete Speicherbudget dieser Maschine:
 
@@ -117,11 +146,11 @@ Wichtigste Env-Schalter (alle mit Begründung im Skriptkopf dokumentiert):
 
 | Variable | Default | Wirkung |
 |---|---|---|
-| `PROFILE` | `default` | `lean` = minimaler RAM (Tabelle oben) |
+| `PROFILE` | `auto` | `lean` / `balanced` / `roomy` (Tabelle oben) |
 | `KV_BITS` | profilabhängig | `8` halbiert 64 → 32 KiB/Token, verdoppelt den Kontext |
 | `APC_ENTRIES` | profilabhängig | Prefix-Cache-Snapshots = warm gehaltene Konversationen |
 | `ENABLE_SPEC_DECODE` | `1` | MTP-Drafter, +58…132 % Decode |
-| `PREFILL_STEP` | `1024` | Prefill-Chunk = transienter Aktivierungs-Peak |
+| `PREFILL_STEP` | profilabhängig | Prefill-Chunk = transienter Aktivierungs-Peak |
 | `BIND_HOST` / `PORT` | `127.0.0.1` / `8888` | Bind-Adresse |
 | `MODEL_ALIAS` | `Qwen3.8-27B-local` | **muss** zum Modellnamen im Request passen |
 
@@ -208,7 +237,7 @@ model:
   base_url: http://localhost:8888/v1
   api_key: sk-local
   api_mode: chat_completions
-  context_length: 49152            # ← 32-GB-Wert
+  context_length: 49152            # ← Profil balanced (lean 32768, roomy 98304)
   max_tokens: 8192                 # NICHT erhöhen: Kompaktierungs-Trigger ist
   supports_vision: true            # (context_length − max_tokens) × threshold
   extra_body:
@@ -343,7 +372,7 @@ Zwei Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
 |---|---|
 | `install-prereqs.sh` | Komplettes Setup ab frischem macOS, idempotent |
 | `LICENSE` | MIT No Attribution (SPDX `MIT-0`) |
-| `start-mlx_qwen3.8.sh` | Server-Start, 32-GB-Defaults, Live-Budgetrechnung |
+| `start-mlx_qwen3.8.sh` | Server-Start, Profile lean/balanced/roomy, Live-Budgetrechnung |
 | `download-mlx-model.sh` | Resume-fähiger HuggingFace-Downloader (curl, mit Größenprüfung) |
 | `patches/apply-patches.sh` | Patches anwenden / prüfen / zurücknehmen |
 | `com.local.iogpu-wired-limit.plist` | LaunchDaemon für das Wired-Limit |

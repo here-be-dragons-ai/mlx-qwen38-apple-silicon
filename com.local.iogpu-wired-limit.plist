@@ -9,6 +9,12 @@
   Browser/IDE laufen — zu wenig Rest-RAM tauscht Metal-OOM gegen Beachball
   bzw. Kernel-Panic. Konservativ: 24576. Nur-Inferenz-Maschine: 28672.
 
+  AUF ANDEREN RAM-GROESSEN den Wert unten anpassen (Faustregel: RAM minus
+  5-6 GB fuer macOS):
+      32 GB → 26624   (Profil balanced)
+      48 GB → 45056   (Profil roomy)
+      64 GB → 59392
+
   Installation (braucht sudo, aendert Systemzustand):
     sudo cp com.local.iogpu-wired-limit.plist /Library/LaunchDaemons/
     sudo chown root:wheel /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist

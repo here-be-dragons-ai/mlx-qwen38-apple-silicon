@@ -1,12 +1,18 @@
 #!/usr/bin/env zsh
 # ─────────────────────────────────────────────────────────────────────────────
 # mlx-vlm Server Start-Skript  –  Qwen3.8 27B (DENSE, MLX 4bit)
-# ZIELHARDWARE:  Apple M5 (Basis) · 32 GB Unified Memory
+# ZIELHARDWARE:  Apple Silicon ab 32 GB Unified Memory
 #
-# Abgeleitet von ~/.hermes/start-mlx_qwen3.8.sh (M5 Pro, 48 GB). Alle dortigen
-# MESSWERTE stammen von der 48-GB-Maschine; hier uebernommen sind nur die
-# Erkenntnisse, die hardwareunabhaengig sind (MTP-SpecDec lohnt, APC lohnt,
-# KV-Fensterung halluziniert). Die SPEICHER-Parameter sind neu gerechnet.
+# Die speicherrelevanten Parameter kommen aus PROFILE (s.u.):
+#     lean      32 GB ohne sudo   (Working-Set 21,3 GiB)   Peak ~18,8 GiB
+#     balanced  32 GB mit sysctl  (Working-Set 26 GiB)     Peak ~25,0 GiB
+#     roomy     48 GB             (Working-Set 44 GiB)     Peak ~41 GiB
+#     auto      (Default) waehlt anhand des Working-Sets
+#
+# Die MESSWERTE in diesem Skript stammen alle von der 48-GB-Maschine (M5 Pro,
+# mlx-vlm 0.6.13), auf der das "roomy"-Profil ueber Wochen lief. Fuer 32 GB
+# uebernommen sind die hardwareunabhaengigen Erkenntnisse (MTP-SpecDec lohnt,
+# APC lohnt, KV-Fensterung halluziniert); die SPEICHER-Parameter sind gerechnet.
 #
 # ── PASST DAS MODELL AUF 32 GB? JA — aber der Kontext ist das Nadeloehr. ─────
 #
@@ -76,31 +82,83 @@ PORT="${PORT:-8888}"
 MODEL_ALIAS="${MODEL_ALIAS:-Qwen3.8-27B-local}"
 
 # ── Profile ───────────────────────────────────────────────────────────────────
-# Setzt nur DEFAULTS — jede einzeln gesetzte Env-Variable gewinnt weiterhin,
-# z. B.  PROFILE=lean APC_ENTRIES=2 ./start-mlx_qwen3.8.sh
+# Ein Profil setzt nur DEFAULTS — jede einzeln gesetzte Env-Variable gewinnt
+# weiterhin, z. B.  PROFILE=lean APC_ENTRIES=2 ./start-mlx_qwen3.8.sh
 #
-#   default  Ausgewogen. Peak ~25 GiB bei 43k-Spitzenprompt → braucht
-#            iogpu.wired_limit_mb=26624.
-#   lean     Minimaler RAM. Peak ~18,8 GiB bei 29k-Spitzenprompt → passt unter
-#            das macOS-Default-Working-Set von 21,33 GiB, also OHNE sudo.
-#            Gerechnete Ersparnis gegenueber default (43k-Prompt):
-#              APC_ENTRIES 2→1 (3→2 Kopien)  -2,8 GiB   billigster Hebel: der
-#                 SSD-Tier bleibt, ein verdraengter Snapshot ist in 350 ms
-#                 zurueck statt in 90 s Vollprefill
-#              KV_BITS=8 (64→32 KiB/Token)   -4,2 GiB   Durchsatzkosten auf dem
-#                 MLX-Pfad NICHT gemessen — bei llama.cpp kostete KV-Quant an
-#                 vergleichbarer Stelle bis 8x Prefill. Vor Dauerbetrieb A/B.
-#              PREFILL_STEP 1024→512         ~-0,2 GiB  transienter Peak
-#            Dazu gehoert clientseitig context_length 32768 (s. Banner).
-PROFILE="${PROFILE:-default}"
+#   lean      Minimaler RAM. Peak ~18,8 GiB bei 29k-Spitzenprompt → passt unter
+#             das macOS-Default-Working-Set von 21,33 GiB, also OHNE sudo.
+#             Gerechnete Ersparnis gegenueber balanced (43k-Prompt):
+#               APC_ENTRIES 2→1 (3→2 Kopien)  -2,8 GiB   billigster Hebel: der
+#                  SSD-Tier bleibt, ein verdraengter Snapshot ist in 350 ms
+#                  zurueck statt in 90 s Vollprefill
+#               KV_BITS=8 (64→32 KiB/Token)   -4,2 GiB   Durchsatzkosten auf dem
+#                  MLX-Pfad NICHT gemessen — bei llama.cpp kostete KV-Quant an
+#                  vergleichbarer Stelle bis 8x Prefill. Vor Dauerbetrieb A/B.
+#               PREFILL_STEP 1024→512         ~-0,2 GiB  transienter Peak
+#
+#   balanced  32 GB mit angehobenem Wired-Limit (26624 MB). Peak ~25 GiB bei
+#             43k-Spitzenprompt, KV unquantisiert — kein ungemessener Trade-off.
+#             (Alias: "default", historischer Name.)
+#
+#   roomy     48 GB. Das urspruengliche, ueber Wochen gefahrene M5-Pro-Setup:
+#             APC_ENTRIES 4 (mehr Konversationen warm), PREFILL_STEP 2048,
+#             VISION_CACHE 20, APC_DISK_MAX_GB 60. Peak ~41 GiB bei 110k-Prompt
+#             → braucht iogpu.wired_limit_mb=45056.
+#             ACHTUNG, die APC-Rechnung unterschaetzt den Agent-Fall: ein
+#             Snapshot bei 104k Token ist 6,5 GiB, VIER davon 26 GiB. Deshalb
+#             APC_ENTRIES hier NICHT weiter anheben.
+#
+# Zu jedem Profil gehoert clientseitig ein passendes context_length — der Banner
+# druckt es, und weiter unten warnt das Skript, wenn die config.yaml darueber
+# liegt.
+PROFILE="${PROFILE:-auto}"
+
+# auto: waehlt anhand des Metal-Working-Sets. Der wird hier ueber sysctl
+# geschaetzt statt ueber mx.device_info(), weil die Profil-Defaults gebraucht
+# werden, BEVOR das venv-Python laeuft (Modell-Load dauert). Regel:
+# iogpu.wired_limit_mb gewinnt, wenn gesetzt; sonst der macOS-Default (2/3 des
+# RAM bei <= 36 GB, sonst 3/4). Die exakte Zahl aus Metal steht spaeter im
+# Banner — weichen beide ab, gilt die aus dem Banner.
+if [[ "$PROFILE" == "auto" ]]; then
+  _RAM_MB=$(( $(sysctl -n hw.memsize) / 1048576 ))
+  _WIRED_MB=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+  if [[ "${_WIRED_MB:-0}" -gt 0 ]]; then
+    _WS_MB=$_WIRED_MB
+  elif [[ "$_RAM_MB" -le 36864 ]]; then
+    _WS_MB=$(( _RAM_MB * 2 / 3 ))
+  else
+    _WS_MB=$(( _RAM_MB * 3 / 4 ))
+  fi
+  if   [[ "$_WS_MB" -ge 30720 ]]; then PROFILE=roomy      # >= 30 GiB
+  elif [[ "$_WS_MB" -ge 24576 ]]; then PROFILE=balanced   # >= 24 GiB
+  else                                 PROFILE=lean
+  fi
+  _AUTO_NOTE=" (auto, Working-Set ~$(( _WS_MB / 1024 )) GiB)"
+else
+  _AUTO_NOTE=""
+fi
+
 case "$PROFILE" in
-  default) _APC_ENTRIES=2; _KV_BITS="";  _PREFILL=1024; _VISION=4; _CTX_HINT=49152 ;;
   # VISION_CACHE hier 1 und NICHT 0: VisionFeatureCache.put() prueft
   # `len(cache) >= max_size` und ruft dann popitem() — bei max_size=0 also auf
   # ein leeres OrderedDict, was den ersten Bild-Request mit KeyError killt.
   # 1 ist das echte Minimum (vision_cache.py:60ff).
-  lean)    _APC_ENTRIES=1; _KV_BITS="8"; _PREFILL=512;  _VISION=1; _CTX_HINT=32768 ;;
-  *) echo "ERROR: unbekanntes PROFILE='$PROFILE' (gueltig: default | lean)" >&2; exit 1 ;;
+  lean)
+    _APC_ENTRIES=1; _KV_BITS="8"; _PREFILL=512;  _VISION=1;  _APC_MAXGB=40; _APC_MINFREE=4.0; _CTX_HINT=32768 ;;
+  balanced|default)
+    PROFILE=balanced
+    _APC_ENTRIES=2; _KV_BITS="";  _PREFILL=1024; _VISION=4;  _APC_MAXGB=40; _APC_MINFREE=4.0; _CTX_HINT=49152 ;;
+  # _CTX_HINT hier 98304 und NICHT 131072, obwohl das 48-GB-Setup produktiv mit
+  # 131072 lief: die Budgetrechnung unten ist ein WORST CASE (alle APC-Snapshots
+  # gleichzeitig auf voller Promptlaenge). Bei 44 GiB Working-Set, 5 Kopien und
+  # 64 KiB/Token sind das ~87k Token, also ctx <= ~101k. Dass 131072 in der
+  # Praxis trug, liegt daran, dass die vier Snapshots real nie alle gleichzeitig
+  # am Anschlag stehen — es ist Glueck, keine Garantie. Wer 131072 will, nimmt
+  # APC_ENTRIES=2 dazu (3 Kopien → Budget ~145k).
+  roomy)
+    _APC_ENTRIES=4; _KV_BITS="";  _PREFILL=2048; _VISION=20; _APC_MAXGB=60; _APC_MINFREE=2.0; _CTX_HINT=98304 ;;
+  *)
+    echo "ERROR: unbekanntes PROFILE='$PROFILE' (gueltig: auto | lean | balanced | roomy)" >&2; exit 1 ;;
 esac
 
 # ── Speculative Decoding (MTP) ────────────────────────────────────────────────
@@ -130,11 +188,11 @@ APC_ENTRIES="${APC_ENTRIES:-$_APC_ENTRIES}"
 # 36k-Prefill. Auf dieser Maschine noch wertvoller, weil der Prefill langsamer
 # ist. Preis: ~2,3 GB Schreiblast pro 36k-Konversation → Deckel unten.
 APC_DISK="${APC_DISK:-$HOME/.hermes/apc}"
-APC_DISK_MAX_GB="${APC_DISK_MAX_GB:-40}"
+APC_DISK_MAX_GB="${APC_DISK_MAX_GB:-$_APC_MAXGB}"
 # Der Disk-Tier restauriert nur, wenn noch so viel RAM frei ist. Upstream-Default
 # 2.0 ist fuer 32 GB zu knapp — ein Restore mitten in den Speicherdruck hinein
 # ist genau der Weg in "[METAL] Insufficient Memory".
-APC_MIN_FREE_RAM_GB="${APC_MIN_FREE_RAM_GB:-4.0}"
+APC_MIN_FREE_RAM_GB="${APC_MIN_FREE_RAM_GB:-$_APC_MINFREE}"
 # Unterdrueckt den redundanten Voll-Snapshot (getroffen wird immer der
 # Checkpoint bei len-16). Halbiert den APC-Speicher. Braucht den lokalen Patch
 # 0010 (patches/apply-patches.sh) — ohne ihn ist die Variable wirkungslos, das
@@ -329,7 +387,7 @@ KV_KIB="${REST%%|*}";  DEV_NAME="${REST#*|}"
 
 echo "──────────────────────────────────────────────────────────────"
 echo "  mlx-vlm $MLX_VLM_VER  |  Qwen3.8 27B (DENSE, MLX 4bit)  |  $DEV_NAME"
-echo "  Profil   :  $PROFILE  $([[ "$PROFILE" == "lean" ]] && echo "(minimaler RAM, empf. context_length $_CTX_HINT)" || echo "(ausgewogen, empf. context_length $_CTX_HINT)")"
+echo "  Profil   :  $PROFILE$_AUTO_NOTE  —  empf. context_length $_CTX_HINT"
 echo "  Modell   :  $MODEL_DIR"
 echo "  API-Name :  $MODEL_ALIAS  (Symlink; MUSS zum Request-Modellnamen passen)"
 echo "  Port     :  $BIND_HOST:$PORT"
