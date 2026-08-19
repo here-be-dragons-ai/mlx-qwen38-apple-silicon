@@ -79,11 +79,28 @@ sudo launchctl load -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
 ## Betrieb
 
 ```sh
-./start-mlx_qwen3.8.sh                                    # Defaults (32 GB)
-KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh      # doppelter Kontext
-PORT=8899 ./start-mlx_qwen3.8.sh                          # Laborinstanz
-ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh               # ohne Drafter
+./start-mlx_qwen3.8.sh                        # Profil default
+PROFILE=lean ./start-mlx_qwen3.8.sh           # minimaler RAM, läuft ohne sudo
+PORT=8899 ./start-mlx_qwen3.8.sh              # Laborinstanz
+ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh   # ohne Drafter
 ```
+
+### Profile
+
+| | `default` | `lean` |
+|---|---|---|
+| `APC_ENTRIES` | 2 | 1 |
+| `KV_BITS` | — (f16) | 8 (ab 8k Token) |
+| `PREFILL_STEP` | 1024 | 512 |
+| `VISION_CACHE` | 4 | 1 |
+| **Peak-RAM** | ~25,0 GiB @ 43k Prompt | **~18,8 GiB** @ 29k Prompt |
+| braucht `wired_limit` | 26624 MB | — **läuft im macOS-Default** |
+| passendes `context_length` | 49152 | 32768 |
+
+Das Profil setzt nur *Defaults* — einzelne Env-Variablen gewinnen weiterhin,
+z. B. `PROFILE=lean APC_ENTRIES=2 …` oder `PROFILE=lean KV_BITS=` (zurück auf
+f16). Der `lean`-Preis: nur eine Konversation im RAM-Cache und ungemessene
+KV-Quantisierung (s. „Wenn es zu eng wird").
 
 Beim Start druckt das Skript das errechnete Speicherbudget dieser Maschine:
 
@@ -100,8 +117,9 @@ Wichtigste Env-Schalter (alle mit Begründung im Skriptkopf dokumentiert):
 
 | Variable | Default | Wirkung |
 |---|---|---|
-| `KV_BITS` | leer (f16) | `8` halbiert 64 → 32 KiB/Token, verdoppelt den Kontext |
-| `APC_ENTRIES` | `2` | Prefix-Cache-Snapshots = warm gehaltene Konversationen |
+| `PROFILE` | `default` | `lean` = minimaler RAM (Tabelle oben) |
+| `KV_BITS` | profilabhängig | `8` halbiert 64 → 32 KiB/Token, verdoppelt den Kontext |
+| `APC_ENTRIES` | profilabhängig | Prefix-Cache-Snapshots = warm gehaltene Konversationen |
 | `ENABLE_SPEC_DECODE` | `1` | MTP-Drafter, +58…132 % Decode |
 | `PREFILL_STEP` | `1024` | Prefill-Chunk = transienter Aktivierungs-Peak |
 | `BIND_HOST` / `PORT` | `127.0.0.1` / `8888` | Bind-Adresse |
@@ -135,7 +153,26 @@ pro Prefix-Cache-Snapshot. Mit `APC_ENTRIES=2` sind das 3 Kopien:
 
 ```
 Budget = (Working-Set − Gewichte − 1,5 GiB − Kopien × 152 MiB) / (Kopien × KV_pro_Token)
+Bedarf = 16,7 GiB + Kopien × (Token × KV_pro_Token + 152 MiB)
 ```
+
+### Wieviel RAM braucht es konkret?
+
+Profil `default`, ctx 49152:
+
+| Zustand | RAM |
+|---|---|
+| Gewichte geladen, Leerlauf | 15,2 GiB (gemessen: RSS 15,5 GiB) |
+| + Aktivierungen / Metal-Heap / Python | ~16,7 GiB |
+| Betrieb, 8k-Prompt | ~18,7 GiB |
+| Betrieb, Spitzenprompt 43k | **~25,0 GiB** ← dimensionierend |
+
+Profil `lean` mit ctx 32768 kommt auf **~18,8 GiB** Peak. Der absolute Boden für
+dieses Modell liegt bei **~17 GiB** (ohne Drafter, ohne Cache, 8k Kontext, KV4)
+— darunter hilft nur ein anderes Modell oder ein kleineres Quant.
+
+Dazu kommen 5–6 GB für macOS selbst; das ist der Grund, warum auf 32 GB bei
+26 GiB Wired-Limit Schluss ist.
 
 Metals `max_recommended_working_set_size` ist auf Macs **≤ 36 GB per Default
 2/3 des RAM** → auf 32 GB nur 21,33 GiB. `iogpu.wired_limit_mb` setzt diesen
@@ -214,17 +251,34 @@ und SSD-Tier hier keine Optimierung, sondern Voraussetzung: gemessen 89 630 ms
 
 ## Wenn es zu eng wird
 
-In dieser Reihenfolge:
+Erster Griff ist `PROFILE=lean`. Was dahintersteckt, einzeln und mit Preis
+(Ersparnis bezogen auf einen 43k-Spitzenprompt):
 
-1. **`KV_BITS=8 QUANT_KV_START=8192`** — verdoppelt den Kontext, lässt die
-   ersten 8k unquantisiert. Vorher A/B messen: bei llama.cpp kostete
-   KV-Quantisierung an vergleichbarer Stelle bis zu 8× Prefill und 1,9× Decode;
-   für den MLX-Pfad ist das *nicht* nachgemessen.
-2. **`APC_ENTRIES=1`** — nur eine Konversation warm, dafür 50 % mehr Kontext.
-3. **Kleineres Quant** (3bit/DWQ, falls verfügbar) — spart 3–4 GiB, kostet
-   Qualität: `./download-mlx-model.sh <repo> <ziel>` und `MODEL_DIR=… ./start-…`.
-4. **Kleineres Modell.** Ab hier ist die ehrliche Antwort, dass 27B dense auf
-   32 GB einfach knapp ist.
+| Hebel | spart | Preis |
+|---|---|---|
+| `APC_ENTRIES=1` | **−2,8 GiB** | gering — der SSD-Tier bleibt, ein verdrängter Snapshot ist in 350 ms zurück statt in 90 s Vollprefill |
+| `KV_BITS=8 QUANT_KV_START=8192` | **−4,2 GiB** | Durchsatz auf dem MLX-Pfad *nicht* gemessen; bei llama.cpp kostete KV-Quantisierung an vergleichbarer Stelle bis 8× Prefill und 1,9× Decode → A/B messen |
+| `context_length` 49152 → 32768 | −2,6 GiB | kürzere Läufe bis zur Kompaktierung |
+| `PREFILL_STEP=512` | ~−0,2 GiB | praktisch keiner (Prefill ist rechen-, nicht chunklimitiert) |
+| Gewichte `mxfp4` statt `4bit` | −0,78 GiB | `mlx-community/Qwen3.8-27B-mxfp4` = 14,17 statt 14,95 GiB, von mlx 0.32 unterstützt; Qualität unverglichen |
+| Drafter weglassen | −0,23 GiB | **schlechter Tausch** — kostet 58–132 % Decode |
+| `ENABLE_APC=0` | −5,5 GiB | **inakzeptabel** — jeder Turn zahlt den vollen Prefill |
+
+Zwei Dinge, die man beim Suchen findet und die nichts bringen:
+
+- **Der Vision-Tower ist 0,86 GiB und liegt unquantisiert in BF16 im Modell**
+  (5,7 % der Gewichte; die 4bit-Quantisierung hat ihn übersprungen). Für einen
+  reinen Text-Agenten totes Gewicht — aber mlx-vlm 0.6.13 wertet den
+  `language_model_only`-Schalter aus der `config.json` nicht aus (kein Treffer
+  im Code). Es gibt also keinen Schalter; nur Strippen/Requantisieren der
+  Gewichte von Hand.
+- **Unter 4bit gibt es nichts Fertiges.** mlx-community führt für Qwen3.8-27B
+  4bit, 8bit, mxfp4, nvfp4, oQ4/oQ6 und OptiQ — alles ≥ 14,17 GiB, kein 3bit,
+  kein DWQ. Selbst quantisieren ginge (`mlx_vlm.convert -q --q-bits 3`, ~11,5 GiB),
+  ist aber ein Qualitätsexperiment mit offenem Ausgang.
+
+Ab hier ist die ehrliche Antwort, dass 27B dense auf 32 GB knapp ist und ein
+kleineres Modell die bessere Wahl wäre.
 
 **Nicht** `--max-kv-size` benutzen (rotierendes KV-Fenster): dieselbe Idee wurde
 mit einem Needle-in-Haystack-Test widerlegt — die Nadel außerhalb des Fensters
@@ -288,6 +342,7 @@ Zwei Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
 | Datei | Zweck |
 |---|---|
 | `install-prereqs.sh` | Komplettes Setup ab frischem macOS, idempotent |
+| `LICENSE` | MIT No Attribution (SPDX `MIT-0`) |
 | `start-mlx_qwen3.8.sh` | Server-Start, 32-GB-Defaults, Live-Budgetrechnung |
 | `download-mlx-model.sh` | Resume-fähiger HuggingFace-Downloader (curl, mit Größenprüfung) |
 | `patches/apply-patches.sh` | Patches anwenden / prüfen / zurücknehmen |
@@ -310,3 +365,11 @@ nur die hardwareunabhängigen Erkenntnisse:
 Dateigrößen — die gilt auf jeder Maschine. **Die Durchsatzangaben für 32 GB
 sind Schätzungen**, hochskaliert über die Speicherbandbreite, und als solche
 gekennzeichnet.
+
+---
+
+## Lizenz
+
+[MIT No Attribution](LICENSE) (SPDX: `MIT-0`) — MIT ohne die Pflicht, den
+Copyright-Vermerk weiterzugeben. Kopieren, anpassen, weiterverwenden ohne
+Namensnennung.
