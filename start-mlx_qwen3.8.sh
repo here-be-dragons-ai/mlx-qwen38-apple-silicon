@@ -172,8 +172,25 @@ esac
 # ist reiner Bandbreiten-Gewinn — und Bandbreite ist auf dem M5 Basis knapp.
 # Rollback: ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh
 ENABLE_SPEC_DECODE="${ENABLE_SPEC_DECODE:-1}"
-DRAFT_MODEL="${DRAFT_MODEL:-$MODELS_ROOT/Qwen3.8-27B-MTP-4bit}"
-DRAFT_BLOCK_SIZE="${DRAFT_BLOCK_SIZE:-}"
+# DRAFT_KIND=mtp|dflash
+#   mtp     MTP-Kopf, 0,23 GiB. Default, weil ueber Wochen gemessen:
+#           +58..132 % Decode, Acceptance 90 % JSON / 93 % Tool-Call,
+#           Ausgabe 7/7 bit-identisch.
+#   dflash  DFlash 2 (z-lab), 1,01 GiB in 4bit. Block-Diffusion-Drafter mit
+#           Pfad-Selektor. Braucht den lokalen Patch 0020 — mlx-vlm selbst
+#           implementiert nur DFlash v1.
+#           ACHTUNG BLOCKGROESSE: der Checkpoint ist auf block_size 8 ausgelegt,
+#           z-lab empfiehlt fuer quantisierte MLX-Modelle aber <= 5, und die
+#           eigene Kernelmessung zeigt bei M=5 eine Dispatch-Klippe
+#           (M=1 5,7 ms, M=4 6,3 ms, M=5 7,4 ms). Default hier deshalb 4.
+DRAFT_KIND="${DRAFT_KIND:-mtp}"
+case "$DRAFT_KIND" in
+  mtp)    _DRAFT_DEFAULT="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit";      _BLOCK_DEFAULT="" ;;
+  dflash) _DRAFT_DEFAULT="$MODELS_ROOT/Qwen3.8-27B-DFlash2-4bit";  _BLOCK_DEFAULT="4" ;;
+  *) echo "ERROR: unbekanntes DRAFT_KIND='$DRAFT_KIND' (gueltig: mtp | dflash)" >&2; exit 1 ;;
+esac
+DRAFT_MODEL="${DRAFT_MODEL:-$_DRAFT_DEFAULT}"
+DRAFT_BLOCK_SIZE="${DRAFT_BLOCK_SIZE-$_BLOCK_DEFAULT}"
 
 # ── Automatic Prefix Caching ──────────────────────────────────────────────────
 # Wiederverwendet den KV-Cache, wenn der neue Prompt den alten als Prefix
@@ -308,7 +325,12 @@ if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
     SPEC_STATUS="ON"
   else
     echo "  WARNUNG: Drafter nicht gefunden ($DRAFT_MODEL) — starte OHNE SpecDec."
-    echo "           ./download-mlx-model.sh mlx-community/Qwen3.8-27B-MTP-4bit $DRAFT_MODEL"
+    if [[ "$DRAFT_KIND" == "dflash" ]]; then
+      echo "           ./download-mlx-model.sh z-lab/Qwen3.8-27B-DFlash2 ${MODELS_ROOT}/Qwen3.8-27B-DFlash2-bf16"
+      echo "           ./convert-dflash2-drafter.py ${MODELS_ROOT}/Qwen3.8-27B-DFlash2-bf16 $DRAFT_MODEL"
+    else
+      echo "           ./download-mlx-model.sh mlx-community/Qwen3.8-27B-MTP-4bit $DRAFT_MODEL"
+    fi
     ENABLE_SPEC_DECODE=0
   fi
 fi
@@ -391,7 +413,7 @@ echo "  Profil   :  $PROFILE$_AUTO_NOTE  —  empf. context_length $_CTX_HINT"
 echo "  Modell   :  $MODEL_DIR"
 echo "  API-Name :  $MODEL_ALIAS  (Symlink; MUSS zum Request-Modellnamen passen)"
 echo "  Port     :  $BIND_HOST:$PORT"
-echo "  SpecDec  :  $SPEC_STATUS  (MTP-Drafter, 0,23 GiB)"
+echo "  SpecDec  :  $SPEC_STATUS  (Drafter: $DRAFT_KIND, $(du -shL "$DRAFT_MODEL" 2>/dev/null | cut -f1)${DRAFT_BLOCK_SIZE:+, block_size $DRAFT_BLOCK_SIZE})"
 if [[ "$ENABLE_APC" == "1" ]]; then
   echo "  APC      :  ON ($APC_ENTRIES Snapshots, Single=$([[ "$APC_SINGLE" != "0" && "$APC_SINGLE_OK" == "1" ]] && echo ja || echo NEIN)${APC_DISK:+, SSD: $APC_DISK})"
 else
@@ -469,7 +491,7 @@ args=(
 )
 
 if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
-  args+=( --draft-model "$DRAFT_MODEL" --draft-kind mtp )
+  args+=( --draft-model "$DRAFT_MODEL" --draft-kind "$DRAFT_KIND" )
   [[ -n "$DRAFT_BLOCK_SIZE" ]] && args+=( --draft-block-size "$DRAFT_BLOCK_SIZE" )
 fi
 

@@ -1,0 +1,228 @@
+--- a/mlx_vlm/speculative/drafters/qwen3_dflash/config.py	2026-08-20 06:28:05
++++ b/mlx_vlm/speculative/drafters/qwen3_dflash/config.py	2026-08-20 06:28:05
+@@ -29,6 +29,16 @@
+     final_logit_softcapping: Optional[float] = None
+     runtime_block_size: int | None = None
+     draft_window_size: int | None = None
++    # ── DFlash 2 ──────────────────────────────────────────────────────────────
++    # Alle vier default 0 => exakt das bisherige DFlash-v1-Verhalten. Ein
++    # v1-Checkpoint laedt damit unveraendert; die v2-Module werden nur gebaut,
++    # wenn die dflash_config des Drafters sie mitbringt.
++    #   conv_*     -> GroupedDynamicCausalConv je Layer (Two-Tap-Dynamic-Conv)
++    #   selector_* -> CandidateSelector (Top-k je Position + Pfadwahl)
++    conv_kernel_size: int = 0
++    conv_group_size: int = 0
++    selector_rank: int = 0
++    selector_top_k: int = 0
+ 
+     @classmethod
+     def from_dict(cls, params: dict) -> "DFlashConfig":
+@@ -42,6 +52,23 @@
+             flat["runtime_block_size"] = dflash_cfg["runtime_block_size"]
+         if "draft_window_size" in dflash_cfg:
+             flat["draft_window_size"] = dflash_cfg["draft_window_size"]
++        # DFlash 2 legt block_size IN dflash_config (v1 hatte es top-level).
++        if "block_size" in dflash_cfg:
++            flat["block_size"] = dflash_cfg["block_size"]
++        for key in (
++            "conv_kernel_size",
++            "conv_group_size",
++            "selector_rank",
++            "selector_top_k",
++        ):
++            if key in dflash_cfg:
++                flat[key] = int(dflash_cfg[key])
++        # transformers 5.x buendelt RoPE unter rope_parameters; ohne das faellt
++        # rope_theta auf den Klassendefault zurueck (fuer Qwen3.8 zufaellig
++        # richtig, fuer andere Drafter nicht).
++        rope_params = flat.get("rope_parameters")
++        if isinstance(rope_params, dict) and "rope_theta" in rope_params:
++            flat.setdefault("rope_theta", rope_params["rope_theta"])
+         sig = inspect.signature(cls).parameters
+         return cls(**{k: v for k, v in flat.items() if k in sig})
+ 
+--- a/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py	2026-08-20 06:28:05
++++ b/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py	2026-08-20 06:28:05
+@@ -117,6 +117,134 @@
+         return h + self.mlp(self.post_attention_layernorm(h))
+ 
+ 
++# ── DFlash 2 ─────────────────────────────────────────────────────────────────
++# Transkribiert aus der Referenzimplementierung z-lab/dflash, dflash/model_mlx.py
++# (GroupedDynamicCausalConv, DFlash2DecoderLayer, CandidateSelector). Die
++# Layer-Signatur (x, x_ctx, rope, cache) ist dort identisch zu der hier, deshalb
++# passt der Einbau ohne Umbau der Rundenschleife in speculative/dflash.py.
++#
++# Der Drafter schlaegt weiterhin nur vor — das Target verifiziert jeden Token.
++# Ein Fehler in Conv oder Selector kostet deshalb ausschliesslich Acceptance,
++# niemals Korrektheit. Aus demselben Grund ist der verteilungserhaltende
++# Sampling-Pfad der Referenz (q_rows) hier nicht noetig: mlx-vlms
++# _speculative_walk vergleicht den Draft gegen das Target-Sample.
++
++
++def _grouped_dynamic_convolve(hidden, dynamic, base, group_size):
++    """Zwei-Tap-Causal-Conv mit statischem Kernel + eingabeabhaengigem Anteil.
++
++    Der dynamische Teil ist pro GRUPPE (group_size Kanaele teilen sich einen
++    Koeffizienten) — daher kernel_projection mit 2 * kernel_size * groups
++    Ausgaengen statt einer vollen Kanalmatrix.
++    """
++    batch, length, hidden_size = hidden.shape
++    groups = hidden_size // group_size
++    blocks = hidden.reshape(batch, length, groups, group_size)
++    dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
++    output = mx.zeros_like(blocks)
++    for offset in range(base.shape[0]):
++        values = (
++            blocks
++            if offset == 0
++            else mx.concatenate(
++                (mx.zeros_like(blocks[:, :offset]), blocks[:, :-offset]), axis=1
++            )
++        )
++        kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
++        output = output + kernel * values
++        output = output + dynamic[:, :, offset] * values
++    return output.reshape(hidden.shape)
++
++
++class GroupedDynamicCausalConv(nn.Module):
++    def __init__(self, hidden_size, kernel_size, group_size):
++        super().__init__()
++        self.kernel_size = kernel_size
++        self.group_size = group_size
++        groups = hidden_size // group_size
++        self.base_kernel = mx.zeros((2, kernel_size, hidden_size))
++        self.kernel_projection = nn.Linear(
++            hidden_size, 2 * kernel_size * groups, bias=False
++        )
++
++    def prepare(self, hidden):
++        groups = hidden.shape[-1] // self.group_size
++        dynamic = self.kernel_projection(hidden).reshape(
++            *hidden.shape[:-1], 2, self.kernel_size, groups
++        )
++        return (
++            _grouped_dynamic_convolve(
++                hidden, dynamic[..., 0, :, :], self.base_kernel[0], self.group_size
++            ),
++            dynamic[..., 1, :, :],
++        )
++
++    def finish(self, hidden, dynamic):
++        return _grouped_dynamic_convolve(
++            hidden, dynamic, self.base_kernel[1], self.group_size
++        )
++
++
++class DFlash2DecoderLayer(DFlashDecoderLayer):
++    def __init__(self, config: DFlashConfig, layer_idx: int):
++        super().__init__(config, layer_idx)
++        self.attention_conv = GroupedDynamicCausalConv(
++            config.hidden_size, config.conv_kernel_size, config.conv_group_size
++        )
++        self.mlp_conv = GroupedDynamicCausalConv(
++            config.hidden_size, config.conv_kernel_size, config.conv_group_size
++        )
++
++    def __call__(self, x, x_ctx, rope, cache):
++        residual = x
++        x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
++        x = residual + self.attention_conv.finish(
++            self.self_attn(x, x_ctx, rope, cache), kernel
++        )
++        residual = x
++        x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
++        return residual + self.mlp_conv.finish(self.mlp(x), kernel)
++
++
++class CandidateSelector(nn.Module):
++    """Waehlt einen zusammenhaengenden Pfad durch die Top-k je Blockposition.
++
++    Statt an jeder Position unabhaengig das argmax zu nehmen, werden benachbarte
++    Token-Paare mit einer niedrigrangigen bilinearen Form bewertet
++    (predecessor_codebook x hidden_projection x successor_codebook) und der beste
++    Pfad einmal vorwaerts durchgezogen.
++    """
++
++    def __init__(self, config: DFlashConfig):
++        super().__init__()
++        self.top_k = config.selector_top_k
++        self.predecessor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
++        self.successor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
++        self.hidden_projection = nn.Linear(
++            config.hidden_size, config.selector_rank, bias=False
++        )
++
++    def select(self, hidden: mx.array, logits: mx.array, anchor_ids: mx.array):
++        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k :]
++        unary = mx.take_along_axis(logits, candidates, axis=-1)
++        hidden = self.hidden_projection(hidden)
++        predecessor = anchor_ids
++        path = []
++        for position in range(hidden.shape[1]):
++            edges = mx.sum(
++                self.predecessor_codebook(predecessor)[:, None]
++                * hidden[:, position, None]
++                * self.successor_codebook(candidates[:, position]),
++                axis=-1,
++            )
++            selected = mx.argmax(unary[:, position] + edges, axis=-1)
++            predecessor = mx.take_along_axis(
++                candidates[:, position], selected[:, None], axis=-1
++            )[:, 0]
++            path.append(predecessor)
++        return mx.stack(path, axis=1)
++
++
+ class DFlashDraftModel(nn.Module):
+     def __init__(self, config: DFlashConfig):
+         super().__init__()
+@@ -126,9 +254,16 @@
+         concat_dim = len(config.target_layer_ids) * config.hidden_size
+         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
+         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+-        self.layers = [
+-            DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)
+-        ]
++        # DFlash 2 bringt zusaetzlich Convs je Layer und den Pfad-Selektor mit.
++        # Beides haengt allein an der Drafter-Config: fehlen die Felder (v1),
++        # entsteht exakt der bisherige Aufbau.
++        layer_class = (
++            DFlash2DecoderLayer if config.conv_kernel_size > 0 else DFlashDecoderLayer
++        )
++        self.layers = [layer_class(config, i) for i in range(config.num_hidden_layers)]
++        self.candidate_selector = (
++            CandidateSelector(config) if config.selector_rank > 0 else None
++        )
+         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         self.rope = _build_rope(config)
+         self.embed_tokens = None
+@@ -216,6 +351,12 @@
+             )
+         draft_hidden = self._hidden(block, hidden, cache)
+         draft_logits = self._logits(draft_hidden[:, 1:])
++        if self.candidate_selector is not None:
++            # DFlash 2: Pfad durch die Top-k statt argmax je Position. Der Anker
++            # ist das erste Blocktoken (das bereits akzeptierte Bonus-Token).
++            return self.candidate_selector.select(
++                draft_hidden[:, 1:], draft_logits, block[:, 0]
++            ).astype(token_dtype)
+         return sampler(draft_logits)
+ 
+     def _hidden(
+@@ -253,6 +394,14 @@
+         for k, v in weights.items():
+             if k.startswith("model."):
+                 k = k[len("model.") :]
++            # Die DFlash-2-Codebooks liegen im Checkpoint als blanke Tensoren
++            # (candidate_selector.predecessor_codebook), hier sind es aber
++            # nn.Embedding — die erwarten den .weight-Suffix.
++            if k in (
++                "candidate_selector.predecessor_codebook",
++                "candidate_selector.successor_codebook",
++            ):
++                k = f"{k}.weight"
+             out[k] = v
+         return out
+ 

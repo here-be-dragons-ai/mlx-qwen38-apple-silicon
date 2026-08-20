@@ -27,6 +27,27 @@
 #   OHNE die Env-Variable ist der Patch inert = exaktes Upstream-Verhalten;
 #   das ist der Rollback-Pfad.
 #
+# 0020-dflash2-qwen38.patch   (LOKAL, Upstream-PR-Kandidat)
+#   Ruestet DFlash 2 im Drafter qwen3_dflash nach. mlx-vlm implementiert bis
+#   einschliesslich 0.6.15 (und auf main) nur DFlash v1; fuer Qwen3.8-27B gibt
+#   es aber ausschliesslich einen v2-Drafter. Ergaenzt werden:
+#     GroupedDynamicCausalConv  Two-Tap-Conv mit statischem + eingabeabhaengigem
+#                               Kernel, pro Layer vor Attention und MLP
+#     CandidateSelector         Top-k je Blockposition + Pfadwahl ueber eine
+#                               niedrigrangige bilineare Form
+#   Transkribiert aus der MLX-Referenz z-lab/dflash (dflash/model_mlx.py).
+#   VERIFIZIERT: 81/81 Parameter stimmen in Name und Form mit dem Checkpoint
+#   ueberein, Conv max|diff| = 0 gegen die Referenz, Selector-Pfade identisch,
+#   Ausgabe bei temperature 0 bit-identisch zum MTP-Drafter (4/4).
+#   GEMESSEN (M5 Pro, block_size 4): Decode +13..24 % gegenueber MTP.
+#   Blocksweep: 3 -> +6 %, 4 -> +19 %, 5 -> +20 %, 8 -> +6 % (der Checkpoint ist
+#   auf 8 ausgelegt, das ist auf einem 4bit-Target die schlechteste Wahl).
+#   ABER: unter draft_kind=dflash greift APC gar nicht (cached_tokens=0 in jedem
+#   Turn, APC_TRACE zeigt keinen einzigen Lookup). Das liegt an der
+#   dflash-Integration in mlx-vlm, nicht am Patch — MTP trifft mit angewandtem
+#   Patch weiter. Deshalb ist DRAFT_KIND=mtp Default; s. README.
+#   Ohne DRAFT_KIND=dflash ist der Patch inert.
+#
 # ── ERLEDIGT / OBSOLET ───────────────────────────────────────────────────────
 #
 # 0002-pr1901-apc-short-prompt.patch   ENTFERNT 2026-08-19 beim Upgrade auf
