@@ -318,36 +318,71 @@ Stiller Qualitätsverlust ist schlimmer als ein sauberer kleiner Kontext.
 
 ---
 
-## DFlash2 — Stand 2026-08-19: nicht nutzbar
+## DFlash2 — portiert, gemessen, aber nicht Default
 
-[DFlash 2](https://inco.ai/blog/dflash2/) ist ein Block-Diffusion-Drafter mit
-2,7–3,4× Durchsatz auf genau diesem Modell. Für Qwen3.8-27B gibt es einen
-fertigen Drafter (`z-lab/Qwen3.8-27B-DFlash2`, 3,58 GiB bf16). Trotzdem läuft er
-hier **nicht**:
+[DFlash 2](https://inco.ai/blog/dflash2/) ist als Drafter für Qwen3.8-27B
+portiert (`patches/0020-dflash2-qwen38.patch`) und über `DRAFT_KIND=dflash`
+nutzbar. **Default bleibt trotzdem der MTP-Drafter** — der Grund steht unten.
 
-- mlx-vlm hat zwar die Drafter-Klasse `speculative/drafters/qwen3_dflash` und
-  das Zielmodell liefert die nötigen Hidden States (`capture_layer_ids`) — aber
-  implementiert ist nur **DFlash v1**. Die beiden v2-Neuerungen (Kandidaten-Pfad-
-  Selektor, Two-Tap-Dynamic-Convolutions) fehlen in `0.6.13`, `0.6.15` **und**
-  auf upstream `main`; der Config-Parser ignoriert `selector_rank`,
-  `selector_top_k`, `conv_group_size`, `conv_kernel_size`.
-- Ein Versuch endet im **harten Startabbruch**: `load_model()` lädt mit
-  `strict=True`, die Selector-/Conv-Tensoren sind unerwartete Keys.
-- Eine brauchbare MLX-Konversion existiert nicht (der einzige Treffer hat keine
-  `config.json`).
+Hintergrund: mlx-vlm bringt zwar die Drafter-Klasse `qwen3_dflash` und die
+Zielmodell-Hooks mit, implementiert aber nur DFlash **v1**; die v2-Neuerungen
+(Kandidaten-Pfad-Selektor, Two-Tap-Dynamic-Convolutions) fehlen in 0.6.13,
+0.6.15 und auf upstream `main`. Auch oMLX 0.6.2 (`dflash_mlx 0.1.10+omlx.5`) hat
+nur v1. Für Qwen3.8-27B existiert aber gar kein v1-Drafter — nur der v2. Der
+Patch schließt genau diese Lücke, transkribiert aus der MLX-Referenz von z-lab
+([`dflash/model_mlx.py`](https://github.com/z-lab/dflash/blob/main/dflash/model_mlx.py)).
 
-Ob sich das geändert hat, prüft man so:
+### Verwendung
 
 ```sh
-curl -sL https://raw.githubusercontent.com/Blaizzy/mlx-vlm/main/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py | grep -c selector
-# > 0  →  DFlash2 ist da, Drafter nach MLX konvertieren und A/B gegen MTP messen
+./download-mlx-model.sh z-lab/Qwen3.8-27B-DFlash2 ~/src/mlx/models/Qwen3.8-27B-DFlash2-bf16
+./convert-dflash2-drafter.py ~/src/mlx/models/Qwen3.8-27B-DFlash2-bf16 \
+                             ~/src/mlx/models/Qwen3.8-27B-DFlash2-4bit
+DRAFT_KIND=dflash ./start-mlx_qwen3.8.sh          # block_size 4 (Default)
 ```
 
-**Und selbst dann lohnt erst eine Messung:** die 2,7–3,4× gelten gegen *reines
-autoregressives* Decoding. Mit dem MTP-Drafter (0,23 GiB) liegen wir gemessen
-schon bei +58…132 % und 90–93 % Acceptance auf Tool-Calls/JSON. Der DFlash2-
-Drafter kostet in 4bit ~1 GiB — auf `lean`/`balanced` ist das direkt weniger
-Kontext.
+### Was gemessen wurde (M5 Pro, mlx-vlm 0.6.15, identische Prompts)
+
+| Prompt | MTP | DFlash2 (block 4) | |
+|---|---|---|---|
+| 64 Token | 33,9 t/s | **40,8 t/s** | +20 % |
+| 66 Token | 33,9 t/s | **38,2 t/s** | +13 % |
+| 76 Token | 36,7 t/s | **45,6 t/s** | +24 % |
+| 5767 Token | 33,9 t/s | **38,4 t/s** | +13 % |
+
+Blockgrößen-Sweep (Mittel der drei kurzen Prompts, gegen MTP):
+`block 3` +6 %, **`block 4` +19 %**, **`block 5` +20 %**, `block 8` +6 %.
+Der Checkpoint ist auf `block_size 8` ausgelegt — auf einem 4bit-Target ist das
+gemessen die *schlechteste* Wahl, genau wie z-lab es für quantisierte
+MLX-Modelle ankündigt (`block_size <= 5`). Acceptance bei Block 4–5:
+3,0–3,7 angenommene Token pro Runde.
+
+Korrektheit: Ausgabe bei `temperature 0` **4/4 bit-identisch zum MTP-Drafter**,
+Tool-Call korrekt. Die portierten Module sind gegen die Referenz geprüft —
+81/81 Parameter in Name und Form, Conv `max|diff| = 0`, Selector-Pfade identisch.
+
+### Warum trotzdem MTP als Default: DFlash2 schaltet den Prefix-Cache ab
+
+Unter `DRAFT_KIND=dflash` meldet **jeder** Request `cached_tokens=0`, auch der
+zweite Turn derselben Konversation. `APC_TRACE=1` zeigt keinen einzigen
+Lookup- oder Store-Event — der APC-Pfad wird gar nicht erst betreten. Mit MTP
+trifft derselbe Test 5771 von 5791 Token.
+
+Das ist kein Effekt der Portierung (der Patch fasst nur die Drafter-Module an,
+und MTP trifft mit angewandtem Patch weiterhin), sondern der dflash-Integration
+in mlx-vlm. Gegenprobe: MTP mit künstlich ungechunktem Prefill
+(`PREFILL_STEP=65536`) trifft APC weiterhin — es liegt also nicht am Chunking.
+
+**Die Rechnung, die es entscheidet:** ein kalter 5,8k-Prefill kostet 12–17 s,
+der Decode-Gewinn auf 60 Token liegt bei ~0,4 s. Für Agentenlast mit langen,
+wiederverwendeten Prompts ist DFlash2 damit netto ein deutliches Minus —
+für Einzelanfragen ohne Präfix-Wiederverwendung dagegen ein echter Gewinn.
+
+Wieder auszuwerten, sobald der dflash-Pfad APC unterstützt:
+
+```sh
+DRAFT_KIND=dflash APC_TRACE=1 ./start-mlx_qwen3.8.sh   # Turn 2 muss cached_tokens > 0 zeigen
+```
 
 ---
 
