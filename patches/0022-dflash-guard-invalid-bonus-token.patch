@@ -1,0 +1,26 @@
+--- a/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py	2026-08-20 10:39:04
++++ b/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py	2026-08-20 10:39:04
+@@ -339,6 +339,23 @@
+     ) -> mx.array:
+         mask_id = int(self.config.mask_token_id)
+         if isinstance(last_bonus, int):
++            # ── Guard gegen korrupte Bonus-Tokens (lokaler Patch, 2026-08-20)
++            # mx.array() wirft fuer Elemente ausserhalb des int64-Bereichs ein
++            # nacktes "RuntimeError: std::bad_cast" ohne Hinweis auf die Ursache
++            # (reproduzierbar: mx.array([[2**63]], dtype=mx.int32)). Genau so ist
++            # am 2026-08-20 10:07 ein Request nach 250 Tokens gestorben:
++            # last_bonus kam aus new_tokens[-1] des vorigen _speculative_walk und
++            # war kein gueltiges Token. Der Guard macht den Fehler lesbar und
++            # nennt den Wert, damit der naechste Treffer zur Quelle fuehrt statt
++            # im C++-Cast zu enden. Kein Clamping: ein stillschweigend ersetztes
++            # Token wuerde die Ausgabe verfaelschen statt den Bug zu zeigen.
++            _vocab = int(getattr(self.config, "vocab_size", 0) or 0) or (1 << 31)
++            if not 0 <= last_bonus < _vocab:
++                raise ValueError(
++                    "DFlash draft_block: Bonus-Token ausserhalb des Vokabulars "
++                    f"({last_bonus!r}, erwartet 0..{_vocab - 1}). Der Wert stammt "
++                    "aus dem vorigen _speculative_walk."
++                )
+             block = mx.array(
+                 [[last_bonus] + [mask_id] * (block_size - 1)],
+                 dtype=token_dtype,
