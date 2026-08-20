@@ -318,48 +318,51 @@ Stiller Qualitätsverlust ist schlimmer als ein sauberer kleiner Kontext.
 
 ---
 
-## DFlash2 — portiert, gemessen, aber nicht Default
+## DFlash 2 ist der Default-Drafter
 
-[DFlash 2](https://inco.ai/blog/dflash2/) ist als Drafter für Qwen3.8-27B
-portiert (`patches/0020-dflash2-qwen38.patch`) und über `DRAFT_KIND=dflash`
-nutzbar. **Default bleibt trotzdem der MTP-Drafter** — der Grund steht unten.
+[DFlash 2](https://inco.ai/blog/dflash2/) läuft über `patches/0020` (Module) und
+`patches/0021` (Prefix-Cache-Routing) und ist seit 2026-08-20 der Default.
+Zurück auf den MTP-Kopf: `DRAFT_KIND=mtp ./start-mlx_qwen3.8.sh`.
 
-Hintergrund: mlx-vlm bringt zwar die Drafter-Klasse `qwen3_dflash` und die
-Zielmodell-Hooks mit, implementiert aber nur DFlash **v1**; die v2-Neuerungen
-(Kandidaten-Pfad-Selektor, Two-Tap-Dynamic-Convolutions) fehlen in 0.6.13,
-0.6.15 und auf upstream `main`. Auch oMLX 0.6.2 (`dflash_mlx 0.1.10+omlx.5`) hat
-nur v1. Für Qwen3.8-27B existiert aber gar kein v1-Drafter — nur der v2. Der
-Patch schließt genau diese Lücke, transkribiert aus der MLX-Referenz von z-lab
-([`dflash/model_mlx.py`](https://github.com/z-lab/dflash/blob/main/dflash/model_mlx.py)).
+Hintergrund: mlx-vlm implementiert bis 0.6.15 und auf `main` nur DFlash **v1**,
+oMLX 0.6.2 ebenso — für Qwen3.8-27B existiert aber ausschließlich ein
+v2-Drafter. Die Module sind aus der MLX-Referenz von z-lab transkribiert
+([`dflash/model_mlx.py`](https://github.com/z-lab/dflash/blob/main/dflash/model_mlx.py)),
+geprüft gegen die Referenz (Conv `max|diff| = 0`, identische Selector-Pfade) und
+gegen den Checkpoint (81/81 Parameter in Name und Form).
 
-### Verwendung
+### Messung: ohne Drafter / MTP / DFlash 2
 
-```sh
-./download-mlx-model.sh z-lab/Qwen3.8-27B-DFlash2 ~/src/mlx/models/Qwen3.8-27B-DFlash2-bf16
-./convert-dflash2-drafter.py ~/src/mlx/models/Qwen3.8-27B-DFlash2-bf16 \
-                             ~/src/mlx/models/Qwen3.8-27B-DFlash2-4bit
-DRAFT_KIND=dflash ./start-mlx_qwen3.8.sh          # block_size 4 (Default)
-```
+Identische Prompts, `temperature 0`, Decode-Rate aus dem `predicted_ms` des
+Servers, Median aus drei Läufen:
 
-### Was gemessen wurde (M5 Pro, mlx-vlm 0.6.15, identische Prompts)
+| Fall | ohne Drafter | MTP | DFlash 2 | |
+|---|---|---|---|---|
+| JSON | 16,4 t/s | 37,8 t/s | **44,2 t/s** | +17 % |
+| Code | 16,4 t/s | 35,8 t/s | **42,6 t/s** | +19 % |
+| Langkontext (5,8k) | 14,2 t/s | 36,0 t/s | **40,8 t/s** | +13 % |
+| Tool-Call | 18,3 t/s | 33,8 t/s | **39,8 t/s** | +18 % |
+| Prosa | 16,5 t/s | **29,8 t/s** | 29,9 t/s | ±0 % |
 
-| Prompt | MTP | DFlash2 (block 4) | |
-|---|---|---|---|
-| 64 Token | 33,9 t/s | **40,8 t/s** | +20 % |
-| 66 Token | 33,9 t/s | **38,2 t/s** | +13 % |
-| 76 Token | 36,7 t/s | **45,6 t/s** | +24 % |
-| 5767 Token | 33,9 t/s | **38,4 t/s** | +13 % |
+**Der Gewinn steckt in strukturierter Ausgabe** — Tool-Calls, JSON, Code — und
+damit genau in der Agentenlast. Bei freier Prosa sind beide gleichauf; dort
+liegt MTP bei der Acceptance sogar vorn (57 % gegen 45 %).
 
-Blockgrößen-Sweep (Mittel der drei kurzen Prompts, gegen MTP):
-`block 3` +6 %, **`block 4` +19 %**, **`block 5` +20 %**, `block 8` +6 %.
-Der Checkpoint ist auf `block_size 8` ausgelegt — auf einem 4bit-Target ist das
-gemessen die *schlechteste* Wahl, genau wie z-lab es für quantisierte
-MLX-Modelle ankündigt (`block_size <= 5`). Acceptance bei Block 4–5:
-3,0–3,7 angenommene Token pro Runde.
+Interessant ist, *warum*: die Acceptance-**Rate** ist bei beiden praktisch
+identisch (Median 81 % gegen 80 %). DFlash 2 draftet pro Runde schlicht mehr
+Token (`block_size 4` statt 3) und gewinnt darüber. Genau deshalb ist die
+Blockgröße der empfindlichste Parameter — Sweep gegen MTP: `3` +6 %, **`4` +19 %,
+`5` +20 %**, `8` +6 %. Der Checkpoint ist auf `block_size 8` ausgelegt, was auf
+einem 4bit-Target die schlechteste Wahl ist; z-lab empfiehlt für quantisierte
+MLX-Modelle ebenfalls ≤ 5.
 
-Korrektheit: Ausgabe bei `temperature 0` **4/4 bit-identisch zum MTP-Drafter**,
-Tool-Call korrekt. Die portierten Module sind gegen die Referenz geprüft —
-81/81 Parameter in Name und Form, Conv `max|diff| = 0`, Selector-Pfade identisch.
+Korrektheit: Ausgabe bei `temperature 0` in allen fünf Fällen identisch zum Lauf
+**ohne** Drafter, Tool-Call-Argumente identisch. Beide Drafter erreichen ~2,1×
+gegenüber gar keinem Drafter.
+
+Kosten: der Drafter belegt 1,01 GiB statt 0,23 GiB. Auf `lean` und `balanced`
+ist das direkt weniger Kontext — dort lohnt die Abwägung, ob `DRAFT_KIND=mtp`
+die bessere Wahl ist.
 
 ### Der Prefix-Cache greift jetzt auch unter DFlash2
 
