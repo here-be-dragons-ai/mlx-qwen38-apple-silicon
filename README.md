@@ -436,12 +436,14 @@ ps -o rss=,command= -p "$(pgrep -f mlx_vlm.server)" | awk '{printf "%.1f GiB\n",
 
 ## Patches
 
-Sechs Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
+Acht Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). Sie verschwinden bei jedem
 `pip install -U mlx-vlm` — danach erneut ausführen.
 
 **Eigene:** `0010` (APC-Einzel-Snapshot), `0011` (Rollen-Kompatibilität),
-`0020` (DFlash-2-Module), `0021` (Prefix-Cache-Routing für Nicht-MTP-Drafter).
+`0012` (Decode-Rate im Log), `0020` (DFlash-2-Module), `0021`
+(Prefix-Cache-Routing für Nicht-MTP-Drafter), `0022` (Guard gegen korrupte
+DFlash-Bonus-Tokens).
 
 **Fremde, noch offene Upstream-PRs** — beide selbst reproduziert und
 gegengetestet:
@@ -466,6 +468,26 @@ Zwei Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
   einem realen Log: 13 Requests = 1055 s verlorene Prefill-Zeit, ausgelöst von
   6 kurzen Prompts. Meldet `apply-patches.sh` hier „KONFLIKT", ist der Fix
   upstream angekommen → Datei löschen.
+- **`0022-dflash-guard-invalid-bonus-token.patch`** — lokal, kein Upstream-PR.
+  `draft_block` baut den nächsten Block aus dem Bonus-Token des vorigen
+  `_speculative_walk`. Ist der Wert korrupt, wirft `mx.array()` nur
+  `RuntimeError: std::bad_cast` — ohne Wert, ohne Index, ohne Hinweis, dass es
+  um eine Integer-Konvertierung geht (reproduzierbar mit
+  `mx.array([[2**63]], dtype=mx.int32)`). Genau so starb am 2026-08-20 10:07
+  ein Request nach 250 Tokens. Der Patch prüft gegen `vocab_size` und nennt den
+  Wert. Bewusst kein Clamping: ein still ersetztes Token verfälscht die Ausgabe,
+  statt den Bug zu zeigen. Der nackte `std::bad_cast` selbst ist ein
+  Upstream-Papercut in mlx — `mx.array` sollte bei Integer-Überlauf einen
+  `OverflowError` mit Wert und Index werfen, wie es die Nachbarpfade
+  (`Invalid type NoneType received in array initialization.`) längst tun.
+- **`0012-decode-progress-cumulative-rate.patch`** — lokal, kein Upstream-PR.
+  Das `rate=` in `Decode progress` war die Momentanrate zwischen zwei
+  Log-Aufrufen (`emitted_tokens / (now - previous_token_at)`). Unter
+  spekulativer Dekodierung wird ein akzeptierter Block in Mikrosekunden
+  ausgegeben, deshalb meldeten 17 % aller Zeilen über 1000 tok/s (Spitze
+  162153) im Wechsel mit viel zu niedrigen Werten — im Widerspruch zum
+  `elapsed=` derselben Zeile. `rate=` ist jetzt die kumulative Rate wie in
+  `Decode completed`, die Momentanrate bleibt als `inst=`.
 - **`0011-role-compat-developer-to-system.patch`** — lokal, kein Upstream-PR.
   Das Qwen3.8-Template kennt nur `system/user/assistant/tool` und wirft bei
   allem anderen `Unexpected message role.` → HTTP 500. Das Request-Schema

@@ -1,0 +1,43 @@
+--- a/mlx_vlm/server/generation.py	2026-08-20 10:38:33
++++ b/mlx_vlm/server/generation.py	2026-08-20 10:38:33
+@@ -1493,11 +1493,22 @@
+         debug_enabled = logger.isEnabledFor(logging.DEBUG)
+         if debug_enabled:
+             logger.debug(
++                # ── rate= war die MOMENTAN-Rate (lokaler Patch, 2026-08-20)
++                # token_rate = emitted_tokens / (now - previous_token_at) misst
++                # den Abstand zweier _log_decode_progress-Aufrufe. Unter
++                # spekulativer Dekodierung wird ein ganzer akzeptierter Block in
++                # Mikrosekunden nacheinander ausgegeben => 17 % aller Zeilen
++                # meldeten > 1000 tok/s (Spitze 162153), im Wechsel mit viel zu
++                # niedrigen Werten. Das widersprach dem elapsed= derselben Zeile
++                # und war als Diagnosewert unbrauchbar. rate= ist jetzt die
++                # kumulative Dekodierrate (dieselbe wie in "Decode completed"),
++                # die Momentanrate bleibt als inst= erhalten.
+                 "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
+-                "rate=%s token_number=%d token_id=%s text=%r",
++                "rate=%.1f tok/s inst=%s token_number=%d token_id=%s text=%r",
+                 request_id,
+                 generated_tokens,
+                 elapsed,
++                rate,
+                 progress_rate_text,
+                 generated_tokens,
+                 token,
+@@ -1516,11 +1527,15 @@
+             )
+         elif crossed_interval and not debug_enabled:
+             logger.info(
++                # Siehe Kommentar im logger.debug-Zweig oben: rate= ist die
++                # kumulative Rate, inst= die (unter Spekulation sprunghafte)
++                # Momentanrate.
+                 "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
+-                "rate=%s",
++                "rate=%.1f tok/s inst=%s",
+                 request_id,
+                 generated_tokens,
+                 elapsed,
++                rate,
+                 progress_rate_text,
+             )
+         return now
