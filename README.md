@@ -436,12 +436,12 @@ ps -o rss=,command= -p "$(pgrep -f mlx_vlm.server)" | awk '{printf "%.1f GiB\n",
 
 ## Patches
 
-Fünf Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
+Sechs Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). Sie verschwinden bei jedem
 `pip install -U mlx-vlm` — danach erneut ausführen.
 
-**Eigene:** `0010` (APC-Einzel-Snapshot), `0020` (DFlash-2-Module),
-`0021` (Prefix-Cache-Routing für Nicht-MTP-Drafter).
+**Eigene:** `0010` (APC-Einzel-Snapshot), `0011` (Rollen-Kompatibilität),
+`0020` (DFlash-2-Module), `0021` (Prefix-Cache-Routing für Nicht-MTP-Drafter).
 
 **Fremde, noch offene Upstream-PRs** — beide selbst reproduziert und
 gegengetestet:
@@ -466,6 +466,13 @@ Zwei Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
   einem realen Log: 13 Requests = 1055 s verlorene Prefill-Zeit, ausgelöst von
   6 kurzen Prompts. Meldet `apply-patches.sh` hier „KONFLIKT", ist der Fix
   upstream angekommen → Datei löschen.
+- **`0011-role-compat-developer-to-system.patch`** — lokal, kein Upstream-PR.
+  Das Qwen3.8-Template kennt nur `system/user/assistant/tool` und wirft bei
+  allem anderen `Unexpected message role.` → HTTP 500. Das Request-Schema
+  erlaubt aber zusätzlich `developer`; genau diese eine Rolle rutscht durch die
+  Validierung in die Template-Ausnahme (Hermes schickt sie). Der Patch bildet
+  `developer → system` und `function → tool` ab, alles andere fällt weiterhin
+  durch.
 - **`0010-qwen38-apc-single-snapshot.patch`** — lokal, kein Upstream-PR.
   mlx-vlm legt pro Request zwei fast identische Snapshots ab (Checkpoint bei
   `len-16` und den vollen Prompt); getroffen wird gemessen immer der

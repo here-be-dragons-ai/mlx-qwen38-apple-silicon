@@ -1,0 +1,68 @@
+--- a/mlx_vlm/prompt_utils.py	2026-08-14 17:55:02
++++ b/mlx_vlm/prompt_utils.py	2026-08-17 13:55:43
+@@ -1,5 +1,7 @@
+ import inspect
+ import json
++import logging
++import os
+ from enum import Enum
+ from functools import partial
+ from typing import Any, Dict, List, Union
+@@ -811,6 +813,57 @@
+         ):
+             template_kwargs["thinking_mode"] = "enabled"
+ 
++        # ── Rollen-Kompatibilitaet (lokaler Patch, 2026-08-17) ────────────────
++        # Qwen3.8 akzeptiert im chat_template NUR system/user/assistant/tool und
++        # wirft bei allem anderen raise_exception('Unexpected message role.') —
++        # in mlx-vlm ein HTTP 500. Qwen3.6 war toleranter und akzeptierte
++        # zusaetzlich 'developer'. Beim Modellwechsel bricht damit jeder Client,
++        # der eine der beiden Alt-Rollen schickt (bei Hermes laesst
++        # _VALID_API_ROLES sowohl 'function' als auch 'developer' durch).
++        #
++        # GENAUE URSACHE (2026-08-17 eingegrenzt): das Request-Schema erlaubt
++        # user/assistant/system/developer/tool (server/schemas.py:279), das
++        # Qwen3.8-Template akzeptiert system/user/assistant/tool. Die Schnitt-
++        # menge laesst GENAU EINE Rolle durch die Validierung und in die
++        # Template-Ausnahme fallen: 'developer'. Alles andere (function,
++        # session_meta, admin) wird schon vom Schema mit HTTP 422 abgewiesen
++        # und erreicht das Template nie.
++        #
++        # Beide Abbildungen sind semantisch exakt, kein Rateschluss:
++        #   developer -> system : 'developer' ist OpenAIs neuerer Name fuer die
++        #                         Systemrolle. Nur wenn das Template die Rolle
++        #                         nicht selbst kennt (Qwen3.6 kennt sie und
++        #                         behandelt sie in Zeile 47 identisch zu system).
++        #                         DAS ist der Fix fuer den 500er.
++        #   function  -> tool    : 'function' ist die von 'tool' abgeloeste
++        #                         Vorgaengerrolle. Heute unerreichbar, weil das
++        #                         Schema vorher 422 wirft — bewusst als Vorsorge
++        #                         drin, falls das Schema je erweitert wird.
++        # Alles andere faellt weiterhin durch und wirft — absichtlich, damit
++        # echte Fehler sichtbar bleiben statt still umgedeutet zu werden.
++        # Abschalten: MLX_VLM_ROLE_COMPAT=0
++        if os.environ.get("MLX_VLM_ROLE_COMPAT", "1").lower() not in (
++            "0", "false", "no", "off",
++        ):
++            _dev_native = _template_references_kw(template_processor, "developer")
++            _out, _swaps = [], []
++            for _msg in messages:
++                if isinstance(_msg, dict):
++                    _role = _msg.get("role")
++                    if _role == "function":
++                        _msg = {**_msg, "role": "tool"}
++                        _swaps.append("function->tool")
++                    elif _role == "developer" and not _dev_native:
++                        _msg = {**_msg, "role": "system"}
++                        _swaps.append("developer->system")
++                _out.append(_msg)
++            if _swaps:
++                logging.getLogger(__name__).info(
++                    "role compat: remapped %s (set MLX_VLM_ROLE_COMPAT=0 to disable)",
++                    ", ".join(sorted(set(_swaps))),
++                )
++                messages = _out
++
+         try:
+             return template_processor.apply_chat_template(
+                 messages,
