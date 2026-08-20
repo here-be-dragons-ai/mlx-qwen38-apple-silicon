@@ -173,17 +173,25 @@ esac
 # Rollback: ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh
 ENABLE_SPEC_DECODE="${ENABLE_SPEC_DECODE:-1}"
 # DRAFT_KIND=mtp|dflash
-#   mtp     MTP-Kopf, 0,23 GiB. Default, weil ueber Wochen gemessen:
+#   mtp     MTP-Kopf, 0,23 GiB. Frueherer Default, weiter gepflegt:
 #           +58..132 % Decode, Acceptance 90 % JSON / 93 % Tool-Call,
 #           Ausgabe 7/7 bit-identisch.
-#   dflash  DFlash 2 (z-lab), 1,01 GiB in 4bit. Block-Diffusion-Drafter mit
+#   dflash  DEFAULT seit 2026-08-20. DFlash 2 (z-lab), 1,01 GiB in 4bit.
+#           Gemessen gegen MTP bei identischen Prompts (Decode aus predicted_ms):
+#             JSON  37,8 -> 44,2 t/s   Code 35,8 -> 42,6   Langkontext 36,0 -> 40,8
+#             Prosa 29,8 -> 29,9 t/s   (dort liegt MTP bei der Acceptance vorn)
+#           Der Gewinn steckt also in STRUKTURIERTER Ausgabe — Tool-Calls, JSON,
+#           Code — und damit genau in der Agentenlast. Die Acceptance-RATE ist
+#           bei beiden gleich (Median 80 % vs 81 %); DFlash 2 draftet pro Runde
+#           mehr Token (block_size 4 statt 3) und gewinnt darueber.
+#           Block-Diffusion-Drafter mit
 #           Pfad-Selektor. Braucht den lokalen Patch 0020 — mlx-vlm selbst
 #           implementiert nur DFlash v1.
 #           ACHTUNG BLOCKGROESSE: der Checkpoint ist auf block_size 8 ausgelegt,
 #           z-lab empfiehlt fuer quantisierte MLX-Modelle aber <= 5, und die
 #           eigene Kernelmessung zeigt bei M=5 eine Dispatch-Klippe
 #           (M=1 5,7 ms, M=4 6,3 ms, M=5 7,4 ms). Default hier deshalb 4.
-DRAFT_KIND="${DRAFT_KIND:-mtp}"
+DRAFT_KIND="${DRAFT_KIND:-dflash}"
 case "$DRAFT_KIND" in
   mtp)    _DRAFT_DEFAULT="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit";      _BLOCK_DEFAULT="" ;;
   dflash) _DRAFT_DEFAULT="$MODELS_ROOT/Qwen3.8-27B-DFlash2-4bit";  _BLOCK_DEFAULT="4" ;;
