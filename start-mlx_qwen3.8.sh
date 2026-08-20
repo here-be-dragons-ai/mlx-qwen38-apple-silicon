@@ -319,6 +319,24 @@ if [[ "$APC_SINGLE" != "0" && "$APC_SINGLE_OK" == "0" ]]; then
 fi
 
 # ── Drafter pruefen ───────────────────────────────────────────────────────────
+# DFlash 2 haengt an zwei lokalen Patches. Fehlt 0020, wuerde der Server beim
+# Laden des Drafters hart abbrechen (unerwartete Gewichte) — deshalb hier
+# abfangen und auf MTP zurueckfallen, statt den Start zu verlieren.
+if [[ "$DRAFT_KIND" == "dflash" && "$ENABLE_SPEC_DECODE" != "0" ]]; then
+  if ! grep -q "candidate_selector" \
+       "$SITE_PACKAGES/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py" 2>/dev/null; then
+    echo "⚠️  WARNUNG: Patch 0020 fehlt — DFlash 2 nicht ladbar, falle auf MTP zurueck." >&2
+    echo "    Fix:  ./patches/apply-patches.sh" >&2
+    DRAFT_KIND=mtp
+    DRAFT_MODEL="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit"
+    DRAFT_BLOCK_SIZE=""
+  elif ! grep -q "_speculative_batch_path_enabled" \
+         "$SITE_PACKAGES/mlx_vlm/server/generation.py" 2>/dev/null; then
+    echo "⚠️  WARNUNG: Patch 0021 fehlt — unter dflash greift dann KEIN Prefix-Cache" >&2
+    echo "    (jeder Turn zahlt den vollen Prefill). Fix:  ./patches/apply-patches.sh" >&2
+  fi
+fi
+
 SPEC_STATUS="OFF"
 if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   if [[ -f "$DRAFT_MODEL/config.json" ]]; then
@@ -492,6 +510,10 @@ args=(
 
 if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   args+=( --draft-model "$DRAFT_MODEL" --draft-kind "$DRAFT_KIND" )
+  # Ohne das laufen Nicht-MTP-Drafter in einer eigenen Generierungsschleife, die
+  # den APC-Manager nie verdrahtet: cached_tokens=0 in JEDEM Turn. Braucht
+  # Patch 0021. Gemessen: cached 0 -> 5748/5788, Decode unveraendert.
+  [[ "$DRAFT_KIND" != "mtp" ]] && export MLX_VLM_SPECULATIVE_BATCH=1
   [[ -n "$DRAFT_BLOCK_SIZE" ]] && args+=( --draft-block-size "$DRAFT_BLOCK_SIZE" )
 fi
 
