@@ -48,6 +48,21 @@
 #   Patch weiter. Deshalb ist DRAFT_KIND=mtp Default; s. README.
 #   Ohne DRAFT_KIND=dflash ist der Patch inert.
 #
+# 0021-speculative-apc-routing.patch   (LOKAL, Upstream-PR-Kandidat)
+#   Macht den Prefix-Cache fuer Nicht-MTP-Drafter ueberhaupt erst erreichbar.
+#   server/generation.py routet jeden Drafter ausser mtp in eine zweite
+#   Generierungsschleife (_run_speculative), die ihren eigenen Prompt-Cache baut
+#   und den apc_manager NIE verdrahtet — Folge: cached_tokens=0 in jedem Request,
+#   APC_TRACE zeigt keinen einzigen Lookup. Der Continuous-Batching-Pfad kann
+#   dflash laengst (generisch ueber draft_kind, bekommt apc_manager, draft_kind
+#   und draft_block_size in derselben Zeile); nur die Weiche hielt ihn fern.
+#   Der Patch macht den Batch-Pfad ueber MLX_VLM_SPECULATIVE_BATCH=1 erreichbar,
+#   Default unveraendert. Das Start-Skript setzt die Variable bei DRAFT_KIND!=mtp.
+#   GEMESSEN (5,8k-Konversation, Turn 2): cached 0 -> 5748/5788. Decode
+#   unveraendert (im Mittel 40,8 statt 41,5 t/s), beim 5767-Token-Prompt besser
+#   (38,4 -> 40,9 t/s). --draft-block-size wirkt weiter, MAX_NUM_SEQS=2 laeuft,
+#   MTP unveraendert (cached 5772).
+#
 # ── ERLEDIGT / OBSOLET ───────────────────────────────────────────────────────
 #
 # 0002-pr1901-apc-short-prompt.patch   ENTFERNT 2026-08-19 beim Upgrade auf

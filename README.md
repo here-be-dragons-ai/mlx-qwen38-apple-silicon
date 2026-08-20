@@ -361,28 +361,44 @@ Korrektheit: Ausgabe bei `temperature 0` **4/4 bit-identisch zum MTP-Drafter**,
 Tool-Call korrekt. Die portierten Module sind gegen die Referenz geprüft —
 81/81 Parameter in Name und Form, Conv `max|diff| = 0`, Selector-Pfade identisch.
 
-### Warum trotzdem MTP als Default: DFlash2 schaltet den Prefix-Cache ab
+### Der Prefix-Cache greift jetzt auch unter DFlash2
 
-Unter `DRAFT_KIND=dflash` meldet **jeder** Request `cached_tokens=0`, auch der
-zweite Turn derselben Konversation. `APC_TRACE=1` zeigt keinen einzigen
-Lookup- oder Store-Event — der APC-Pfad wird gar nicht erst betreten. Mit MTP
-trifft derselbe Test 5771 von 5791 Token.
+Ursprünglich meldete unter `DRAFT_KIND=dflash` **jeder** Request
+`cached_tokens=0`. Ursache gefunden: `server/generation.py` routet jeden
+Nicht-MTP-Drafter in eine zweite Generierungsschleife (`_run_speculative`), die
+ihren eigenen Prompt-Cache baut und den APC-Manager nie verdrahtet. Der
+Continuous-Batching-Pfad kann dflash längst — er ist durchgehend generisch über
+`draft_kind` und bekommt `apc_manager`, `draft_kind` und `draft_block_size` in
+derselben Zeile übergeben. Nur die Weiche hielt dflash davon fern.
 
-Das ist kein Effekt der Portierung (der Patch fasst nur die Drafter-Module an,
-und MTP trifft mit angewandtem Patch weiterhin), sondern der dflash-Integration
-in mlx-vlm. Gegenprobe: MTP mit künstlich ungechunktem Prefill
-(`PREFILL_STEP=65536`) trifft APC weiterhin — es liegt also nicht am Chunking.
+`patches/0021-speculative-apc-routing.patch` macht den Batch-Pfad über
+`MLX_VLM_SPECULATIVE_BATCH=1` erreichbar; das Start-Skript setzt die Variable
+automatisch, sobald `DRAFT_KIND != mtp`. Gemessen (5,8k-Konversation, Turn 2):
 
-**Die Rechnung, die es entscheidet:** ein kalter 5,8k-Prefill kostet 12–17 s,
-der Decode-Gewinn auf 60 Token liegt bei ~0,4 s. Für Agentenlast mit langen,
-wiederverwendeten Prompts ist DFlash2 damit netto ein deutliches Minus —
-für Einzelanfragen ohne Präfix-Wiederverwendung dagegen ein echter Gewinn.
+| | `cached_tokens` | Decode 64/66/76 Tok | 5767 Tok |
+|---|---|---|---|
+| MTP | 5772 / 5788 | 33,9 / 33,9 / 36,7 t/s | 33,9 t/s |
+| DFlash2, alte Schleife | **0** | 40,8 / 38,2 / 45,6 t/s | 38,4 t/s |
+| DFlash2, Batch-Pfad | **5748 / 5788** | 38,7 / 40,7 / 43,0 t/s | **40,9 t/s** |
 
-Wieder auszuwerten, sobald der dflash-Pfad APC unterstützt:
+Der Durchsatz bleibt also gleich (im Mittel 40,8 statt 41,5 t/s — Rauschen) und
+wird beim langen Prompt sogar besser, aber der Prefix-Cache ist wieder da.
+`--draft-block-size` wirkt weiterhin (Block 4 schlägt Block 8 auf beiden Pfaden),
+zwei parallele Requests mit `MAX_NUM_SEQS=2` laufen sauber, und MTP bleibt
+unverändert (`cached=5772`).
 
-```sh
-DRAFT_KIND=dflash APC_TRACE=1 ./start-mlx_qwen3.8.sh   # Turn 2 muss cached_tokens > 0 zeigen
-```
+### Warum MTP trotzdem noch Default ist
+
+Kein technischer Grund mehr — ein betrieblicher: DFlash2 hängt an **zwei**
+lokalen Patches (0020 für die Drafter-Module, 0021 fürs Routing). Ein
+`pip install -U mlx-vlm` ohne anschließendes `apply-patches.sh` würde den
+Drafter unladbar machen. Das Start-Skript fängt das ab — es prüft beide Patches
+und fällt notfalls mit Warnung auf MTP zurück — aber MTP läuft hier seit Wochen
+produktiv, DFlash2 seit Stunden.
+
+Empfehlung: ein paar Tage mit `DRAFT_KIND=dflash` fahren, dann den Default
+umstellen (eine Zeile im Start-Skript). Beide Patches sind als PR bei mlx-vlm
+eingereicht; sobald sie upstream sind, entfällt die Patch-Abhängigkeit.
 
 ---
 
