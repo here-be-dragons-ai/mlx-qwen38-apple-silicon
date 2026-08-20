@@ -1,0 +1,64 @@
+diff --git a/mlx_vlm/models/cache.py b/mlx_vlm/models/cache.py
+index ac4ae5fc4..dc18223b2 100644
+--- a/mlx_vlm/models/cache.py
++++ b/mlx_vlm/models/cache.py
+@@ -1961,10 +1961,13 @@ def meta_state(self, v):
+         self._idx, self.group_size, self.bits = map(int, v)
+ 
+     def is_trimmable(self):
+-        return False
++        return True
+ 
+     def trim(self, n):
+-        return 0
++        n = min(self._idx, n)
++        self._idx -= n
++        self.offset -= n
++        return n
+ 
+     def empty(self):
+         return self.keys is None
+diff --git a/mlx_vlm/models/qwen3_5/language.py b/mlx_vlm/models/qwen3_5/language.py
+index 6fa6b0b0f..3ff509083 100644
+--- a/mlx_vlm/models/qwen3_5/language.py
++++ b/mlx_vlm/models/qwen3_5/language.py
+@@ -1449,6 +1449,22 @@ def _qwen3_5_ragged_decode_attention(
+     return None if one_pass is None else one_pass[0]
+ 
+ 
++def _kv_seq_len(kv) -> int:
++    """Sequence length of a cache entry.
++
++    A quantized cache hands back (packed, scales, biases) rather than one
++    array, but every component still keeps the sequence on axis -2.
++    """
++    return (kv[0] if isinstance(kv, (tuple, list)) else kv).shape[-2]
++
++
++def _kv_prefix(kv, length: int):
++    """First length positions of a cache entry, quantized or not."""
++    if isinstance(kv, (tuple, list)):
++        return tuple(component[:, :, :length, :] for component in kv)
++    return kv[:, :, :length, :]
++
++
+ def _target_verify_left_padded_attention(
+     queries: mx.array,
+     keys: mx.array,
+@@ -1638,13 +1654,13 @@ def __call__(
+             output = None
+ 
+         if output is None and target_verify and L > 1:
+-            prefix_len = keys.shape[-2] - L
++            prefix_len = _kv_seq_len(keys) - L
+             output = mx.concatenate(
+                 [
+                     scaled_dot_product_attention(
+                         queries[:, :, i : i + 1, :],
+-                        keys[:, :, : prefix_len + i + 1, :],
+-                        values[:, :, : prefix_len + i + 1, :],
++                        _kv_prefix(keys, prefix_len + i + 1),
++                        _kv_prefix(values, prefix_len + i + 1),
+                         cache=cache,
+                         scale=self.scale,
+                         mask=(

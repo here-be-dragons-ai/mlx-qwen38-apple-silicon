@@ -63,6 +63,37 @@
 #   (38,4 -> 40,9 t/s). --draft-block-size wirkt weiter, MAX_NUM_SEQS=2 laeuft,
 #   MTP unveraendert (cached 5772).
 #
+# ── FREMDE, NOCH OFFENE UPSTREAM-PRs (cherry-gepickt) ────────────────────────
+# Beide sind Bugfixes anderer Leute, die upstream noch offen sind. Sobald sie
+# gemerged sind, meldet dieses Skript "KONFLIKT" — dann entfernen.
+#
+# 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, offen)
+#   "Fix speculative decoding against a quantized KV cache".
+#   SELBST REPRODUZIERT: mit KV_BITS=8 und MAX_NUM_SEQS=2 sterben zwei
+#   parallele Requests mit HTTP 500 und
+#     AttributeError: 'tuple' object has no attribute 'shape'
+#   Der Verify-Pfad nimmt an, keys sei EIN Array; ein quantisierter Cache liefert
+#   ein Tupel. Mit Patch laufen dieselben zwei Requests korrekt durch.
+#   BETRIFFT UNS bei MAX_NUM_SEQS > 1: das lean-Profil setzt KV_BITS=8. Mit
+#   MAX_NUM_SEQS=1 (unser Default in allen Profilen) tritt der Fehler NICHT auf —
+#   auch nicht bei 15838 Token und Quantisierung ab Token 0, extra geprueft.
+#
+# 0031-pr1835-recurrent-cache-no-trim.patch    (PR #1835, @kylesyx, offen)
+#   "Decline prefix-cache reuse for non-trimmable recurrent caches".
+#   _prefix_cache_trim_amount() prueft nur, ob der Praefix noch VORHANDEN ist,
+#   nicht ob der Cache ueberhaupt trimmbar ist. Die ArraysCache der 48
+#   GDN-Layer von Qwen3.8 ist beides nicht — sie faellt durch die Pruefung und
+#   der Aufrufer stirbt an c.trim(n_drop).
+#   SELBST REPRODUZIERT auf Einheitsebene mit den echten Cache-Klassen:
+#     ohne Patch  _prefix_cache_trim_amount([ArraysCache, KVCache], 10) = 10
+#                 -> AttributeError: 'ArraysCache' object has no attribute 'trim'
+#     mit  Patch  = None (Wiederverwendung abgelehnt), reines KVCache-Modell
+#                 liefert weiter 10 — keine Regression fuer Attention-Modelle.
+#   BETRIFFT UNSEREN SERVER NICHT: _prefix_cache_trim_amount wird nur aus
+#   dispatch.stream_generate aufgerufen, der Serverpfad geht da nicht durch.
+#   Drin als Vorsorge fuer mlx_vlm.chat_ui, die generate-CLI und eigene Skripte,
+#   die prompt_cache_state durchreichen.
+#
 # ── ERLEDIGT / OBSOLET ───────────────────────────────────────────────────────
 #
 # 0002-pr1901-apc-short-prompt.patch   ENTFERNT 2026-08-19 beim Upgrade auf

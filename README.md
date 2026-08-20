@@ -433,6 +433,25 @@ ps -o rss=,command= -p "$(pgrep -f mlx_vlm.server)" | awk '{printf "%.1f GiB\n",
 
 ## Patches
 
+Fünf Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
+(idempotent, `--check` / `--revert`). Sie verschwinden bei jedem
+`pip install -U mlx-vlm` — danach erneut ausführen.
+
+**Eigene:** `0010` (APC-Einzel-Snapshot), `0020` (DFlash-2-Module),
+`0021` (Prefix-Cache-Routing für Nicht-MTP-Drafter).
+
+**Fremde, noch offene Upstream-PRs** — beide selbst reproduziert und
+gegengetestet:
+
+| Patch | Wirkung | Betrifft uns |
+|---|---|---|
+| `0030` = [#1956](https://github.com/Blaizzy/mlx-vlm/pull/1956) | `KV_BITS` + Drafter + `MAX_NUM_SEQS>1` stirbt an `AttributeError: 'tuple' object has no attribute 'shape'` | nur bei `MAX_NUM_SEQS > 1`; mit 1 (unser Default) tritt es auch bei 15838 Token nicht auf |
+| `0031` = [#1835](https://github.com/Blaizzy/mlx-vlm/pull/1835) | Prefix-Wiederverwendung auf nicht-trimmbaren rekurrenten Caches (die 48 GDN-Layer) → `'ArraysCache' object has no attribute 'trim'` | **nicht** über den Server (`_prefix_cache_trim_amount` läuft nur in `stream_generate`); Vorsorge für `chat_ui` und eigene Skripte |
+
+Sobald einer davon upstream gemerged ist, meldet `apply-patches.sh` „KONFLIKT" —
+das ist das Signal, die Datei zu löschen.
+
+
 Zwei Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). Sie verschwinden bei jedem
 `pip install -U mlx-vlm` — danach erneut ausführen.
