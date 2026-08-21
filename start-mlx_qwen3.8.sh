@@ -31,10 +31,10 @@
 #   2/3 des RAM  →  32 GB = 21,33 GiB. Davon bleiben nach den Gewichten nur
 #   ~4,6 GiB fuer KV + Snapshots + Aktivierungen. Deshalb:
 #
-#     OHNE sysctl (21,3 GiB Budget) :  ~23k Token Kontext  → Hermes ctx 24576
-#     OHNE sysctl, dafuer KV_BITS=8 :  ~46k Token Kontext  → Hermes ctx 32768
-#     MIT  sysctl 26624 MB (26 GiB) :  ~48k Token Kontext  → Hermes ctx 49152
-#     MIT  sysctl + KV_BITS=8       :  ~97k Token Kontext  → Hermes ctx 65536
+#     OHNE sysctl (21,3 GiB Budget) :  ~23k Token Kontext  → Client-ctx 24576
+#     OHNE sysctl, dafuer KV_BITS=8 :  ~46k Token Kontext  → Client-ctx 32768
+#     MIT  sysctl 26624 MB (26 GiB) :  ~48k Token Kontext  → Client-ctx 49152
+#     MIT  sysctl + KV_BITS=8       :  ~97k Token Kontext  → Client-ctx 65536
 #
 #   Das Skript RECHNET dieses Budget beim Start aus den echten Werten der
 #   laufenden Maschine aus und druckt es (Abschnitt "Speicherbudget") — die
@@ -67,7 +67,10 @@ set -euo pipefail
 VENV_PY="${MLX_VENV_PY:-$HOME/src/mlx/.venv/bin/python}"
 MODELS_ROOT="${MLX_MODELS:-$HOME/src/mlx/models}"
 MODEL_DIR="${MODEL_DIR:-$MODELS_ROOT/Qwen3.8-27B-MLX-4bit}"
-LOG_FILE="${LOG_FILE:-$HOME/.hermes/logs/mlx-qwen3.8.log}"
+# Laufzeitdaten: Log und SSD-Prefix-Cache. Wer sie woanders haben will, setzt
+# STATE_DIR — oder LOG_FILE / APC_DISK einzeln.
+STATE_DIR="${STATE_DIR:-$HOME/.mlx-qwen38}"
+LOG_FILE="${LOG_FILE:-$STATE_DIR/logs/server.log}"
 # NICHT $HOST benutzen: zsh belegt diesen Parameter selbst mit dem Hostnamen,
 # ein "${HOST:-127.0.0.1}" wuerde den Server auf die LAN-Adresse binden.
 BIND_HOST="${BIND_HOST:-127.0.0.1}"
@@ -238,7 +241,7 @@ APC_ENTRIES="${APC_ENTRIES:-$_APC_ENTRIES}"
 # SSD-Tier: ueberlebt Serverneustarts, gemessen Faktor 256 auf einen kalten
 # 36k-Prefill. Auf dieser Maschine noch wertvoller, weil der Prefill langsamer
 # ist. Preis: ~2,3 GB Schreiblast pro 36k-Konversation → Deckel unten.
-APC_DISK="${APC_DISK:-$HOME/.hermes/apc}"
+APC_DISK="${APC_DISK:-$STATE_DIR/apc}"
 APC_DISK_MAX_GB="${APC_DISK_MAX_GB:-$_APC_MAXGB}"
 # Der Deckel ist nur eine Obergrenze — er muss auch auf die Platte passen.
 # Gemessen am 2026-08-20: der Tier stand mit 58 GB exakt am 60-GB-Deckel und
@@ -515,29 +518,37 @@ if [[ -z "$KV_BITS" && "$MAX_TOKENS_FIT" -lt 40000 ]]; then
   echo "      KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh   (vorher A/B messen)" >&2
 fi
 
-# ── Hermes-Abgleich (rein lesend) ─────────────────────────────────────────────
+# ── Client-Abgleich (optional, rein lesend) ───────────────────────────────────
 # mlx-vlm hat KEIN -c-Flag; der Kontext kommt aus der config.json (262144). Der
-# effektive Deckel ist also allein Hermes' model.context_length. Steht der ueber
-# dem Budget oben, laeuft der Server irgendwann in "[METAL] Insufficient Memory".
-HERMES_CFG="$HOME/.hermes/config.yaml"
-if [[ -f "$HERMES_CFG" ]]; then
+# effektive Deckel ist also allein das context_length des Clients. Steht das
+# ueber dem Budget oben, laeuft der Server irgendwann in
+# "[METAL] Insufficient Memory".
+#
+# Wer eine Client-Konfiguration im YAML-Format mit einem model:-Block fuehrt
+# (model.context_length, model.default), kann sie hier gegenpruefen lassen:
+#
+#   CLIENT_CONFIG=~/pfad/zu/config.yaml ./start-mlx_qwen3.8.sh
+#
+# Ohne die Variable ist der Block inert. Er aendert nichts, er warnt nur.
+CLIENT_CONFIG="${CLIENT_CONFIG:-}"
+if [[ -n "$CLIENT_CONFIG" && -f "$CLIENT_CONFIG" ]]; then
   CONFIG_CTX=$(awk '
     /^model:/ { in_model=1; next }
     in_model && /^[a-zA-Z_]/ { in_model=0 }
     in_model && /context_length:/ { gsub(/[^0-9]/,"",$0); print; exit }
-  ' "$HERMES_CFG")
+  ' "$CLIENT_CONFIG")
   if [[ -n "$CONFIG_CTX" && "$CONFIG_CTX" -gt "$MAX_TOKENS_FIT" ]]; then
-    echo "⚠️  WARNUNG: config.yaml model.context_length=$CONFIG_CTX > Budget $MAX_TOKENS_FIT." >&2
-    echo "    Hermes wird Prompts bauen, die hier nicht mehr in den Speicher passen." >&2
+    echo "⚠️  WARNUNG: ${CLIENT_CONFIG:t} model.context_length=$CONFIG_CTX > Budget $MAX_TOKENS_FIT." >&2
+    echo "    Der Client wird Prompts bauen, die hier nicht mehr in den Speicher passen." >&2
     echo "    Entweder context_length senken oder KV_BITS=8 / wired_limit anheben." >&2
   fi
   CONFIG_MODEL=$(awk '
     /^model:/ { in_model=1; next }
     in_model && /^[a-zA-Z_]/ { in_model=0 }
     in_model && /default:/ { sub(/^[^:]*:[[:space:]]*/,""); gsub(/["\x27]/,""); print; exit }
-  ' "$HERMES_CFG")
+  ' "$CLIENT_CONFIG")
   if [[ -n "$CONFIG_MODEL" && "$CONFIG_MODEL" != "$MODEL_ALIAS" ]]; then
-    echo "⚠️  WARNUNG: config.yaml model.default='$CONFIG_MODEL' != Alias '$MODEL_ALIAS'." >&2
+    echo "⚠️  WARNUNG: ${CLIENT_CONFIG:t} model.default='$CONFIG_MODEL' != Alias '$MODEL_ALIAS'." >&2
     echo "    Bei mlx-vlm IST der Request-Modellname der Ladepfad — Abweichung fuehrt" >&2
     echo "    zu Reload + HF-Download (401). Angleichen oder:" >&2
     echo "      MODEL_ALIAS='$CONFIG_MODEL' ./start-mlx_qwen3.8.sh" >&2
@@ -546,7 +557,7 @@ fi
 
 # ── Thinking ──────────────────────────────────────────────────────────────────
 # Serverseitig AUS (mlx-vlm schickt enable_thinking immer ans Template, Default
-# false). Hermes/pi.dev setzen pro Request enable_thinking:true +
+# false). Der Client setzt pro Request enable_thinking:true +
 # reasoning_effort:low. GUELTIG SIND NUR low|medium|xhigh — jeder andere Wert,
 # auch "none", wirft im Template eine Exception → HTTP 500. Ohne Angabe
 # defaultet das Template auf 'xhigh' (gemessen 1269 statt 428 Completion-Tokens).
