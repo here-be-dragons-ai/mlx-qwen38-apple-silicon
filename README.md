@@ -17,12 +17,23 @@ selbst:
 |---|---|---|---|
 | `lean` | 32 GB **ohne** `sudo` | ~18,8 GiB | 32768 |
 | `balanced` | 32 GB mit `wired_limit 26624` | ~25,0 GiB | 49152 |
-| `roomy` | 48 GB mit `wired_limit 45056` | ~28 GiB | 98304 |
+| `roomy` | 48 GB mit `wired_limit 40960` | ~28 GiB | 98304 |
 
 Getestet auf macOS 26. `roomy` ist das ursprüngliche, über Wochen produktiv
 gefahrene M5-Pro-Setup; die 32-GB-Profile sind daraus gerechnet. Das
 Start-Skript ermittelt das Speicherbudget zur Laufzeit aus den echten Werten
 der Maschine und warnt, wenn die Client-Konfiguration darüber liegt.
+
+> **`roomy` stand bis 2026-08-21 auf `wired_limit 45056`.** Das sind 44 GiB
+> Metal-Working-Set auf einer 48-GiB-Maschine — macOS bleiben ~2 GiB, und das
+> reicht nicht. Am 2026-08-21 um 12:30 hat die Testmaschine deshalb eine
+> **Kernel-Panik** geworfen (`watchdog timeout: no checkins from watchdogd in
+> 93 seconds`): 45,8 GiB von 48 GiB standen als *wired*, der auslagerbare Pool
+> war unter 1 MB, und der Pageout-Scanner bekam nur 252 von 3086 angeforderten
+> Seiten zurück. Die Falle dabei: `memoryPressure` meldete `false`, weil macOS'
+> Pressure-Metrik den Compressor bewertet und **nicht** Wired — es gibt bei
+> GPU-Wired keinen Jetsam, der vorher eingreift. Das Limit ist der einzige
+> Schutz, deshalb jetzt 40960 (40 GiB, lässt macOS 8 GiB).
 
 ---
 
@@ -32,6 +43,7 @@ der Maschine und warnt, wenn die Client-Konfiguration darüber liegt.
 |---|---|
 | Hardware | Apple Silicon (arm64), ≥ 32 GB Unified Memory |
 | macOS | aktuell, mit Xcode Command Line Tools (`xcode-select --install`) |
+| Xcode | **nur für den mlx-Quellbau** (s. u.): Xcode.app + Metal-Toolchain. Ohne ihn läuft alles, nur `head_dim 256` bleibt unfused |
 | Platte | ~20 GB für Modell + Drafter, dazu bis zu 40 GB für den SSD-Prefix-Cache |
 | Netz | einmalig ~15 GB Download von HuggingFace |
 
@@ -49,7 +61,7 @@ cd mlx-qwen38-apple-silicon
 ./install-prereqs.sh
 
 # 2. GPU-Wired-Limit anheben — der wichtigste Schritt (s.u.)
-sudo sysctl -w iogpu.wired_limit_mb=26624    # 32 GB;  48 GB → 45056
+sudo sysctl -w iogpu.wired_limit_mb=26624    # 32 GB;  48 GB → 40960
 
 # 3. Server starten (127.0.0.1:8888)
 ./start-mlx_qwen3.8.sh
@@ -72,7 +84,8 @@ Metal-Selbsttest → Patches → Modell + MTP-Drafter → `~/.mlx-qwen38/{logs,a
 Pfade sind über Env steuerbar: `MLX_HOME` (Default `~/src/mlx`), `MLX_MODELS`,
 `PYTHON_VERSION`.
 
-**Gepinnter, verifizierter Stand:** `mlx 0.32.1`, `mlx-lm 0.31.3`,
+**Gepinnter, verifizierter Stand:** `mlx 0.32.2.dev` **aus dem Quellbau**
+(s. u.; `install-prereqs.sh` pinnt weiterhin `mlx 0.32.1` von PyPI), `mlx-lm 0.31.3`,
 **`mlx-vlm 0.6.15`**, `transformers 5.15.0`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 `mlx-vlm >= 0.6.13` ist Pflicht — erst dort ist Prefix-Caching upstream korrekt
@@ -97,19 +110,54 @@ mlx 0.32.1", gemerged 34 Minuten *vor* dem 0.6.15-Release) — unter anderem
 `mx.clear_streams()` beim Thread-Ende und contiguous Views bei der
 KV-Dequantisierung. Der Stand passt also zusammen.
 
-> **Offen: mlx 0.32.2.** Für Qwen3.8 hängt daran der einzige echte
-> Kernel-Gewinn: `head_dim 256` bekommt wieder einen fused Full-Attention-Pfad
-> ([#4185](https://github.com/ml-explore/mlx/pull/4185), plus
-> [#3842](https://github.com/ml-explore/mlx/pull/3842) für NAX/M5). Beide sind
-> **nach** dem `0.32.1`-Tag gemerged; auf PyPI gibt es 0.32.2 noch nicht (auch
-> nicht als `mlx-metal`/`mlx-cpu`), GitHub-Releases führen keine Wheels, und
-> conda-forge steht auf 0.32.0. Ein Quellbau scheitert an
-> `xcrun: unable to find utility "metal"` — der Metal-Compiler steckt in
-> Xcode.app, die Command Line Tools allein reichen nicht.
-> Patch `0013` liegt deshalb fertig im Baum und ist auf 0.32.0 **und** 0.32.1
-> als **inert verifiziert** (`_FORCE_FUSED == False`). Er schaltet sich von
-> selbst scharf, sobald 0.32.2 installiert ist — der Versionsbump steht bereits
-> auf `main`.
+### mlx 0.32.2 — seit 2026-08-21 aus dem Quellbau
+
+Für Qwen3.8 hängt daran der einzige echte Kernel-Gewinn: `head_dim 256` bekommt
+wieder einen fused Full-Attention-Pfad
+([#4185](https://github.com/ml-explore/mlx/pull/4185), plus
+[#3842](https://github.com/ml-explore/mlx/pull/3842) für NAX/M5). Beide sind
+**nach** dem `0.32.1`-Tag gemerged, und **auf PyPI gibt es 0.32.2 bis heute
+nicht** (auch nicht als `mlx-metal`/`mlx-cpu`). Deshalb wird mlx hier gebaut:
+
+```sh
+# Voraussetzung: Xcode.app + Metal-Toolchain. Die Command Line Tools reichen
+# NICHT — ohne sie: xcrun: unable to find utility "metal"
+sudo xcodebuild -license accept
+xcodebuild -downloadComponent MetalToolchain      # ~690 MB
+xcrun -sdk macosx metal --version                 # muss durchlaufen
+
+git clone https://github.com/ml-explore/mlx.git ~/src/mlx-core
+cd ~/src/mlx-core
+CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=14 \
+  uv build --wheel --python ~/src/mlx/.venv/bin/python
+
+# mlx und mlx-metal teilen sich das mlx/-Verzeichnis; der Quellbau ist
+# monolithisch, also BEIDE vorher weg
+uv pip uninstall --python ~/src/mlx/.venv/bin/python mlx mlx-metal
+uv pip install   --python ~/src/mlx/.venv/bin/python dist/mlx-0.32.2.dev*.whl
+```
+
+> **`--python` ist Pflicht.** Ohne baut `uv` gegen sein Default-Python und legt
+> ein `cp313`-Wheel ab; das venv läuft auf 3.12, und das Wheel passt dann nicht.
+>
+> **`uv pip install -U mlx` fällt auf 0.32.1 zurück** und schaltet Patch `0013`
+> wieder ab. Das Start-Banner zeigt es (`Full-Attn: unfused …`), aber erst nach
+> dem nächsten Neustart.
+
+Patch `0013` ist damit scharf (`_FORCE_FUSED == True`). Gemessen mit
+`0.32.2.dev20260821+a082cb91`, Produktionsform `qL=512` / `kL=22747`, 24 Heads /
+4 KV-Heads / `head_dim 256`:
+
+| | Peak |
+|---|---|
+| `force_fused=False` | 662 MiB |
+| `force_fused=True` | **123 MiB** |
+
+Die Differenz von 539 MiB ist der Score-Transient (theoretisch 533 MiB). Der
+Blowup hängt an der **asymmetrischen Form `qL << kL`**, nicht an der Maskenart —
+ein Benchmark mit `qL = kL` zeigt ihn *nicht*. Praktische Folge auf 37,4 GiB
+Working-Set: der Prefill starb vorher bei 22.747 Token in `[METAL] Insufficient
+Memory`, danach liefen **37.822 Token in 91,8 s** durch.
 
 ### Wired-Limit persistent machen
 
@@ -137,14 +185,20 @@ ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh   # ohne Drafter
 
 | | `lean` | `balanced` | `roomy` |
 |---|---|---|---|
-| Zielmaschine | 32 GB ohne sudo | 32 GB, `wired_limit 26624` | 48 GB, `wired_limit 45056` |
-| `APC_ENTRIES` | 1 | 2 | 3 mit `wired_limit`, sonst 2 |
+| Zielmaschine | 32 GB ohne sudo | 32 GB, `wired_limit 26624` | 48 GB, `wired_limit 40960` |
+| `APC_ENTRIES` | 1 | 2 | 1 (s. Messung unten) |
 | `KV_BITS` | 8 (ab 8k Token) | — (f16) | — (f16) |
-| `PREFILL_STEP` | 512 | 1024 | 2048 |
+| `PREFILL_STEP` | 512 | 1024 | 2048 (ohne `wired_limit` 512) |
 | `VISION_CACHE` | 1 | 4 | 20 |
 | `APC_DISK_MAX_GB` | 40 | 40 | 80 (plattenabhängig gekappt) |
 | **Peak-RAM** | **~18,8 GiB** @ 29k | ~25,0 GiB @ 43k | ~30 GiB @ 90k (ger.) |
 | `context_length` | 32768 | 49152 | 98304 |
+
+> **Bei aktivem fused Pfad** (mlx-Quellbau, s. o.) zieht das Skript
+> `PREFILL_STEP` automatisch auf mindestens **1024** — der NAX-Kernel aus #3842
+> verlangt ausdrücklich `query_sequence_length >= 1024` und greift bei 512 gar
+> nicht. Der Score-Transient, aus dem die 512 überhaupt entstanden sind, fällt
+> dann weg. Eine explizite Vorgabe `PREFILL_STEP=…` bleibt unangetastet.
 
 **`PROFILE=auto`** (Default) entscheidet anhand des Metal-Working-Sets:
 ≥ 30 GiB → `roomy`, ≥ 24 GiB → `balanced`, sonst `lean`. Der Working-Set wird
@@ -165,21 +219,25 @@ f16).
 > es ~142k Token, das Profil deckt seine eigene Empfehlung jetzt ab.
 >
 > **Aber nur mit gesetztem `wired_limit`.** Ohne `sudo sysctl -w
-> iogpu.wired_limit_mb=45056` gibt macOS auf 48 GB nur 37,4 GiB Working-Set,
+> iogpu.wired_limit_mb=40960` gibt macOS auf 48 GB nur 37,4 GiB Working-Set,
 > und daraus werden ~107k Token — 98304 trägt, 131072 nicht. Die maßgebliche
 > Zahl steht bei jedem Start in der Zeile `→ KONTEXT-BUDGET` im Banner.
 >
-> **Seit 2026-08-20 hängt auch `APC_ENTRIES` daran** (s. „Kalte Prefills"). Das
-> Skript liest `iogpu.wired_limit_mb` selbst und wählt auf `roomy` drei
-> Snapshots statt zwei, sobald das Limit steht:
+> **Die 44-GiB-Zahlen hier sind historisch.** Sie stammen von `wired_limit
+> 45056` vor der Kernel-Panik vom 2026-08-21 und aus der Zeit vor dem fused
+> Pfad. Mit aktivem Patch `0013` fällt der Prefill-Transient aus der
+> Budgetrechnung heraus, und die Budgets liegen deutlich höher — auf 37,4 GiB
+> Working-Set meldet das Banner ~161k Token. Verlass dich auf das Banner, nicht
+> auf diese Tabellen.
 >
-> | | 3 Kopien (`APC_ENTRIES=2`) | 4 Kopien (`APC_ENTRIES=3`) |
-> |---|---|---|
-> | ohne `wired_limit` (36 GiB WS) | ~103k Token | ~77k — **unter 98304** |
-> | mit `wired_limit 45056` (44 GiB WS) | ~147k Token | ~109k Token |
->
-> Ohne Limit bleibt es deshalb bei 2. Kalte Prefills gegen
-> `[METAL] Insufficient Memory` zu tauschen wäre der schlechtere Handel.
+> **Von 2026-08-20 bis 2026-08-21 hing auch `APC_ENTRIES` am `wired_limit`** —
+> drei Snapshots statt zwei, sobald das Limit stand. Das ist **zurückgenommen**.
+> Die Kopplung stützte sich auf genau die Budgetrechnung, die der
+> Speicher-Sampler am 2026-08-21 widerlegt hat (s. „Was der Sampler misst").
+> Sie hatte einen unangenehmen Nebeneffekt: `sudo sysctl -w
+> iogpu.wired_limit_mb=40960` hob zwar die Decke um 2,5 GiB, verdoppelte aber
+> gleichzeitig die Snapshot-Zahl — netto ein Rückschritt. `roomy` steht jetzt
+> fest auf `APC_ENTRIES=1`.
 
 Beim Start druckt das Skript das errechnete Speicherbudget dieser Maschine:
 
@@ -209,6 +267,51 @@ Wichtigste Env-Schalter (alle mit Begründung im Skriptkopf dokumentiert):
 > geladene Modell weg und startet einen HuggingFace-Download (→ 401, obwohl das
 > Modell lokal liegt). Das Skript legt dafür einen Symlink an und warnt bei
 > Abweichung.
+
+---
+
+## Was der Sampler misst
+
+Seit 2026-08-21 schreibt das Start-Skript alle 5 s eine Speicherzeile ins
+`server.log` (`MEM_PROBE_INTERVAL=0` schaltet ab, ab 85 % wird daraus ein
+`WARNING`):
+
+```
+2026-08-21 14:23:13 - WARNING - mem active=37.78 cache=0.13 sum=37.91 GiB (95% von 40.00 GiB Working-Set) peak=39.49 GiB
+```
+
+Der Sampler hängt sich **nicht** in `mlx-vlm` ein — das Skript startet
+`mlx_vlm.server` über einen `runpy`-Bootstrap mit einem Daemon-Thread davor. Ein
+Patch in `site-packages` wäre nach jedem `mlx-vlm`-Update wieder weg. Von außen
+ist die Zahl nicht messbar: RSS enthält die Metal-Buffer nicht (gemessen 2,3 GiB
+RSS bei 16 GiB Gewichten).
+
+**Warum das drin ist.** Die Speicherrechnung unten ist eine Obergrenze, keine
+Zusage. Erster Lauf mit Sampler, `roomy`, Working-Set 40 GiB, `APC_ENTRIES=3`:
+
+| Zeitpunkt | `active` |
+|---|---|
+| nach Modell + Drafter, idle | **15,96 GiB** ← Baseline, deckt sich mit der Tabelle |
+| nach 1 Request à 13.112 Token | 27,35 GiB ← **+11,4 GiB** |
+| nach 4 Requests | 35,54 GiB |
+| bei 23.091 Token | 37,78 GiB → 95 %, der nächste Prefill starb im OOM |
+
+Die Rechnung setzt für diesen 13k-Request 1,6 GiB an (4 Kopien × 32 KiB/Token).
+Real sind es 11,4 — **Faktor 7** — und `active` fällt zwischen den Requests
+nicht zurück. `cache` liegt dabei durchgehend nahe null, der Puffer-Cache ist
+also nicht die Ursache: mlx gibt ihn bei `gc_limit_ = 0,95 × Working-Set`
+korrekt frei (`mlx/backend/metal/allocator.cpp`). Es ist **lebender** Speicher,
+und für den gibt es unterhalb des Working-Sets keine Bremse.
+
+Wohin die Differenz genau geht, ist offen. Bis das geklärt ist, steht
+`APC_ENTRIES` auf `roomy` fest auf 1, und das `KONTEXT-BUDGET` im Banner ist als
+Obergrenze markiert. **Maßgeblich sind die `mem`-Zeilen, nicht die Rechnung.**
+
+> **`KV_BITS=8` hilft hier nicht.** Naheliegend, weil ohne Score-Transient die
+> 64 KiB/Token dominieren — aber `apc_adapters.py:515` ruft beim Snapshot-Store
+> `dequantize_for_apc()`. Quantisiert wird nur der lebende Cache, die
+> APC-Snapshots bleiben f16. Gemessen: Decode 22,9 → 18,7 tok/s (Mittel aus 6
+> bzw. 8 Requests), `active` kletterte unverändert auf 37,78 GiB, gleicher OOM.
 
 ---
 
@@ -255,7 +358,10 @@ Dazu kommen 5–6 GB für macOS selbst; das ist der Grund, warum auf 32 GB bei
 
 Metals `max_recommended_working_set_size` ist auf Macs **≤ 36 GB per Default
 2/3 des RAM** → auf 32 GB nur 21,33 GiB. `iogpu.wired_limit_mb` setzt diesen
-Wert direkt (verifiziert: `wired_limit_mb=45056` → Working-Set exakt 44 GiB).
+Wert direkt (verifiziert: `wired_limit_mb=45056` → Working-Set exakt 44 GiB;
+der Wert ist 1:1, `40960` → 40 GiB). **Nicht über 40960 auf einer 48-GiB-
+Maschine** — bei 44 GiB bleiben macOS ~2 GiB, und das endet in einer
+Kernel-Panik statt in einem Metal-Fehler (s. oben).
 
 | `iogpu.wired_limit_mb` | KV | Budget | empfohlenes `context_length` |
 |---|---|---|---|
@@ -314,10 +420,13 @@ Rechnung für 65536: (65536 − 8192) × 0,85 → Kompaktierung bei ~48,7k,
 Spitzenprompt ~57k — unter dem Budget.
 
 > **Warum für `roomy` hier 65536 steht und nicht die 98304 aus der
-> Profiltabelle:** die Profilzahl gilt **mit** gesetztem
-> `iogpu.wired_limit_mb=45056` (44 GiB Working-Set). Ohne das Limit gibt macOS
-> auf 48 GB nur 37,4 GiB, und dann ist 98304 rechnerisch am Anschlag — der
-> Bedarf liegt bei 35,9 GiB, es bleiben 0,1 GiB übrig:
+> Profiltabelle:** die Profilzahl galt **mit** gesetztem `wired_limit` (die
+> Tabelle unten rechnet mit den historischen 44 GiB, s. o.). Ohne das Limit
+> gibt macOS auf 48 GB nur 37,4 GiB, und dann ist 98304 rechnerisch am
+> Anschlag — der Bedarf liegt bei 35,9 GiB, es bleiben 0,1 GiB übrig:
+>
+> Das gilt für den **unfused** Pfad. Mit dem mlx-Quellbau fällt der
+> Prefill-Transient weg, und 98304 trägt auch auf 37,4 GiB.
 >
 > | `context_length` | Bedarf (3 Kopien) | bei 37,4 GiB | mit 44 GiB |
 > |---|---|---|---|
@@ -688,6 +797,9 @@ Im Einzelnen:
   hier zutrifft. Eng gefasst: nur `qL > 1` (Prefill/Verify, nicht Decode), nur
   `head_dim` 192/256, ohne Array-Maske, ohne Sinks. **Auf mlx < 0.32.2 inert**
   (Probe beim Import fällt auf `TypeError`; auf 0.32.0 und 0.32.1 verifiziert).
+  **Seit dem Quellbau vom 2026-08-21 aktiv** (`_FORCE_FUSED == True`), gemessen
+  bei `qL=512` / `kL=22747`: Peak 662 → 123 MiB, Prefill-Decke 22.747 → 37.822
+  Token. Das Start-Banner zeigt den Zustand in der Zeile `Full-Attn:`.
   Rollback: `QWEN38_FORCE_FUSED_SDPA=0`.
 - **`0014-quantized-kv-start-uniform.patch`** — lokal, kein Upstream-PR.
   `quantized_kv_start` galt auf dem Batch-Pfad nur für TurboQuant
