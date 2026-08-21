@@ -10,10 +10,20 @@
   bzw. Kernel-Panic. Konservativ: 24576. Nur-Inferenz-Maschine: 28672.
 
   AUF ANDEREN RAM-GROESSEN den Wert unten anpassen (Faustregel: RAM minus
-  5-6 GB fuer macOS):
-      32 GB → 26624   (Profil balanced)
-      48 GB → 45056   (Profil roomy)
-      64 GB → 59392
+  6-8 GB fuer macOS — der Rest zaehlt absolut, nicht relativ, also auf
+  groesseren Maschinen eher mehr abziehen):
+      32 GB → 26624   (Profil balanced, laesst 6 GiB)
+      48 GB → 40960   (Profil roomy,    laesst 8 GiB)
+      64 GB → 57344   (                 laesst 8 GiB)
+
+  GEGENBEISPIEL, gemessen: 48 GB mit 45056 (44 GiB) laesst macOS ~2 GiB. Am
+  2026-08-21 um 12:30 ist die Testmaschine damit in eine Kernel-Panik gelaufen
+  ("watchdog timeout: no checkins from watchdogd in 93 seconds"): 45,8 GiB von
+  48 GiB standen als wired, der auslagerbare Pool unter 1 MB, und der
+  Pageout-Scanner bekam nur 252 von 3086 Seiten zurueck. Es gibt dabei KEINE
+  Vorwarnung — macOS' memoryPressure bewertet den Compressor, nicht Wired, und
+  meldete waehrenddessen "false". Jetsam greift deshalb auch nicht ein. Der
+  einzige Schutz ist dieser Wert.
 
   Installation (braucht sudo, aendert Systemzustand):
     sudo cp com.local.iogpu-wired-limit.plist /Library/LaunchDaemons/
