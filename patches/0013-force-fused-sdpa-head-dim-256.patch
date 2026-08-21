@@ -1,0 +1,121 @@
+--- a/mlx_vlm/models/base.py
++++ b/mlx_vlm/models/base.py
+@@ -1,5 +1,7 @@
+ import inspect
++import logging
+ import math
++import os
+ from abc import abstractmethod
+ from dataclasses import dataclass
+ from typing import Dict, List, Optional
+@@ -300,8 +302,94 @@
+         out = mx.reshape(out, (B, n_q_heads, L, D))
+ 
+     return out
++
++
++# ── Fused Full-Attention fuer head_dim 192/256 (lokaler Patch 0013) ──────────
++# Qwen3.8-27B hat head_dim 256. mlx' Default-Dispatch laesst fused Full-Attn nur
++# fuer head_dim 64/80/128 zu; alles andere faellt auf den unfused Graph zurueck,
++# der pro Full-Attn-Layer einen Score-Transienten von O(n_heads x qL x kL)
++# materialisiert. Genau das macht PREFILL_STEP bei uns ueberhaupt erst zu einem
++# RAM-Hebel.
++# mlx 0.32.2 (PR #4185) stellt die 192/256-Kernel wieder her, erreichbar NUR
++# ueber force_fused=True — der Default-Dispatch routet weiterhin nicht dorthin.
++# Begruendung aus dem PR: die Entscheidung gehoert der Runtime, die ihr
++# Speicherbudget kennt. Das ist hier der Fall.
++# PR #3842 ergaenzt auf NAX-Geraeten (M5) einen fused Pfad speziell fuer
++# head_dim 256; Bedingung u. a. qL >= 1024 → PREFILL_STEP muss >= 1024 bleiben,
++# sonst greift er nicht (PROFILE=lean setzt 512).
++#
++# Inert auf mlx < 0.32.2: die Probe faellt auf TypeError, der Pfad bleibt aus.
++# Rollback: QWEN38_FORCE_FUSED_SDPA=0
++_FORCE_FUSED_HEAD_DIMS = (192, 256)
++
++
++def _probe_force_fused() -> bool:
++    if os.environ.get("QWEN38_FORCE_FUSED_SDPA", "1").lower() in ("0", "false", "no"):
++        return False
++    try:
++        q = mx.zeros((1, 1, 1, 128), dtype=mx.bfloat16)
++        mx.eval(
++            mx.fast.scaled_dot_product_attention(
++                q, q, q, scale=1.0, mask=None, force_fused=False
++            )
++        )
++        return True
++    except TypeError:
++        return False  # mlx < 0.32.2 kennt force_fused nicht
++    except Exception:
++        return False
+ 
+ 
++_FORCE_FUSED = _probe_force_fused()
++# Wird gesetzt, sobald force_fused einmal wirft (keine passende Kernel-Form).
++# Danach bleibt es beim Default-Dispatch, statt pro Aufruf erneut zu werfen.
++_FORCE_FUSED_DISABLED = False
++
++
++def _sdpa_maybe_fused(queries, keys, values, scale, mask, sinks):
++    """mx.fast.scaled_dot_product_attention, fused wo es sich lohnt.
++
++    Eng gefasst: nur Prefill/Verify (qL > 1), nur head_dim 192/256, nur ohne
++    Array-Maske und ohne Sinks. Decode (qL == 1) laeuft weiter ueber den
++    Default-Dispatch — dort sind die sdpa_vector-Kernel schneller.
++    """
++    global _FORCE_FUSED_DISABLED
++    if (
++        _FORCE_FUSED
++        and not _FORCE_FUSED_DISABLED
++        and sinks is None
++        and queries.shape[-1] in _FORCE_FUSED_HEAD_DIMS
++        and queries.shape[-2] > 1
++        and (mask is None or (isinstance(mask, str) and mask == "causal"))
++    ):
++        try:
++            return mx.fast.scaled_dot_product_attention(
++                queries,
++                keys,
++                values,
++                scale=scale,
++                mask=mask,
++                force_fused=True,
++            )
++        except Exception as exc:
++            _FORCE_FUSED_DISABLED = True
++            logging.getLogger(__name__).warning(
++                "force_fused SDPA nicht verfuegbar fuer head_dim=%s qL=%s (%s) — "
++                "ab jetzt Default-Dispatch.",
++                queries.shape[-1],
++                queries.shape[-2],
++                exc,
++            )
++    return mx.fast.scaled_dot_product_attention(
++        queries,
++        keys,
++        values,
++        scale=scale,
++        mask=mask,
++        sinks=sinks,
++    )
++
++
+ def scaled_dot_product_attention(
+     queries,
+     keys,
+@@ -363,14 +451,7 @@
+             bits=cache.bits,
+         )
+ 
+-    return mx.fast.scaled_dot_product_attention(
+-        queries,
+-        keys,
+-        values,
+-        scale=scale,
+-        mask=mask,
+-        sinks=sinks,
+-    )
++    return _sdpa_maybe_fused(queries, keys, values, scale, mask, sinks)
+ 
+ 
+ def expand2square(pil_img, background_color):

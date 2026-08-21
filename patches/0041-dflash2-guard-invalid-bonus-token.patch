@@ -1,7 +1,7 @@
---- a/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py	2026-08-20 10:39:04
-+++ b/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py	2026-08-20 10:39:04
-@@ -339,6 +339,23 @@
-     ) -> mx.array:
+--- a/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
++++ b/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
+@@ -447,6 +447,27 @@
+     ):
          mask_id = int(self.config.mask_token_id)
          if isinstance(last_bonus, int):
 +            # ── Guard gegen korrupte Bonus-Tokens (lokaler Patch, 2026-08-20)
@@ -14,12 +14,16 @@
 +            # nennt den Wert, damit der naechste Treffer zur Quelle fuehrt statt
 +            # im C++-Cast zu enden. Kein Clamping: ein stillschweigend ersetztes
 +            # Token wuerde die Ausgabe verfaelschen statt den Bug zu zeigen.
++            # Sitzt seit PR #1959 hier statt in DFlashDraftModel.draft_block:
++            # DFlash2 baut den Block in propose_block, die v1-Methode ist fuer
++            # diesen Drafter tot. Nur der int-Zweig kann bad_cast ausloesen —
++            # der Array-Zweig geht ueber astype() und wirft lesbar.
 +            _vocab = int(getattr(self.config, "vocab_size", 0) or 0) or (1 << 31)
 +            if not 0 <= last_bonus < _vocab:
 +                raise ValueError(
-+                    "DFlash draft_block: Bonus-Token ausserhalb des Vokabulars "
-+                    f"({last_bonus!r}, erwartet 0..{_vocab - 1}). Der Wert stammt "
-+                    "aus dem vorigen _speculative_walk."
++                    "DFlash2 propose_block: Bonus-Token ausserhalb des "
++                    f"Vokabulars ({last_bonus!r}, erwartet 0..{_vocab - 1}). "
++                    "Der Wert stammt aus dem vorigen _speculative_walk."
 +                )
              block = mx.array(
                  [[last_bonus] + [mask_id] * (block_size - 1)],

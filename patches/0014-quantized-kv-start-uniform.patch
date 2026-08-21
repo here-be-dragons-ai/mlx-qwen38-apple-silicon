@@ -1,0 +1,39 @@
+--- a/mlx_vlm/generate/ar.py
++++ b/mlx_vlm/generate/ar.py
+@@ -782,14 +782,32 @@
+ 
+     use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
+ 
+-    defer_turbo = (
+-        use_turbo and quantized_kv_start > 0 and prefill_length < quantized_kv_start
++    # ── quantized_kv_start gilt jetzt auch fuer uniform (lokaler Patch 0014)
++    # Upstream wertet quantized_kv_start ausschliesslich im TurboQuant-Zweig aus
++    # (defer_turbo). Auf dem uniform-Pfad — also bei --kv-bits ohne
++    # --kv-quant-scheme turboquant, unserem Default — wurde ab Token 0
++    # quantisiert, egal was --quantized-kv-start sagt. Sichtbar wird das erst,
++    # seit DFlash 2 Default ist: das Start-Skript setzt dafuer
++    # MLX_VLM_SPECULATIVE_BATCH=1, und damit laeuft der Batch-Pfad im
++    # Normalbetrieb, nicht mehr nur bei MAX_NUM_SEQS > 1.
++    # Semantik wie bei defer_turbo: die Entscheidung faellt EINMAL beim Anlegen
++    # des Cache anhand der Promptlaenge, es wird nicht mitten im Request
++    # umgeschaltet. Kurze Turns bleiben damit f16, lange werden quantisiert.
++    # ACHTUNG: dadurch haengt der Cache-TYP an der Promptlaenge. Bei
++    # MAX_NUM_SEQS > 1 koennen zwei gleichzeitige Requests unterschiedliche
++    # Typen bekommen, die `extend` nicht zusammenfuehren kann — dieselbe
++    # Eigenschaft hat defer_turbo upstream schon. Wir fahren MAX_NUM_SEQS=1.
++    # Rollback: QUANT_KV_START=0 (dann ist der Zweig wie vorher inert).
++    defer_quant = (
++        kv_bits is not None
++        and quantized_kv_start > 0
++        and prefill_length < quantized_kv_start
+     )
+ 
+     def _make_quant_cache(lp):
++        if defer_quant:
++            return cache.BatchKVCache(lp)
+         if use_turbo:
+-            if defer_turbo:
+-                return cache.BatchKVCache(lp)
+             return BatchTurboQuantKVCache(
+                 lp, bits=kv_bits, key_bits=kv_key_bits, value_bits=kv_value_bits
+             )
