@@ -181,9 +181,27 @@ case "$PROFILE" in
   # Deshalb haengt der Default am tatsaechlich gesetzten Limit statt an einer
   # Annahme. Ohne Limit bleibt es bei 2 — sonst tauscht man kalte Prefills
   # gegen "[METAL] Insufficient Memory", was der schlechtere Handel ist.
+  # PREFILL_STEP haengt ebenfalls am Wired-Limit, und zwar aus einem anderen
+  # Grund als APC_ENTRIES: head_dim ist 256, und mlx' Default-Dispatch laesst
+  # fused Full-Attention (bis 0.32.1) nur fuer 64/80/128 zu. Die 16
+  # Full-Attn-Layer materialisieren deshalb je einen Score-Tensor
+  # n_heads x qL x kL x 2 B — bei Chunk 2048 und 38k Kontext sind das 2,8 GiB
+  # PRO LAYER, und durch die verzoegerte Auswertung leben mehrere gleichzeitig.
+  # GEMESSEN auf 37,4 GiB Working-Set, kalter Prefill, Tier vorher geleert:
+  #   Chunk 2048               bis ~30k, danach [METAL] Insufficient Memory
+  #   Chunk 2048 + KV_BITS=8   bis ~30k  — KV halbieren bringt NICHTS, die
+  #                                        Grenze ist der Score-Tensor
+  #   Chunk  512               bis ~38k  ✓
+  # Ohne Limit also 512. Mit Limit (44 GiB) bleibt 2048 — dort ist Luft, und
+  # groessere Chunks sind beim Prefill etwas effizienter.
+  # Faellt weg, sobald mlx 0.32.2 + Patch 0013 den fused Pfad liefern.
   roomy)
-    if [[ "${_WIRED_MB:-0}" -ge 45056 ]]; then _APC_ENTRIES=3; else _APC_ENTRIES=2; fi
-    _KV_BITS="";  _PREFILL=2048; _VISION=20; _APC_MAXGB=80; _APC_MINFREE=2.0; _CTX_HINT=98304 ;;
+    if [[ "${_WIRED_MB:-0}" -ge 45056 ]]; then
+      _APC_ENTRIES=3; _PREFILL=2048
+    else
+      _APC_ENTRIES=2; _PREFILL=512
+    fi
+    _KV_BITS="";  _VISION=20; _APC_MAXGB=80; _APC_MINFREE=2.0; _CTX_HINT=98304 ;;
   *)
     echo "ERROR: unbekanntes PROFILE='$PROFILE' (gueltig: auto | lean | balanced | roomy)" >&2; exit 1 ;;
 esac
@@ -436,7 +454,7 @@ print(tc.get('max_position_embeddings') or d.get('max_position_embeddings') or '
 BUDGET=$(
   WEIGHTS_KB="$WEIGHTS_KB" DRAFT_KB="$DRAFT_KB" KV_BITS="$KV_BITS" MODEL_CTX="$MODEL_CTX" \
   APC_ENTRIES="$APC_ENTRIES" ENABLE_APC="$ENABLE_APC" APC_SINGLE="$APC_SINGLE" \
-  APC_SINGLE_OK="$APC_SINGLE_OK" \
+  APC_SINGLE_OK="$APC_SINGLE_OK" CTX_HINT="$_CTX_HINT" PREFILL_STEP="$PREFILL_STEP" \
   "$VENV_PY" - <<'PY'
 import os
 import mlx.core as mx
@@ -459,21 +477,72 @@ if kv_bits:
 # GDN/Mamba-State: 48 Linear-Layer x 48 v-Heads x 128 (k) x 128 (v) x 4 B (float32)
 recurrent = 48 * 48 * 128 * 128 * 4
 
-copies = 1                                               # die lebende Sequenz
-if os.environ["ENABLE_APC"] == "1":
-    # APC_EXACT_CACHE_ENTRIES deckelt die Zahl der Snapshots, nicht die Bytes —
-    # der Speicherbedarf ist also entries * Promptlaenge, unabhaengig von Patch
-    # 0010. Der Patch aendert nur, WIE VIELE KONVERSATIONEN in diese Eintraege
-    # passen (mit: eine pro Eintrag, ohne: eine pro zwei Eintraegen).
-    copies += int(os.environ["APC_ENTRIES"])
+apc_on = os.environ["ENABLE_APC"] == "1"
+entries_req = int(os.environ["APC_ENTRIES"]) if apc_on else 0
+model_ctx = int(os.environ.get("MODEL_CTX") or 0)
+ctx_hint = int(os.environ.get("CTX_HINT") or 0)
 
-avail = ws - weights - reserve - copies * recurrent
-tokens = int(avail / (copies * per_tok)) if avail > 0 else 0
-# Nach oben deckelt die Architektur: mehr als max_position_embeddings kann das
-# Modell nicht, egal wieviel RAM frei ist.
-tokens = min(tokens, int(os.environ.get("MODEL_CTX") or tokens))
+# APC_EXACT_CACHE_ENTRIES deckelt die Zahl der Snapshots, nicht die Bytes — der
+# Speicherbedarf ist also entries * Promptlaenge, unabhaengig von Patch 0010.
+# Der Patch aendert nur, WIE VIELE KONVERSATIONEN in diese Eintraege passen
+# (mit: eine pro Eintrag, ohne: eine pro zwei Eintraegen).
+# ── Prefill-Transient ─────────────────────────────────────────────────────────
+# Der bis 2026-08-21 fehlende Posten, und der Grund fuer "[METAL] Insufficient
+# Memory" trotz scheinbar reichlichem Budget.
+#
+# head_dim ist 256. mlx' Default-Dispatch laesst fused Full-Attention nur fuer
+# 64/80/128 zu (bis 0.32.1), die 16 Full-Attn-Layer laufen also auf dem unfused
+# Graph und materialisieren je Layer einen Score-Tensor von
+# n_heads x qL x kL x 2 B. Bei PREFILL_STEP 2048 und 38k Kontext sind das
+# 2,8 GiB — PRO LAYER. Durch die verzoegerte Auswertung sind mehrere davon
+# gleichzeitig lebendig.
+#
+# INFLIGHT = 16, die Zahl der Full-Attention-Layer: unter verzoegerter
+# Auswertung kann im schlechtesten Fall jeder von ihnen seinen Score-Tensor
+# gleichzeitig halten.
+# GEGENGEPRUEFT auf 37,4 GiB Working-Set (kalter Prefill, Tier vorher geleert):
+#   Chunk  512  gerechnet ~40k   gemessen bis ~38k durch, darueber OOM
+#   Chunk 2048  gerechnet ~12k   gemessen bis ~30k durch
+# Bei grossen Chunks ist die Rechnung also zu vorsichtig — das ist die richtige
+# Fehlerrichtung. Unterschaetzen heisst hier Absturz mitten im Betrieb, und der
+# kommt nicht als sauberer Fehler, sondern als
+# "[METAL] Command buffer execution failed: Insufficient Memory".
+# Faellt weg, sobald mlx 0.32.2 + Patch 0013 den fused Pfad liefern.
+INFLIGHT = 16
+n_heads = 24
+prefill_step = int(os.environ.get("PREFILL_STEP") or 2048)
+transient_per_tok = INFLIGHT * n_heads * prefill_step * 2
 
-print(f"{ws/GiB:.1f}|{ram/GiB:.0f}|{weights/GiB:.1f}|{avail/GiB:.1f}|{tokens}|{copies}|{per_tok//1024}|{info['device_name']}")
+def budget(entries):
+    cop = 1 + entries                                    # 1 live + Snapshots
+    av = ws - weights - reserve - cop * recurrent
+    # Der Transient waechst mit der Kontextlaenge, nicht mit der Kopienzahl.
+    tok = int(av / (cop * per_tok + transient_per_tok)) if av > 0 else 0
+    if model_ctx:
+        tok = min(tok, model_ctx)
+    return cop, av, tok
+
+# ── Ueberbuchung verhindern ───────────────────────────────────────────────────
+# Ein Profil ist fuer einen bestimmten Working-Set gedacht (roomy fuer 44 GiB
+# mit gesetztem wired_limit). Steht das Limit nicht, waehlt PROFILE=auto
+# trotzdem roomy — und dann passt die Snapshot-Zahl nicht mehr zum Speicher.
+# Symptom ist kein sauberer Fehler, sondern
+# "[METAL] Command buffer execution failed: Insufficient Memory" mitten im
+# Betrieb, oft erst nach mehreren Requests.
+# Deshalb hier: die empfohlene Kontextlaenge muss mit MARGIN Luft ins Budget
+# passen; sonst werden die Snapshots schrittweise reduziert. Gemessen auf einer
+# 37,4-GiB-Maschine: mit 1,5 GiB Reserve starb jeder vierte Request, mit
+# 7,5 GiB lief er durch.
+MARGIN = 0.20                                            # 20 % Luft aufs Budget
+entries_used = entries_req
+copies, avail, tokens = budget(entries_used)
+if apc_on and ctx_hint:
+    while entries_used > 1 and ctx_hint > tokens * (1 - MARGIN):
+        entries_used -= 1
+        copies, avail, tokens = budget(entries_used)
+
+print(f"{ws/GiB:.1f}|{ram/GiB:.0f}|{weights/GiB:.1f}|{avail/GiB:.1f}|{tokens}|{copies}"
+      f"|{per_tok//1024}|{entries_used}|{info['device_name']}")
 PY
 )
 WS_GIB="${BUDGET%%|*}"; REST="${BUDGET#*|}"
@@ -482,7 +551,19 @@ W_GIB="${REST%%|*}";   REST="${REST#*|}"
 AVAIL_GIB="${REST%%|*}"; REST="${REST#*|}"
 MAX_TOKENS_FIT="${REST%%|*}"; REST="${REST#*|}"
 COPIES="${REST%%|*}";  REST="${REST#*|}"
-KV_KIB="${REST%%|*}";  DEV_NAME="${REST#*|}"
+KV_KIB="${REST%%|*}";  REST="${REST#*|}"
+ENTRIES_USED="${REST%%|*}"; DEV_NAME="${REST#*|}"
+
+# Hat die Budgetrechnung die Snapshot-Zahl gekappt, gilt der gekappte Wert.
+if [[ "$ENABLE_APC" == "1" && "$ENTRIES_USED" != "$APC_ENTRIES" ]]; then
+  echo "⚠️  APC_ENTRIES $APC_ENTRIES → $ENTRIES_USED gekappt: Profil '$PROFILE' ist fuer mehr" >&2
+  echo "    Working-Set gedacht, als diese Maschine hat (${WS_GIB} GiB). Mit $APC_ENTRIES Snapshots" >&2
+  echo "    haette context_length $_CTX_HINT keine Reserve — das endet im Betrieb in" >&2
+  echo "    '[METAL] Insufficient Memory', nicht in einer sauberen Fehlermeldung." >&2
+  echo "    Voller Ausbau: sudo sysctl -w iogpu.wired_limit_mb=45056 (s. README)." >&2
+  echo "    Ueberstimmen: APC_ENTRIES=$APC_ENTRIES ./start-mlx_qwen3.8.sh" >&2
+  APC_ENTRIES="$ENTRIES_USED"
+fi
 
 echo "──────────────────────────────────────────────────────────────"
 echo "  mlx-vlm $MLX_VLM_VER  |  Qwen3.8 27B (DENSE, MLX 4bit)  |  $DEV_NAME"
