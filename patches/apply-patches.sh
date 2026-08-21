@@ -27,26 +27,37 @@
 #   OHNE die Env-Variable ist der Patch inert = exaktes Upstream-Verhalten;
 #   das ist der Rollback-Pfad.
 #
-# 0020-dflash2-qwen38.patch   (LOKAL, Upstream-PR-Kandidat)
-#   Ruestet DFlash 2 im Drafter qwen3_dflash nach. mlx-vlm implementiert bis
-#   einschliesslich 0.6.15 (und auf main) nur DFlash v1; fuer Qwen3.8-27B gibt
-#   es aber ausschliesslich einen v2-Drafter. Ergaenzt werden:
-#     GroupedDynamicCausalConv  Two-Tap-Conv mit statischem + eingabeabhaengigem
-#                               Kernel, pro Layer vor Attention und MLP
-#     CandidateSelector         Top-k je Blockposition + Pfadwahl ueber eine
-#                               niedrigrangige bilineare Form
-#   Transkribiert aus der MLX-Referenz z-lab/dflash (dflash/model_mlx.py).
-#   VERIFIZIERT: 81/81 Parameter stimmen in Name und Form mit dem Checkpoint
-#   ueberein, Conv max|diff| = 0 gegen die Referenz, Selector-Pfade identisch,
-#   Ausgabe bei temperature 0 bit-identisch zum MTP-Drafter (4/4).
-#   GEMESSEN (M5 Pro, block_size 4): Decode +13..24 % gegenueber MTP.
-#   Blocksweep: 3 -> +6 %, 4 -> +19 %, 5 -> +20 %, 8 -> +6 % (der Checkpoint ist
-#   auf 8 ausgelegt, das ist auf einem 4bit-Target die schlechteste Wahl).
-#   ABER: unter draft_kind=dflash greift APC gar nicht (cached_tokens=0 in jedem
-#   Turn, APC_TRACE zeigt keinen einzigen Lookup). Das liegt an der
-#   dflash-Integration in mlx-vlm, nicht am Patch — MTP trifft mit angewandtem
-#   Patch weiter. Deshalb ist DRAFT_KIND=mtp Default; s. README.
-#   Ohne DRAFT_KIND=dflash ist der Patch inert.
+# 0013-force-fused-sdpa-head-dim-256.patch   (LOKAL, kein Upstream-PR)
+#   Qwen3.8 hat head_dim 256. mlx' Default-Dispatch laesst fused Full-Attention
+#   nur fuer head_dim 64/80/128 zu — die 16 Full-Attn-Layer laufen deshalb auf
+#   dem unfused Graph und materialisieren pro Layer einen Score-Transienten von
+#   O(n_heads x qL x kL). Das ist der eigentliche Grund, warum PREFILL_STEP bei
+#   uns ein RAM-Hebel ist.
+#   mlx 0.32.2 (PR #4185) stellt die 192/256-Kernel wieder her, erreichbar NUR
+#   ueber force_fused=True; der Default-Dispatch routet weiterhin nicht dorthin.
+#   Der PR begruendet das ausdruecklich damit, dass nur die Runtime ihr
+#   Speicherbudget kennt — das trifft hier zu.
+#   Eng gefasst: nur qL > 1 (Prefill/Verify, nicht Decode), nur head_dim
+#   192/256, nur ohne Array-Maske und ohne Sinks. Wirft force_fused einmal, wird
+#   der Pfad dauerhaft abgeschaltet und einmal geloggt.
+#   INERT AUF mlx < 0.32.2: die Probe beim Import faellt auf TypeError.
+#   VERIFIZIERT auf mlx 0.32.0: _FORCE_FUSED == False, Verhalten unveraendert.
+#   Rollback: QWEN38_FORCE_FUSED_SDPA=0
+#   ACHTUNG: PR #3842 (fused head_dim 256 auf NAX/M5) verlangt qL >= 1024 —
+#   PROFILE=lean setzt PREFILL_STEP=512 und faellt damit heraus.
+#
+# 0014-quantized-kv-start-uniform.patch   (LOKAL, kein Upstream-PR)
+#   quantized_kv_start galt auf dem Batch-Pfad nur fuer TurboQuant. Auf dem
+#   uniform-Pfad — also --kv-bits ohne --kv-quant-scheme turboquant, unser
+#   Default — wurde ab Token 0 quantisiert, egal was --quantized-kv-start sagt.
+#   GEMESSEN mit _make_cache(kv_bits=8, quantized_kv_start=8192):
+#     ohne Patch  prefill_length=1000  -> BatchQuantizedKVCache  (falsch)
+#     mit  Patch  prefill_length=1000  -> BatchKVCache           (f16)
+#                 prefill_length=20000 -> BatchQuantizedKVCache
+#   BETRIFFT PROFILE=lean im Normalbetrieb: dort ist KV_BITS=8 Default, und
+#   seit DFlash 2 Default ist, setzt das Start-Skript MLX_VLM_SPECULATIVE_BATCH=1
+#   — der Batch-Pfad laeuft also nicht mehr nur bei MAX_NUM_SEQS > 1.
+#   Rollback: QUANT_KV_START=0
 #
 # 0021-speculative-apc-routing.patch   (LOKAL, Upstream-PR-Kandidat)
 #   Macht den Prefix-Cache fuer Nicht-MTP-Drafter ueberhaupt erst erreichbar.
@@ -62,10 +73,45 @@
 #   unveraendert (im Mittel 40,8 statt 41,5 t/s), beim 5767-Token-Prompt besser
 #   (38,4 -> 40,9 t/s). --draft-block-size wirkt weiter, MAX_NUM_SEQS=2 laeuft,
 #   MTP unveraendert (cached 5772).
+#   STATUS UPSTREAM: das zugehoerige Issue #1966 wurde am 2026-08-20 GESCHLOSSEN
+#   — zugunsten von PR #1923 ("conservative DFlash APC prefix reuse", nur B=1,
+#   text-only, exact-prefix). Dieser Patch landet also nicht in dieser Form; die
+#   Abhaengigkeit bleibt bestehen, bis #1923 gemerged ist.
+#
+# 0041-dflash2-guard-invalid-bonus-token.patch   (LOKAL, kein Upstream-PR)
+#   Nachfolger von 0022, auf den Upstream-Code aus 0040 umgezogen. DFlash 2 baut
+#   den naechsten Block in DFlash2DraftModel.propose_block, nicht mehr in
+#   DFlashDraftModel.draft_block — die v1-Methode ist fuer diesen Drafter tot.
+#   Inhalt unveraendert: mx.array() wirft fuer Werte ausserhalb des int64-Bereichs
+#   nur "RuntimeError: std::bad_cast", ohne Wert, ohne Index (reproduzierbar mit
+#   mx.array([[2**63]], dtype=mx.int32)). Genau so starb am 2026-08-20 10:07 ein
+#   Request nach 250 Tokens. Der Guard prueft gegen vocab_size und nennt den Wert.
+#   Bewusst kein Clamping: ein still ersetztes Token verfaelscht die Ausgabe.
+#   GEPRUEFT: PR #1959 hat diesen Guard NICHT — die Stelle ist upstream offen.
 #
 # ── FREMDE, NOCH OFFENE UPSTREAM-PRs (cherry-gepickt) ────────────────────────
-# Beide sind Bugfixes anderer Leute, die upstream noch offen sind. Sobald sie
-# gemerged sind, meldet dieses Skript "KONFLIKT" — dann entfernen.
+# Bugfixes anderer Leute, die upstream noch offen sind. Sobald sie gemerged
+# sind, meldet dieses Skript "KONFLIKT" — dann entfernen.
+#
+# 0040-pr1959-dflash2.patch   (PR #1959, offen, draft)
+#   "Add DFlash 2 speculative decoding" — die Upstream-Fassung dessen, was hier
+#   bis 2026-08-20 als lokaler Patch 0020 lag. ERSETZT 0020 vollstaendig.
+#   Bringt gegenueber 0020 drei Dinge, die die eigene Transkription nicht hatte:
+#     - dedizierter bit-exakter 4bit-M=4-Metal-Verifier-Kernel: streamt die vier
+#       Verify-Zeilen zusammen, reused packed weights ueber alle vier Token
+#     - distribution-preserving rejection sampling fuer temperature > 0
+#       (0020 war nur gegen greedy auf Bit-Gleichheit geprueft)
+#     - optionale In-Memory-Quantisierung des Drafters (MLX_VLM_DRAFT_BITS)
+#   Upstream-Messung (M3 Ultra, BF16-Drafter, block 4): 31,85 -> 47,07 t/s
+#   (1,48x), 500/500 Token identisch zum Lauf ohne Drafter, Acceptance 60,5 %.
+#   VERIFIZIERT HIER: laesst sich sauber auf v0.6.15 anwenden (kein Rebase auf
+#   #1899 noetig) und kollidiert mit keinem der lokalen Patches. Der vorhandene
+#   Checkpoint Qwen3.8-27B-DFlash2-4bit laedt unveraendert (DFlash2DraftModel,
+#   179 Parameter, 1,008 GiB) — keine Neukonvertierung noetig.
+#   Der Codebook-Rename (candidate_selector.{predecessor,successor}_codebook ->
+#   ...weight) sitzt upstream in DFlash2DraftModel.sanitize und ist identisch zu
+#   dem, was 0020 hatte und was z-lab in dflash/model_mlx.py (e128a7e) macht.
+#   MUSS ALS LETZTER PATCH LAUFEN: gegen den Stand MIT 0010..0031 erzeugt.
 #
 # 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, offen)
 #   "Fix speculative decoding against a quantized KV cache".
@@ -74,9 +120,15 @@
 #     AttributeError: 'tuple' object has no attribute 'shape'
 #   Der Verify-Pfad nimmt an, keys sei EIN Array; ein quantisierter Cache liefert
 #   ein Tupel. Mit Patch laufen dieselben zwei Requests korrekt durch.
-#   BETRIFFT UNS bei MAX_NUM_SEQS > 1: das lean-Profil setzt KV_BITS=8. Mit
-#   MAX_NUM_SEQS=1 (unser Default in allen Profilen) tritt der Fehler NICHT auf —
-#   auch nicht bei 15838 Token und Quantisierung ab Token 0, extra geprueft.
+#   EINORDNUNG KORRIGIERT AM 2026-08-20 — vorher stand hier, der Patch sei nur
+#   bei MAX_NUM_SEQS > 1 relevant. Das galt, solange MTP Default war. Seit
+#   DFlash 2 Default ist, setzt das Start-Skript MLX_VLM_SPECULATIVE_BATCH=1,
+#   und _make_cache baut den Batch-Cache auch bei MAX_NUM_SEQS=1, sobald
+#   KV_BITS gesetzt ist (generate/ar.py:796). Auf PROFILE=lean ist KV_BITS=8
+#   Default — dort ist das der NORMALBETRIEB, keine Vorsorge.
+#   ZWEI PRs FUER DIESELBE SACHE: #1956 (hier) und #1938 ("Fix Qwen speculative
+#   decoding with quantized batch cache") aendern dieselben zwei Dateien mit
+#   demselben Inhalt. Nur einer wird mergen — dieser Patch deckt beide ab.
 #
 # 0031-pr1835-recurrent-cache-no-trim.patch    (PR #1835, @kylesyx, offen)
 #   "Decline prefix-cache reuse for non-trimmable recurrent caches".
@@ -95,6 +147,17 @@
 #   die prompt_cache_state durchreichen.
 #
 # ── ERLEDIGT / OBSOLET ───────────────────────────────────────────────────────
+#
+# 0020-dflash2-qwen38.patch   ERSETZT 2026-08-20 durch 0040 (Upstream-PR #1959).
+#   Die eigene Transkription aus z-lab/dflash war korrekt — inklusive des
+#   Codebook-Renames, den z-lab erst am 2026-08-18 mit e128a7e kanonisierte und
+#   den #1959 identisch macht. Ersetzt wurde sie trotzdem: #1959 bringt den
+#   exakten 4bit-M=4-Verifier-Kernel und verteilungserhaltendes Rejection
+#   Sampling dazu. Liegt in der Git-Historie dieses Repos.
+#
+# 0022-dflash-guard-invalid-bonus-token.patch   ERSETZT 2026-08-20 durch 0041.
+#   Gleicher Guard, andere Stelle: DFlash 2 baut den Block seit #1959 in
+#   DFlash2DraftModel.propose_block statt in DFlashDraftModel.draft_block.
 #
 # 0002-pr1901-apc-short-prompt.patch   ENTFERNT 2026-08-19 beim Upgrade auf
 #   mlx-vlm 0.6.15. Der Upstream-PR #1901 wurde am 2026-08-15 gemerged, also
@@ -140,16 +203,43 @@ echo "  mlx-vlm      : $("$VENV_PY" -c 'import importlib.metadata as m;print(m.v
 patches=( "$PATCH_DIR"/*.patch(N) )
 [[ ${#patches[@]} -gt 0 ]] || { echo "  Keine .patch-Dateien in $PATCH_DIR"; exit 0; }
 
+# Zuruecknehmen geht in UMGEKEHRTER Reihenfolge. Seit 0041 auf Code sitzt, den
+# 0040 erst anlegt, ist die Kette geordnet: wer 0040 vor 0041 zurueckzunehmen
+# versucht, findet den erwarteten Kontext nicht mehr, der Reverse-Dry-Run
+# schlaegt fehl und der Patch bliebe still drin. (${(Oa)...} kehrt um.)
+# WICHTIG: revert_order bleibt eine eigene Variable. Wuerde man `patches` selbst
+# umdrehen, drehte die Probe unten es ein zweites Mal zurueck — dann prueft sie
+# in Anwende- statt Abtragereihenfolge und meldet 0040 als "nicht angewendet".
+revert_order=( ${(Oa)patches} )
+
+# ── Angewendet-Status ermitteln ──────────────────────────────────────────────
+# Der Reverse-Dry-Run allein reicht nicht mehr, seit Patches aufeinander sitzen:
+# 0041 liegt MITTEN in dem Code, den 0040 erst anlegt. Ein Reverse-Dry-Run von
+# 0040 findet dann seinen eigenen Kontext nicht wieder und meldet ihn faelschlich
+# als offen — worauf ein zweiter Lauf ihn erneut anwenden wollte und "KONFLIKT"
+# schrie.
+# Deshalb wird der Status auf einer KOPIE ermittelt, die ruecklaeufig abgetragen
+# wird: erst 0041 zurueck, dann steht 0040 wieder frei da. 15 MB, einmal pro Lauf.
+_probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/mlxvlm-probe.XXXXXX")
+trap 'rm -rf "$_probe_dir"' EXIT INT TERM
+cp -R "$SITE_PACKAGES/mlx_vlm" "$_probe_dir/"
+typeset -A applied_map
+for p in "${revert_order[@]}"; do
+  if patch -R -p1 --dry-run --force -d "$_probe_dir" < "$p" &>/dev/null; then
+    applied_map[${p:t}]=1
+    patch -R -p1 --force -d "$_probe_dir" < "$p" &>/dev/null || true
+  else
+    applied_map[${p:t}]=0
+  fi
+done
+rm -rf "$_probe_dir"
+trap - EXIT INT TERM
+
+[[ "$MODE" == "revert" ]] && patches=( "${revert_order[@]}" )
+
 for p in "${patches[@]}"; do
   name="${p:t}"
-
-  # Bereits angewendet? Der Reverse-Dry-Run ist der zuverlaessige Test: er
-  # gelingt genau dann, wenn der Patch drin ist.
-  if patch -R -p1 --dry-run --force -d "$SITE_PACKAGES" < "$p" &>/dev/null; then
-    applied=1
-  else
-    applied=0
-  fi
+  applied=${applied_map[$name]}
 
   case "$MODE" in
     check)

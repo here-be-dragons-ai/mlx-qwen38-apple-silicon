@@ -6,7 +6,7 @@
 # Die speicherrelevanten Parameter kommen aus PROFILE (s.u.):
 #     lean      32 GB ohne sudo   (Working-Set 21,3 GiB)   Peak ~18,8 GiB
 #     balanced  32 GB mit sysctl  (Working-Set 26 GiB)     Peak ~25,0 GiB
-#     roomy     48 GB             (Working-Set 44 GiB)     Peak ~41 GiB
+#     roomy     48 GB             (Working-Set 44 GiB)     Peak ~30 GiB (ger.)
 #     auto      (Default) waehlt anhand des Working-Sets
 #
 # Die MESSWERTE in diesem Skript stammen alle von der 48-GB-Maschine (M5 Pro,
@@ -101,12 +101,17 @@ MODEL_ALIAS="${MODEL_ALIAS:-Qwen3.8-27B-local}"
 #             (Alias: "default", historischer Name.)
 #
 #   roomy     48 GB. Das urspruengliche, ueber Wochen gefahrene M5-Pro-Setup:
-#             APC_ENTRIES 4 (mehr Konversationen warm), PREFILL_STEP 2048,
-#             VISION_CACHE 20, APC_DISK_MAX_GB 60. Peak ~41 GiB bei 110k-Prompt
+#             PREFILL_STEP 2048, VISION_CACHE 20, APC_DISK_MAX_GB 60.
 #             → braucht iogpu.wired_limit_mb=45056.
-#             ACHTUNG, die APC-Rechnung unterschaetzt den Agent-Fall: ein
-#             Snapshot bei 104k Token ist 6,5 GiB, VIER davon 26 GiB. Deshalb
-#             APC_ENTRIES hier NICHT weiter anheben.
+#             APC_ENTRIES war hier bis 2026-08-20 auf 4 und ist jetzt 2: ein
+#             Snapshot ist so gross wie der Prompt (64 KiB/Token), bei 104k
+#             Token also 6,5 GiB — VIER davon sind 26 GiB und sprengen das
+#             Budget, sobald der Kontext wirklich ausgereizt wird. Mit 2 statt
+#             4 Eintraegen (3 statt 5 Kopien) steigt das Kontext-Budget bei
+#             44 GiB Working-Set von ~85k auf ~142k Token, der gerechnete Peak
+#             bei einem 90k-Prompt faellt von ~41 auf ~30 GiB. Preis: zwei
+#             statt vier Konversationen warm — der SSD-Tier holt eine
+#             verdraengte in ~350 ms zurueck statt in ~90 s Vollprefill.
 #
 # Zu jedem Profil gehoert clientseitig ein passendes context_length — der Banner
 # druckt es, und weiter unten warnt das Skript, wenn die config.yaml darueber
@@ -119,16 +124,20 @@ PROFILE="${PROFILE:-auto}"
 # iogpu.wired_limit_mb gewinnt, wenn gesetzt; sonst der macOS-Default (2/3 des
 # RAM bei <= 36 GB, sonst 3/4). Die exakte Zahl aus Metal steht spaeter im
 # Banner — weichen beide ab, gilt die aus dem Banner.
+# Der Working-Set wird IMMER berechnet, nicht nur bei PROFILE=auto: roomy
+# entscheidet unten anhand von _WIRED_MB, wieviele APC-Snapshots ins Budget
+# passen.
+_RAM_MB=$(( $(sysctl -n hw.memsize) / 1048576 ))
+_WIRED_MB=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+if [[ "${_WIRED_MB:-0}" -gt 0 ]]; then
+  _WS_MB=$_WIRED_MB
+elif [[ "$_RAM_MB" -le 36864 ]]; then
+  _WS_MB=$(( _RAM_MB * 2 / 3 ))
+else
+  _WS_MB=$(( _RAM_MB * 3 / 4 ))
+fi
+
 if [[ "$PROFILE" == "auto" ]]; then
-  _RAM_MB=$(( $(sysctl -n hw.memsize) / 1048576 ))
-  _WIRED_MB=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
-  if [[ "${_WIRED_MB:-0}" -gt 0 ]]; then
-    _WS_MB=$_WIRED_MB
-  elif [[ "$_RAM_MB" -le 36864 ]]; then
-    _WS_MB=$(( _RAM_MB * 2 / 3 ))
-  else
-    _WS_MB=$(( _RAM_MB * 3 / 4 ))
-  fi
   if   [[ "$_WS_MB" -ge 30720 ]]; then PROFILE=roomy      # >= 30 GiB
   elif [[ "$_WS_MB" -ge 24576 ]]; then PROFILE=balanced   # >= 24 GiB
   else                                 PROFILE=lean
@@ -148,15 +157,30 @@ case "$PROFILE" in
   balanced|default)
     PROFILE=balanced
     _APC_ENTRIES=2; _KV_BITS="";  _PREFILL=1024; _VISION=4;  _APC_MAXGB=40; _APC_MINFREE=4.0; _CTX_HINT=49152 ;;
-  # _CTX_HINT hier 98304 und NICHT 131072, obwohl das 48-GB-Setup produktiv mit
-  # 131072 lief: die Budgetrechnung unten ist ein WORST CASE (alle APC-Snapshots
-  # gleichzeitig auf voller Promptlaenge). Bei 44 GiB Working-Set, 5 Kopien und
-  # 64 KiB/Token sind das ~87k Token, also ctx <= ~101k. Dass 131072 in der
-  # Praxis trug, liegt daran, dass die vier Snapshots real nie alle gleichzeitig
-  # am Anschlag stehen — es ist Glueck, keine Garantie. Wer 131072 will, nimmt
-  # APC_ENTRIES=2 dazu (3 Kopien → Budget ~145k).
+  # _CTX_HINT bleibt 98304, obwohl das Budget mit APC_ENTRIES=2 rechnerisch fuer
+  # 131072 reicht (3 Kopien, 44 GiB Working-Set → ~142k Token): die 142k gelten
+  # nur MIT gesetztem iogpu.wired_limit_mb=45056. Steht das Limit auf dem macOS-
+  # Default (48 GB → 37,4 GiB Working-Set), sind es ~107k, und 131072 waere
+  # wieder ueberbucht. 98304 traegt in beiden Faellen. Wer 131072 fahren will,
+  # setzt erst das wired_limit UND APC_ENTRIES=2 (mit dem neuen Default 3 sind
+  # es nur ~109k) und prueft die Budgetzeile im Banner.
+  # APC_ENTRIES 3 STATT 2, ABER NUR MIT GESETZTEM WIRED-LIMIT.
+  # Gemessen am 2026-08-20 aus dem Produktivlog: 168 von 549 Prefills liefen
+  # kalt (30,6 %), 45 davon ueber 8k Token = 2415 s reine Prefill-Zeit. Die
+  # teuren Faelle sind KEINE neuen Konversationen — im Fenster 10:03-10:22 lief
+  # kein Serverneustart, trotzdem fielen drei Requests auf cached_tokens=0
+  # (50,4 s / 56,8 s / 70,7 s) zwischen lauter warmen Turns derselben Groesse.
+  # Das ist Verdraengung: mehr als zwei gleichzeitig aktive Konversationen auf
+  # zwei Snapshot-Plaetzen. Ein dritter Platz kostet eine KV-Kopie.
+  # Die Rechnung entscheidet, ob er passt (64 KiB/Token, +152 MiB GDN-State):
+  #   ohne wired_limit (48 GB → 36 GiB WS): 4 Kopien →  77k Token < 98304  NEIN
+  #   mit  wired_limit 45056 (44 GiB WS)  : 4 Kopien → 109k Token > 98304  JA
+  # Deshalb haengt der Default am tatsaechlich gesetzten Limit statt an einer
+  # Annahme. Ohne Limit bleibt es bei 2 — sonst tauscht man kalte Prefills
+  # gegen "[METAL] Insufficient Memory", was der schlechtere Handel ist.
   roomy)
-    _APC_ENTRIES=4; _KV_BITS="";  _PREFILL=2048; _VISION=20; _APC_MAXGB=60; _APC_MINFREE=2.0; _CTX_HINT=98304 ;;
+    if [[ "${_WIRED_MB:-0}" -ge 45056 ]]; then _APC_ENTRIES=3; else _APC_ENTRIES=2; fi
+    _KV_BITS="";  _PREFILL=2048; _VISION=20; _APC_MAXGB=80; _APC_MINFREE=2.0; _CTX_HINT=98304 ;;
   *)
     echo "ERROR: unbekanntes PROFILE='$PROFILE' (gueltig: auto | lean | balanced | roomy)" >&2; exit 1 ;;
 esac
@@ -204,9 +228,11 @@ DRAFT_BLOCK_SIZE="${DRAFT_BLOCK_SIZE-$_BLOCK_DEFAULT}"
 # Wiederverwendet den KV-Cache, wenn der neue Prompt den alten als Prefix
 # enthaelt (= jeder Folge-Turn). Seit mlx-vlm 0.6.13 upstream korrekt.
 ENABLE_APC="${ENABLE_APC:-1}"
-# 2 STATT 4 (48-GB-Skript) STATT 8 (Qwen3.6): ein Snapshot ist so gross wie der
-# Prompt, und dieses Modell braucht 64 KiB/Token. Auf 32 GB ist jeder weitere
-# Eintrag direkt weniger Kontext — s. Budgetrechnung im Banner.
+# 2 IN ALLEN PROFILEN (Qwen3.6 stand auf 8): ein Snapshot ist so gross wie der
+# Prompt, und dieses Modell braucht 64 KiB/Token. Jeder weitere Eintrag ist
+# direkt weniger Kontext — s. Budgetrechnung im Banner. Auch auf 48 GB kostet
+# der Sprung von 2 auf 4 rund ein Drittel des Budgets (142k → 85k Token), und
+# der Verlust bei einem Cache-Miss ist dank SSD-Tier klein (~350 ms Restore).
 # Zusammen mit APC_SINGLE=1 (unten) heisst 2 == zwei Konversationen warm.
 APC_ENTRIES="${APC_ENTRIES:-$_APC_ENTRIES}"
 # SSD-Tier: ueberlebt Serverneustarts, gemessen Faktor 256 auf einen kalten
@@ -214,6 +240,26 @@ APC_ENTRIES="${APC_ENTRIES:-$_APC_ENTRIES}"
 # ist. Preis: ~2,3 GB Schreiblast pro 36k-Konversation → Deckel unten.
 APC_DISK="${APC_DISK:-$HOME/.hermes/apc}"
 APC_DISK_MAX_GB="${APC_DISK_MAX_GB:-$_APC_MAXGB}"
+# Der Deckel ist nur eine Obergrenze — er muss auch auf die Platte passen.
+# Gemessen am 2026-08-20: der Tier stand mit 58 GB exakt am 60-GB-Deckel und
+# raeumte bei praktisch jedem Store ("APC disk: evicted 6 shard(s); now 56341.8
+# MB / 64424.5 MB cap"). Damit ist die Rueckfallebene fuer verdraengte
+# RAM-Snapshots loechrig, und genau dann kostet ein Miss die vollen 50-70 s.
+# roomy geht deshalb auf 80 GB — aber nur soweit das Volume es traegt.
+_APC_RESERVE_GB=25
+if [[ -d "$APC_DISK" ]]; then
+  _apc_used_gb=$(( $(du -sk "$APC_DISK" 2>/dev/null | cut -f1) / 1048576 ))
+else
+  _apc_used_gb=0
+fi
+_apc_free_gb=$(( $(df -k "${APC_DISK:h}" 2>/dev/null | tail -1 | awk '{print $4}') / 1048576 ))
+_apc_cap_max=$(( _apc_used_gb + _apc_free_gb - _APC_RESERVE_GB ))
+if [[ "$_apc_cap_max" -lt 10 ]]; then _apc_cap_max=10; fi
+if [[ "$APC_DISK_MAX_GB" -gt "$_apc_cap_max" ]]; then
+  echo "  Hinweis: APC_DISK_MAX_GB ${APC_DISK_MAX_GB} → ${_apc_cap_max} GB gekappt" \
+       "(nur ${_apc_free_gb} GB frei, ${_APC_RESERVE_GB} GB Reserve)" >&2
+  APC_DISK_MAX_GB=$_apc_cap_max
+fi
 # Der Disk-Tier restauriert nur, wenn noch so viel RAM frei ist. Upstream-Default
 # 2.0 ist fuer 32 GB zu knapp — ein Restore mitten in den Speicherdruck hinein
 # ist genau der Weg in "[METAL] Insufficient Memory".
@@ -327,13 +373,15 @@ if [[ "$APC_SINGLE" != "0" && "$APC_SINGLE_OK" == "0" ]]; then
 fi
 
 # ── Drafter pruefen ───────────────────────────────────────────────────────────
-# DFlash 2 haengt an zwei lokalen Patches. Fehlt 0020, wuerde der Server beim
-# Laden des Drafters hart abbrechen (unerwartete Gewichte) — deshalb hier
-# abfangen und auf MTP zurueckfallen, statt den Start zu verlieren.
+# DFlash 2 haengt an zwei Patches. Fehlt 0040 (= Upstream-PR #1959), wuerde der
+# Server beim Laden des Drafters hart abbrechen (unerwartete Gewichte) —
+# deshalb hier abfangen und auf MTP zurueckfallen, statt den Start zu verlieren.
+# Der Marker candidate_selector trifft sowohl den fruehreren eigenen Patch 0020
+# als auch die Upstream-Fassung, die ihn ersetzt hat.
 if [[ "$DRAFT_KIND" == "dflash" && "$ENABLE_SPEC_DECODE" != "0" ]]; then
   if ! grep -q "candidate_selector" \
        "$SITE_PACKAGES/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py" 2>/dev/null; then
-    echo "⚠️  WARNUNG: Patch 0020 fehlt — DFlash 2 nicht ladbar, falle auf MTP zurueck." >&2
+    echo "⚠️  WARNUNG: Patch 0040 fehlt — DFlash 2 nicht ladbar, falle auf MTP zurueck." >&2
     echo "    Fix:  ./patches/apply-patches.sh" >&2
     DRAFT_KIND=mtp
     DRAFT_MODEL="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit"

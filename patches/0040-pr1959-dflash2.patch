@@ -1,0 +1,1900 @@
+diff --git a/mlx_vlm/generate/dispatch.py b/mlx_vlm/generate/dispatch.py
+index 285154f..810b5db 100644
+--- a/mlx_vlm/generate/dispatch.py
++++ b/mlx_vlm/generate/dispatch.py
+@@ -344,6 +344,18 @@ def parse_arguments():
+         default=DEFAULT_TEMPERATURE,
+         help="Temperature for sampling.",
+     )
++    parser.add_argument(
++        "--top-p",
++        type=float,
++        default=DEFAULT_TOP_P,
++        help="Nucleus-sampling probability threshold (default: 1.0).",
++    )
++    parser.add_argument(
++        "--top-k",
++        type=int,
++        default=DEFAULT_TOP_K,
++        help="Restrict sampling to the top K tokens; 0 disables it.",
++    )
+     parser.add_argument(
+         "--repetition-penalty",
+         type=float,
+@@ -527,6 +539,19 @@ def parse_arguments():
+         default=None,
+         help="Override the drafter's configured block size.",
+     )
++    parser.add_argument(
++        "--draft-bits",
++        type=int,
++        choices=[4, 8],
++        default=None,
++        help="Quantize the drafter in memory to 4 or 8 bits.",
++    )
++    parser.add_argument(
++        "--draft-group-size",
++        type=int,
++        default=64,
++        help="Group size for in-memory drafter quantization (default: 64).",
++    )
+     parser.add_argument(
+         "--enable-thinking",
+         action="store_true",
+@@ -1297,7 +1322,10 @@ def main():
+ 
+         print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
+         draft_model, resolved_kind = load_drafter(
+-            args.draft_model, kind=args.draft_kind
++            args.draft_model,
++            kind=args.draft_kind,
++            draft_bits=getattr(args, "draft_bits", None),
++            draft_group_size=getattr(args, "draft_group_size", 64),
+         )
+         if args.draft_kind is None:
+             print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+@@ -1462,6 +1490,8 @@ def main():
+             stream_kwargs = {
+                 "max_tokens": args.max_tokens,
+                 "temperature": args.temperature,
++                "top_p": getattr(args, "top_p", DEFAULT_TOP_P),
++                "top_k": getattr(args, "top_k", DEFAULT_TOP_K),
+                 "repetition_penalty": args.repetition_penalty,
+                 "repetition_context_size": args.repetition_context_size,
+                 "presence_penalty": args.presence_penalty,
+@@ -1506,6 +1536,8 @@ def main():
+             "video": args.video,
+             "fps": args.fps,
+             "temperature": args.temperature,
++            "top_p": getattr(args, "top_p", DEFAULT_TOP_P),
++            "top_k": getattr(args, "top_k", DEFAULT_TOP_K),
+             "max_tokens": args.max_tokens,
+             "repetition_penalty": args.repetition_penalty,
+             "repetition_context_size": args.repetition_context_size,
+diff --git a/mlx_vlm/models/qwen3_5/language.py b/mlx_vlm/models/qwen3_5/language.py
+index 3ff5090..5e7e605 100644
+--- a/mlx_vlm/models/qwen3_5/language.py
++++ b/mlx_vlm/models/qwen3_5/language.py
+@@ -194,8 +194,8 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
+     constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
+     constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
+     constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
+-    constant constexpr int RESULTS_PER_SIMDGROUP = 4;
+-    constant constexpr int NUM_SIMDGROUPS = 2;
++    constant constexpr int RESULTS_PER_SIMDGROUP = 1;
++    constant constexpr int NUM_SIMDGROUPS = 8;
+     constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
+ 
+     template <typename T>
+@@ -334,6 +334,377 @@ _TARGET_VERIFY_QMV_SOURCE = r"""
+ """
+ 
+ 
++_TARGET_VERIFY_QMV_M4_SOURCE = r"""
++    uint n_tile = threadgroup_position_in_grid.y;
++    uint b_idx = threadgroup_position_in_grid.z;
++    uint simd_gid = simdgroup_index_in_threadgroup;
++    uint simd_lid = thread_index_in_simdgroup;
++
++    int out_row = int(n_tile) * M4_NUM_SIMDGROUPS * M4_RESULTS_PER_SIMDGROUP +
++        int(simd_gid) * M4_RESULTS_PER_SIMDGROUP;
++    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
++    int in_vec_size_g = K_SIZE / GS;
++
++    const device uint8_t* ws =
++        (const device uint8_t*)w + out_row * in_vec_size_w +
++        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
++    const device T* sc =
++        scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
++    const device T* bs =
++        biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
++    const device T* xk =
++        x + int(b_idx) * 4 * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
++
++    float result0[M4_RESULTS_PER_SIMDGROUP] = {0};
++    float result1[M4_RESULTS_PER_SIMDGROUP] = {0};
++    float result2[M4_RESULTS_PER_SIMDGROUP] = {0};
++    float result3[M4_RESULTS_PER_SIMDGROUP] = {0};
++    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
++      // Keep the zero-point correction in the source dtype.  The singleton
++      // kernel evaluates each four-value expression before promoting it to
++      // float; constructing float4 inputs first changes BF16/FP16 rounding.
++      float sum0 = 0.0f;
++      float sum1 = 0.0f;
++      float sum2 = 0.0f;
++      float sum3 = 0.0f;
++      float dot0[M4_RESULTS_PER_SIMDGROUP] = {0};
++      float dot1[M4_RESULTS_PER_SIMDGROUP] = {0};
++      float dot2[M4_RESULTS_PER_SIMDGROUP] = {0};
++      float dot3[M4_RESULTS_PER_SIMDGROUP] = {0};
++
++      for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
++        T x00 = xk[0 * K_SIZE + i];
++        T x01 = xk[0 * K_SIZE + i + 1];
++        T x02 = xk[0 * K_SIZE + i + 2];
++        T x03 = xk[0 * K_SIZE + i + 3];
++        sum0 += x00 + x01 + x02 + x03;
++
++        T x10 = xk[1 * K_SIZE + i];
++        T x11 = xk[1 * K_SIZE + i + 1];
++        T x12 = xk[1 * K_SIZE + i + 2];
++        T x13 = xk[1 * K_SIZE + i + 3];
++        sum1 += x10 + x11 + x12 + x13;
++
++        T x20 = xk[2 * K_SIZE + i];
++        T x21 = xk[2 * K_SIZE + i + 1];
++        T x22 = xk[2 * K_SIZE + i + 2];
++        T x23 = xk[2 * K_SIZE + i + 3];
++        sum2 += x20 + x21 + x22 + x23;
++
++        T x30 = xk[3 * K_SIZE + i];
++        T x31 = xk[3 * K_SIZE + i + 1];
++        T x32 = xk[3 * K_SIZE + i + 2];
++        T x33 = xk[3 * K_SIZE + i + 3];
++        sum3 += x30 + x31 + x32 + x33;
++
++        float fx00 = float(x00);
++        float fx01 = float(x01) / 16.0f;
++        float fx02 = float(x02) / 256.0f;
++        float fx03 = float(x03) / 4096.0f;
++        float fx10 = float(x10);
++        float fx11 = float(x11) / 16.0f;
++        float fx12 = float(x12) / 256.0f;
++        float fx13 = float(x13) / 4096.0f;
++        float fx20 = float(x20);
++        float fx21 = float(x21) / 16.0f;
++        float fx22 = float(x22) / 256.0f;
++        float fx23 = float(x23) / 4096.0f;
++        float fx30 = float(x30);
++        float fx31 = float(x31) / 16.0f;
++        float fx32 = float(x32) / 256.0f;
++        float fx33 = float(x33) / 4096.0f;
++
++#pragma clang loop unroll(full)
++        for (int row = 0; row < M4_RESULTS_PER_SIMDGROUP; ++row) {
++          const device uint16_t* packed_w =
++              (const device uint16_t*)(ws + row * in_vec_size_w);
++          uint16_t packed = packed_w[i / 4];
++          float q0 = float(packed & 0x000f);
++          float q1 = float(packed & 0x00f0);
++          float q2 = float(packed & 0x0f00);
++          float q3 = float(packed & 0xf000);
++          dot0[row] += fx00 * q0 + fx01 * q1 + fx02 * q2 + fx03 * q3;
++          dot1[row] += fx10 * q0 + fx11 * q1 + fx12 * q2 + fx13 * q3;
++          dot2[row] += fx20 * q0 + fx21 * q1 + fx22 * q2 + fx23 * q3;
++          dot3[row] += fx30 * q0 + fx31 * q1 + fx32 * q2 + fx33 * q3;
++        }
++      }
++
++#pragma clang loop unroll(full)
++      for (int row = 0; row < M4_RESULTS_PER_SIMDGROUP; ++row) {
++        float scale = float(sc[row * in_vec_size_g]);
++        float bias = float(bs[row * in_vec_size_g]);
++        result0[row] += scale * dot0[row] + bias * sum0;
++        result1[row] += scale * dot1[row] + bias * sum1;
++        result2[row] += scale * dot2[row] + bias * sum2;
++        result3[row] += scale * dot3[row] + bias * sum3;
++      }
++      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
++      sc += BLOCK_SIZE / GS;
++      bs += BLOCK_SIZE / GS;
++      xk += BLOCK_SIZE;
++    }
++
++#pragma clang loop unroll(full)
++    for (int row = 0; row < M4_RESULTS_PER_SIMDGROUP; ++row) {
++      float r0 = simd_sum(result0[row]);
++      float r1 = simd_sum(result1[row]);
++      float r2 = simd_sum(result2[row]);
++      float r3 = simd_sum(result3[row]);
++      if (simd_lid == 0) {
++        int base = int(b_idx) * 4 * N_SIZE + out_row + row;
++        y[base + 0 * N_SIZE] = T(r0);
++        y[base + 1 * N_SIZE] = T(r1);
++        y[base + 2 * N_SIZE] = T(r2);
++        y[base + 3 * N_SIZE] = T(r3);
++      }
++    }
++"""
++
++
++_TARGET_VERIFY_M4_NUM_SIMDGROUPS = 2
++_TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP = 4
++
++
++_TARGET_VERIFY_QMV_M8_SOURCE = r"""
++#define M8_ARGMAX 0
++
++    uint n_tile = threadgroup_position_in_grid.y;
++    uint b_idx = threadgroup_position_in_grid.z;
++    uint simd_gid = simdgroup_index_in_threadgroup;
++    uint simd_lid = thread_index_in_simdgroup;
++
++#if M8_ARGMAX
++    threadgroup float tile_best_values[8][M8_NUM_SIMDGROUPS];
++    threadgroup int tile_best_indices[8][M8_NUM_SIMDGROUPS];
++#endif
++
++    int out_row = int(n_tile) * M8_NUM_SIMDGROUPS * M8_RESULTS_PER_SIMDGROUP +
++        int(simd_gid) * M8_RESULTS_PER_SIMDGROUP;
++    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
++    int in_vec_size_g = K_SIZE / GS;
++
++    const device uint8_t* ws =
++        (const device uint8_t*)w + out_row * in_vec_size_w +
++        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
++    const device T* sc =
++        scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
++    const device T* bs =
++        biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
++    const device T* xk =
++        x + int(b_idx) * 8 * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
++
++    // Keep only two output rows live per SIMD group.  Eight rows per group
++    // spills on M3-class GPUs; four rows also loses occupancy once the eight
++    // singleton accumulators are present.
++    float result0[M8_RESULTS_PER_SIMDGROUP] = {0};
++    float result1[M8_RESULTS_PER_SIMDGROUP] = {0};
++    float result2[M8_RESULTS_PER_SIMDGROUP] = {0};
++    float result3[M8_RESULTS_PER_SIMDGROUP] = {0};
++    float result4[M8_RESULTS_PER_SIMDGROUP] = {0};
++    float result5[M8_RESULTS_PER_SIMDGROUP] = {0};
++    float result6[M8_RESULTS_PER_SIMDGROUP] = {0};
++    float result7[M8_RESULTS_PER_SIMDGROUP] = {0};
++
++    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
++      float sum0 = 0.0f;
++      float sum1 = 0.0f;
++      float sum2 = 0.0f;
++      float sum3 = 0.0f;
++      float sum4 = 0.0f;
++      float sum5 = 0.0f;
++      float sum6 = 0.0f;
++      float sum7 = 0.0f;
++      float dot0[M8_RESULTS_PER_SIMDGROUP] = {0};
++      float dot1[M8_RESULTS_PER_SIMDGROUP] = {0};
++      float dot2[M8_RESULTS_PER_SIMDGROUP] = {0};
++      float dot3[M8_RESULTS_PER_SIMDGROUP] = {0};
++      float dot4[M8_RESULTS_PER_SIMDGROUP] = {0};
++      float dot5[M8_RESULTS_PER_SIMDGROUP] = {0};
++      float dot6[M8_RESULTS_PER_SIMDGROUP] = {0};
++      float dot7[M8_RESULTS_PER_SIMDGROUP] = {0};
++
++      for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
++        // Load each packed target weight once, then reuse it across all eight
++        // verifier rows.  q0..q3 deliberately retain the singleton kernel's
++        // nibble scaling; changing this expression changes BF16/FP16 rounding.
++        float q0[M8_RESULTS_PER_SIMDGROUP];
++        float q1[M8_RESULTS_PER_SIMDGROUP];
++        float q2[M8_RESULTS_PER_SIMDGROUP];
++        float q3[M8_RESULTS_PER_SIMDGROUP];
++#pragma clang loop unroll(full)
++        for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
++          const device uint16_t* packed_w =
++              (const device uint16_t*)(ws + row * in_vec_size_w);
++          uint16_t packed = packed_w[i / 4];
++          q0[row] = float(packed & 0x000f);
++          q1[row] = float(packed & 0x00f0);
++          q2[row] = float(packed & 0x0f00);
++          q3[row] = float(packed & 0xf000);
++        }
++
++        // Process one token at a time so only four source values and their
++        // promoted forms are live.  The generic T=8 kernel keeps 128 floats
++        // of activation state per thread and spills badly on Apple G15.
++#define M8_ACCUM_TOKEN(TOKEN, SUM, DOT)                                      \
++        {                                                                    \
++          T x0 = xk[(TOKEN) * K_SIZE + i];                                  \
++          T x1 = xk[(TOKEN) * K_SIZE + i + 1];                              \
++          T x2 = xk[(TOKEN) * K_SIZE + i + 2];                              \
++          T x3 = xk[(TOKEN) * K_SIZE + i + 3];                              \
++          SUM += x0 + x1 + x2 + x3;                                        \
++          float fx0 = float(x0);                                            \
++          float fx1 = float(x1) / 16.0f;                                    \
++          float fx2 = float(x2) / 256.0f;                                   \
++          float fx3 = float(x3) / 4096.0f;                                  \
++          _Pragma("clang loop unroll(full)")                               \
++          for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {        \
++            DOT[row] += fx0 * q0[row] + fx1 * q1[row] +                     \
++                fx2 * q2[row] + fx3 * q3[row];                              \
++          }                                                                  \
++        }
++
++        M8_ACCUM_TOKEN(0, sum0, dot0);
++        M8_ACCUM_TOKEN(1, sum1, dot1);
++        M8_ACCUM_TOKEN(2, sum2, dot2);
++        M8_ACCUM_TOKEN(3, sum3, dot3);
++        M8_ACCUM_TOKEN(4, sum4, dot4);
++        M8_ACCUM_TOKEN(5, sum5, dot5);
++        M8_ACCUM_TOKEN(6, sum6, dot6);
++        M8_ACCUM_TOKEN(7, sum7, dot7);
++#undef M8_ACCUM_TOKEN
++      }
++
++#pragma clang loop unroll(full)
++      for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
++        float scale = float(sc[row * in_vec_size_g]);
++        float bias = float(bs[row * in_vec_size_g]);
++        result0[row] += scale * dot0[row] + bias * sum0;
++        result1[row] += scale * dot1[row] + bias * sum1;
++        result2[row] += scale * dot2[row] + bias * sum2;
++        result3[row] += scale * dot3[row] + bias * sum3;
++        result4[row] += scale * dot4[row] + bias * sum4;
++        result5[row] += scale * dot5[row] + bias * sum5;
++        result6[row] += scale * dot6[row] + bias * sum6;
++        result7[row] += scale * dot7[row] + bias * sum7;
++      }
++      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
++      sc += BLOCK_SIZE / GS;
++      bs += BLOCK_SIZE / GS;
++      xk += BLOCK_SIZE;
++    }
++
++#if M8_ARGMAX
++    float best_value0 = -3.4028234663852886e38f;
++    float best_value1 = -3.4028234663852886e38f;
++    float best_value2 = -3.4028234663852886e38f;
++    float best_value3 = -3.4028234663852886e38f;
++    float best_value4 = -3.4028234663852886e38f;
++    float best_value5 = -3.4028234663852886e38f;
++    float best_value6 = -3.4028234663852886e38f;
++    float best_value7 = -3.4028234663852886e38f;
++    int best_index0 = 0;
++    int best_index1 = 0;
++    int best_index2 = 0;
++    int best_index3 = 0;
++    int best_index4 = 0;
++    int best_index5 = 0;
++    int best_index6 = 0;
++    int best_index7 = 0;
++
++#pragma clang loop unroll(full)
++    for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
++      int n = out_row + row;
++      float rounded0 = float(T(simd_sum(result0[row])));
++      float rounded1 = float(T(simd_sum(result1[row])));
++      float rounded2 = float(T(simd_sum(result2[row])));
++      float rounded3 = float(T(simd_sum(result3[row])));
++      float rounded4 = float(T(simd_sum(result4[row])));
++      float rounded5 = float(T(simd_sum(result5[row])));
++      float rounded6 = float(T(simd_sum(result6[row])));
++      float rounded7 = float(T(simd_sum(result7[row])));
++      if (rounded0 > best_value0) { best_value0 = rounded0; best_index0 = n; }
++      if (rounded1 > best_value1) { best_value1 = rounded1; best_index1 = n; }
++      if (rounded2 > best_value2) { best_value2 = rounded2; best_index2 = n; }
++      if (rounded3 > best_value3) { best_value3 = rounded3; best_index3 = n; }
++      if (rounded4 > best_value4) { best_value4 = rounded4; best_index4 = n; }
++      if (rounded5 > best_value5) { best_value5 = rounded5; best_index5 = n; }
++      if (rounded6 > best_value6) { best_value6 = rounded6; best_index6 = n; }
++      if (rounded7 > best_value7) { best_value7 = rounded7; best_index7 = n; }
++    }
++
++    if (simd_lid == 0) {
++      tile_best_values[0][simd_gid] = best_value0;
++      tile_best_values[1][simd_gid] = best_value1;
++      tile_best_values[2][simd_gid] = best_value2;
++      tile_best_values[3][simd_gid] = best_value3;
++      tile_best_values[4][simd_gid] = best_value4;
++      tile_best_values[5][simd_gid] = best_value5;
++      tile_best_values[6][simd_gid] = best_value6;
++      tile_best_values[7][simd_gid] = best_value7;
++      tile_best_indices[0][simd_gid] = best_index0;
++      tile_best_indices[1][simd_gid] = best_index1;
++      tile_best_indices[2][simd_gid] = best_index2;
++      tile_best_indices[3][simd_gid] = best_index3;
++      tile_best_indices[4][simd_gid] = best_index4;
++      tile_best_indices[5][simd_gid] = best_index5;
++      tile_best_indices[6][simd_gid] = best_index6;
++      tile_best_indices[7][simd_gid] = best_index7;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (simd_gid == 0 && simd_lid == 0) {
++#pragma clang loop unroll(full)
++      for (int t = 0; t < 8; ++t) {
++        float best = tile_best_values[t][0];
++        int best_idx = tile_best_indices[t][0];
++#pragma clang loop unroll(full)
++        for (int group = 1; group < M8_NUM_SIMDGROUPS; ++group) {
++          float candidate = tile_best_values[t][group];
++          if (candidate > best) {
++            best = candidate;
++            best_idx = tile_best_indices[t][group];
++          }
++        }
++        int offset = (int(b_idx) * 8 + t) * NUM_TILES + int(n_tile);
++        tile_values[offset] = T(best);
++        tile_indices[offset] = best_idx;
++      }
++    }
++#else
++#pragma clang loop unroll(full)
++    for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
++      float r0 = simd_sum(result0[row]);
++      float r1 = simd_sum(result1[row]);
++      float r2 = simd_sum(result2[row]);
++      float r3 = simd_sum(result3[row]);
++      float r4 = simd_sum(result4[row]);
++      float r5 = simd_sum(result5[row]);
++      float r6 = simd_sum(result6[row]);
++      float r7 = simd_sum(result7[row]);
++      if (simd_lid == 0) {
++        int base = int(b_idx) * 8 * N_SIZE + out_row + row;
++        y[base + 0 * N_SIZE] = T(r0);
++        y[base + 1 * N_SIZE] = T(r1);
++        y[base + 2 * N_SIZE] = T(r2);
++        y[base + 3 * N_SIZE] = T(r3);
++        y[base + 4 * N_SIZE] = T(r4);
++        y[base + 5 * N_SIZE] = T(r5);
++        y[base + 6 * N_SIZE] = T(r6);
++        y[base + 7 * N_SIZE] = T(r7);
++      }
++    }
++#endif
++"""
++
++
++_TARGET_VERIFY_M8_NUM_SIMDGROUPS = 4
++_TARGET_VERIFY_M8_RESULTS_PER_SIMDGROUP = 2
++_TARGET_VERIFY_QARGMAX_M8_SOURCE = _TARGET_VERIFY_QMV_M8_SOURCE.replace(
++    "#define M8_ARGMAX 0", "#define M8_ARGMAX 1"
++)
++
++
+ _TARGET_VERIFY_QARGMAX_SOURCE = r"""
+     uint n_tile = threadgroup_position_in_grid.y;
+     uint b_idx = threadgroup_position_in_grid.z;
+@@ -458,6 +829,43 @@ def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size)
+     )
+ 
+ 
++@lru_cache(maxsize=None)
++def _target_verify_qmv_m4_kernel(group_size, dtype, k_size, n_size):
++    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
++    return mx.fast.metal_kernel(
++        name=(
++            "qwen3_5_target_verify_qmv_m4_"
++            f"gs{group_size}_k{k_size}_n{n_size}_{dtype_name}"
++        ),
++        input_names=["x", "w", "scales", "biases"],
++        output_names=["y"],
++        header=_target_verify_qlinear_header(4, group_size),
++        source=_TARGET_VERIFY_QMV_M4_SOURCE,
++    )
++
++
++@lru_cache(maxsize=None)
++def _target_verify_qmv_m8_kernel(group_size, dtype, k_size, n_size):
++    """Build the M8 verifier as two M4 register tiles in one Metal launch.
++
++    A single workgroup retaining all eight rows reuses weights, but the extra
++    accumulators lower occupancy enough to lose on Apple G15. Flattening M8
++    into two independent four-token tiles preserves the native block-shaped
++    API and singleton arithmetic while keeping the faster M4 register layout.
++    """
++    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
++    return mx.fast.metal_kernel(
++        name=(
++            "qwen3_5_target_verify_qmv_m8_"
++            f"gs{group_size}_k{k_size}_n{n_size}_{dtype_name}"
++        ),
++        input_names=["x", "w", "scales", "biases"],
++        output_names=["y"],
++        header=_target_verify_qlinear_header(4, group_size),
++        source=_TARGET_VERIFY_QMV_M4_SOURCE,
++    )
++
++
+ @lru_cache(maxsize=None)
+ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
+     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+@@ -473,6 +881,21 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
+     )
+ 
+ 
++@lru_cache(maxsize=None)
++def _target_verify_qargmax_m8_kernel(group_size, dtype, k_size, n_size):
++    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
++    return mx.fast.metal_kernel(
++        name=(
++            "qwen3_5_target_verify_qargmax_m8_"
++            f"gs{group_size}_k{k_size}_n{n_size}_{dtype_name}"
++        ),
++        input_names=["x", "w", "scales", "biases"],
++        output_names=["tile_values", "tile_indices"],
++        header=_target_verify_qlinear_header(4, group_size),
++        source=_TARGET_VERIFY_QARGMAX_M8_SOURCE,
++    )
++
++
+ @lru_cache(maxsize=None)
+ def _target_verify_masked_qargmax_kernel(
+     bits, group_size, dtype, verify_t, k_size, n_size
+@@ -519,38 +942,97 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+     return x.shape[-1] == K
+ 
+ 
+-def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
+-    if not _can_target_verify_quantized(linear, x):
+-        return None
+-
++def _target_verify_qmv(
++    x: mx.array,
++    weight: mx.array,
++    scales: mx.array,
++    biases: mx.array,
++    *,
++    bits: int,
++    group_size: int,
++) -> mx.array:
+     B, T, K = x.shape
+-    N = linear.weight.shape[0]
+-
++    N = weight.shape[0]
+     x = mx.contiguous(x)
+-    kernel = _target_verify_qmv_kernel(linear.bits, linear.group_size, x.dtype, T, K, N)
+-    out = kernel(
+-        inputs=[x, linear.weight, linear.scales, linear.biases],
+-        template=[
++
++    if bits == 4 and T == 4:
++        kernel = _target_verify_qmv_m4_kernel(group_size, x.dtype, K, N)
++        template = [
++            ("T", x.dtype),
++            ("K_SIZE", int(K)),
++            ("N_SIZE", int(N)),
++            ("M4_NUM_SIMDGROUPS", _TARGET_VERIFY_M4_NUM_SIMDGROUPS),
++            (
++                "M4_RESULTS_PER_SIMDGROUP",
++                _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP,
++            ),
++        ]
++    elif bits == 4 and T == 8:
++        kernel = _target_verify_qmv_m8_kernel(group_size, x.dtype, K, N)
++        template = [
++            ("T", x.dtype),
++            ("K_SIZE", int(K)),
++            ("N_SIZE", int(N)),
++            ("M4_NUM_SIMDGROUPS", _TARGET_VERIFY_M4_NUM_SIMDGROUPS),
++            (
++                "M4_RESULTS_PER_SIMDGROUP",
++                _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP,
++            ),
++        ]
++    else:
++        kernel = _target_verify_qmv_kernel(bits, group_size, x.dtype, T, K, N)
++        template = [
+             ("T", x.dtype),
+             ("VERIFY_T", int(T)),
+             ("K_SIZE", int(K)),
+             ("N_SIZE", int(N)),
+-        ],
+-        grid=(32, 2 * (N // 8), B),
+-        threadgroup=(32, 2, 1),
++        ]
++
++    if bits == 4 and T == 4:
++        num_simdgroups = _TARGET_VERIFY_M4_NUM_SIMDGROUPS
++        results_per_simdgroup = _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP
++    elif bits == 4 and T == 8:
++        num_simdgroups = _TARGET_VERIFY_M4_NUM_SIMDGROUPS
++        results_per_simdgroup = _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP
++    else:
++        num_simdgroups = 8
++        results_per_simdgroup = 1
++    rows_per_threadgroup = num_simdgroups * results_per_simdgroup
++    return kernel(
++        inputs=[x, weight, scales, biases],
++        template=template,
++        grid=(
++            32,
++            num_simdgroups * (N // rows_per_threadgroup),
++            B * 2 if bits == 4 and T == 8 else B,
++        ),
++        threadgroup=(32, num_simdgroups, 1),
+         output_shapes=[(B, T, N)],
+         output_dtypes=[x.dtype],
+     )[0]
++
++
++def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
++    if not _can_target_verify_quantized(linear, x):
++        return None
++
++    out = _target_verify_qmv(
++        x,
++        linear.weight,
++        linear.scales,
++        linear.biases,
++        bits=linear.bits,
++        group_size=linear.group_size,
++    )
+     if "bias" in linear:
+         out = out + linear["bias"]
+     return out
+ 
+ 
+-def _decode_quantized_linears_fused(linears, x: mx.array):
++def _fused_quantized_linears(linears, x: mx.array):
+     if (
+         x.ndim != 3
+-        or x.shape[1] != 1
+-        or len(linears) != 4
++        or len(linears) < 2
+         or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
+     ):
+         return None
+@@ -560,6 +1042,7 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
+         linear.bits == first.bits
+         and linear.group_size == first.group_size
+         and linear.mode == first.mode
++        and linear.weight.shape[1] == first.weight.shape[1]
+         and linear.biases is not None
+         and linear.scales.dtype == x.dtype
+         and linear.biases.dtype == x.dtype
+@@ -586,6 +1069,18 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
+         first._qwen3_5_fused_decode_linears = cached
+ 
+     _, weights, scales, biases, split_indices = cached
++    return first, weights, scales, biases, split_indices
++
++
++def _decode_quantized_linears_fused(linears, x: mx.array):
++    if x.ndim != 3 or x.shape[1] != 1 or len(linears) != 4:
++        return None
++
++    fused = _fused_quantized_linears(linears, x)
++    if fused is None:
++        return None
++
++    first, weights, scales, biases, split_indices = fused
+     output = mx.quantized_matmul(
+         x,
+         weights,
+@@ -599,6 +1094,34 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
+     return tuple(mx.split(output, split_indices, axis=-1))
+ 
+ 
++def _target_verify_quantized_linears(linears, x: mx.array):
++    fused = _fused_quantized_linears(linears, x)
++    if fused is None:
++        return None
++
++    first, weights, scales, biases, split_indices = fused
++    K = first.weight.shape[1] * 32 // first.bits
++    N = weights.shape[0]
++    if (
++        first.bits not in (4, 5)
++        or first.mode != "affine"
++        or K % 512 != 0
++        or N % 8 != 0
++        or x.shape[-1] != K
++    ):
++        return None
++
++    output = _target_verify_qmv(
++        x,
++        weights,
++        scales,
++        biases,
++        bits=first.bits,
++        group_size=first.group_size,
++    )
++    return tuple(mx.split(output, split_indices, axis=-1))
++
++
+ def _pad_token_mask_to_head(token_mask: mx.array, n_size: int) -> mx.array:
+     """Widen a packed token bitmask to cover every lm_head output row.
+ 
+@@ -634,12 +1157,18 @@ def _target_verify_quantized_argmax(
+     num_tiles = N // 8
+ 
+     x = mx.contiguous(x)
+-    kernel_factory = (
+-        _target_verify_masked_qargmax_kernel
+-        if token_mask is not None
+-        else _target_verify_qargmax_kernel
+-    )
+-    kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
++    use_m8 = linear.bits == 4 and T == 8 and token_mask is None
++    if use_m8:
++        kernel = _target_verify_qargmax_m8_kernel(
++            linear.group_size, x.dtype, K, N
++        )
++    else:
++        kernel_factory = (
++            _target_verify_masked_qargmax_kernel
++            if token_mask is not None
++            else _target_verify_qargmax_kernel
++        )
++        kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
+     inputs = [x, linear.weight, linear.scales, linear.biases]
+     if token_mask is not None:
+         if token_mask.ndim == 1:
+@@ -653,17 +1182,34 @@ def _target_verify_quantized_argmax(
+                 "packed token mask must be int32 with one complete row per token"
+             )
+         inputs.append(token_mask)
+-    tile_values, tile_indices = kernel(
+-        inputs=inputs,
+-        template=[
++    if use_m8:
++        template = [
++            ("T", x.dtype),
++            ("K_SIZE", int(K)),
++            ("N_SIZE", int(N)),
++            ("NUM_TILES", int(num_tiles)),
++            ("M8_NUM_SIMDGROUPS", _TARGET_VERIFY_M8_NUM_SIMDGROUPS),
++            (
++                "M8_RESULTS_PER_SIMDGROUP",
++                _TARGET_VERIFY_M8_RESULTS_PER_SIMDGROUP,
++            ),
++        ]
++        num_simdgroups = _TARGET_VERIFY_M8_NUM_SIMDGROUPS
++    else:
++        template = [
+             ("T", x.dtype),
+             ("VERIFY_T", int(T)),
+             ("K_SIZE", int(K)),
+             ("N_SIZE", int(N)),
+             ("NUM_TILES", int(num_tiles)),
+-        ],
+-        grid=(32, 2 * num_tiles, B),
+-        threadgroup=(32, 2, 1),
++        ]
++        num_simdgroups = 8
++
++    tile_values, tile_indices = kernel(
++        inputs=inputs,
++        template=template,
++        grid=(32, num_simdgroups * num_tiles, B),
++        threadgroup=(32, num_simdgroups, 1),
+         output_shapes=[(B, T, num_tiles), (B, T, num_tiles)],
+         output_dtypes=[x.dtype, mx.int32],
+     )
+@@ -692,8 +1238,6 @@ def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
+         return linear(x)
+ 
+     if isinstance(linear, nn.QuantizedLinear):
+-        if x.shape[0] == 1:
+-            return linear(x)
+         out = _target_verify_quantized_linear(linear, x)
+         if out is not None:
+             return out
+@@ -721,6 +1265,9 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
+             return out
+         return tuple(linear(x) for linear in linears)
+ 
++    out = _target_verify_quantized_linears(linears, x)
++    if out is not None:
++        return out
+     return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
+ 
+ 
+@@ -2113,6 +2660,8 @@ class Qwen3_5Model(nn.Module):
+ 
+ 
+ class LanguageModel(nn.Module):
++    requires_explicit_target_verify = True
++
+     def __init__(self, args: TextConfig, config: ModelConfig = None):
+         super().__init__()
+         self.args = args
+@@ -2621,6 +3170,7 @@ class LanguageModel(nn.Module):
+         video_grid_thw = kwargs.pop("video_grid_thw", None)
+         attention_mask = kwargs.pop("attention_mask", None)
+         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
++        target_verify = kwargs.pop("target_verify", False)
+         return_hidden = kwargs.pop("return_hidden", False)
+         return_shared_kv = kwargs.pop("return_shared_kv", False)
+         skip_logits = kwargs.pop("skip_logits", False)
+@@ -2758,8 +3308,7 @@ class LanguageModel(nn.Module):
+         hidden_sink: Optional[List[mx.array]] = (
+             [] if capture_layer_ids is not None else None
+         )
+-        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
+-        target_verify = gdn_sink is not None
++        gdn_sink: Optional[list] = [] if target_verify else None
+ 
+         out = self.model(
+             inputs,
+@@ -2873,6 +3422,7 @@ class LanguageModel(nn.Module):
+             inputs,
+             cache=cache,
+             capture_layer_ids=[],
++            target_verify=True,
+             return_hidden=True,
+             return_shared_kv=True,
+         )
+@@ -2888,6 +3438,7 @@ class LanguageModel(nn.Module):
+             inputs,
+             cache=cache,
+             capture_layer_ids=[],
++            target_verify=True,
+             return_hidden=True,
+             return_shared_kv=True,
+             skip_logits=True,
+diff --git a/mlx_vlm/sample_utils.py b/mlx_vlm/sample_utils.py
+index 0fb3161..43a2d19 100644
+--- a/mlx_vlm/sample_utils.py
++++ b/mlx_vlm/sample_utils.py
+@@ -61,7 +61,12 @@ def make_sampler(
+         xtc_special_tokens = []
+ 
+     if temp == 0:
+-        return lambda x: mx.argmax(x, axis=-1)
++
++        def greedy_sampler(x):
++            return mx.argmax(x, axis=-1)
++
++        greedy_sampler.temperature = 0.0
++        return greedy_sampler
+ 
+     sampling_methods = []
+     if top_n_sigma > 0.0:
+@@ -86,6 +91,14 @@ def make_sampler(
+             logprobs = method(logprobs)
+         return categorical_sampling(logprobs, temp)
+ 
++    def probabilities(logprobs):
++        for method in sampling_methods:
++            logprobs = method(logprobs)
++        return mx.softmax(logprobs * (1 / temp), axis=-1)
++
++    sampler.temperature = float(temp)
++    sampler.probabilities = probabilities
++
+     return sampler
+ 
+ 
+diff --git a/mlx_vlm/server/cli.py b/mlx_vlm/server/cli.py
+index fdcb664..f6229c8 100644
+--- a/mlx_vlm/server/cli.py
++++ b/mlx_vlm/server/cli.py
+@@ -231,6 +231,19 @@ def main():
+         default=None,
+         help="Override the drafter's configured block size.",
+     )
++    parser.add_argument(
++        "--draft-bits",
++        type=int,
++        choices=[4, 8],
++        default=None,
++        help="Quantize the drafter in memory to 4 or 8 bits.",
++    )
++    parser.add_argument(
++        "--draft-group-size",
++        type=int,
++        default=64,
++        help="Group size for in-memory drafter quantization (default: 64).",
++    )
+     parser.add_argument(
+         "--max-num-seqs",
+         type=int,
+@@ -297,6 +310,9 @@ def main():
+         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+     if args.draft_block_size is not None:
+         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
++    if args.draft_bits is not None:
++        os.environ["MLX_VLM_DRAFT_BITS"] = str(args.draft_bits)
++        os.environ["MLX_VLM_DRAFT_GROUP_SIZE"] = str(args.draft_group_size)
+     if args.max_num_seqs is not None:
+         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
+     if args.prefill_step_size:
+diff --git a/mlx_vlm/server/generation.py b/mlx_vlm/server/generation.py
+index 0f84034..69c9a14 100644
+--- a/mlx_vlm/server/generation.py
++++ b/mlx_vlm/server/generation.py
+@@ -1195,7 +1195,15 @@ class ResponseGenerator:
+                 draft_kind or "auto",
+                 draft_model_path,
+             )
+-            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
++            draft_bits_value = os.environ.get("MLX_VLM_DRAFT_BITS")
++            draft_bits = int(draft_bits_value) if draft_bits_value else None
++            draft_group_size = int(os.environ.get("MLX_VLM_DRAFT_GROUP_SIZE", "64"))
++            draft_model, resolved_kind = load_drafter(
++                draft_model_path,
++                kind=draft_kind,
++                draft_bits=draft_bits,
++                draft_group_size=draft_group_size,
++            )
+             if draft_kind is None:
+                 logger.info("Auto-detected speculative draft kind: %s", resolved_kind)
+             elif resolved_kind != draft_kind:
+diff --git a/mlx_vlm/speculative/common.py b/mlx_vlm/speculative/common.py
+index 66d2eaa..1873173 100644
+--- a/mlx_vlm/speculative/common.py
++++ b/mlx_vlm/speculative/common.py
+@@ -6,6 +6,13 @@ import mlx.nn as nn
+ generation_stream = mx.new_thread_local_stream(mx.default_device())
+ 
+ 
++def _target_verify_kwargs(lm: nn.Module) -> dict:
++    """Opt models into verifier-only numerical paths explicitly."""
++    if getattr(lm, "requires_explicit_target_verify", False):
++        return {"target_verify": True}
++    return {}
++
++
+ def _copy_rng_state() -> List[mx.array]:
+     return [mx.array(state) for state in mx.random.state]
+ 
+diff --git a/mlx_vlm/speculative/dflash.py b/mlx_vlm/speculative/dflash.py
+index f132318..27ae103 100644
+--- a/mlx_vlm/speculative/dflash.py
++++ b/mlx_vlm/speculative/dflash.py
+@@ -8,6 +8,7 @@ from .common import (
+     _record_speculative_round,
+     _speculative_walk,
+     _speculative_walk_batch,
++    _target_verify_kwargs,
+     generation_stream,
+ )
+ 
+@@ -75,6 +76,134 @@ def _dflash_committed_hidden_segments(
+     ]
+ 
+ 
++def _dflash_verify_target(
++    lm: nn.Module,
++    verify_input: mx.array,
++    prompt_cache: List[Any],
++    target_layer_ids: List[int],
++    sampler: Callable[[mx.array], mx.array],
++    *,
++    greedy_sampling: bool,
++):
++    """Verify one DFlash block, fusing the quantized greedy LM-head argmax."""
++    target_verify_kwargs = _target_verify_kwargs(lm)
++    argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
++    if greedy_sampling and callable(argmax_from_hidden):
++        verify_out = lm(
++            verify_input,
++            cache=prompt_cache,
++            capture_layer_ids=target_layer_ids,
++            return_hidden=True,
++            skip_logits=True,
++            **target_verify_kwargs,
++        )
++        target_tokens = argmax_from_hidden(verify_out.hidden_states[-1])
++        captured = verify_out.hidden_states[:-1]
++    else:
++        verify_out = lm(
++            verify_input,
++            cache=prompt_cache,
++            capture_layer_ids=target_layer_ids,
++            **target_verify_kwargs,
++        )
++        if greedy_sampling:
++            target_tokens = sampler(verify_out.logits)
++        else:
++            target_logprobs = verify_out.logits - mx.logsumexp(
++                verify_out.logits, axis=-1, keepdims=True
++            )
++            target_tokens = sampler(target_logprobs)
++        captured = verify_out.hidden_states
++    return verify_out, mx.concatenate(captured, axis=-1), target_tokens
++
++
++def _dflash_rejection_enabled(
++    draft_model: nn.Module,
++    sampler: Callable[[mx.array], mx.array],
++    greedy_sampling: bool,
++) -> bool:
++    return (
++        not greedy_sampling
++        and getattr(draft_model, "supports_rejection_sampling", False)
++        and callable(getattr(draft_model, "propose_block", None))
++        and float(getattr(sampler, "temperature", 0.0)) > 0
++        and callable(getattr(sampler, "probabilities", None))
++    )
++
++
++def _dflash_target_probabilities(sampler, logits: mx.array) -> mx.array:
++    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
++    return sampler.probabilities(logprobs)
++
++
++def _dflash_sample_probs(probabilities: mx.array) -> mx.array:
++    return mx.random.categorical(mx.log(probabilities))
++
++
++def _dflash_rejection_sample(
++    draft_tokens: mx.array,
++    target_probabilities: mx.array,
++    draft_probabilities: mx.array,
++    draft_indices: mx.array,
++) -> Tuple[int, int]:
++    """Distribution-preserving speculative acceptance for one DFlash2 row."""
++    draft_count = draft_tokens.shape[1]
++    target_on_draft = mx.take_along_axis(
++        target_probabilities[:, :draft_count], draft_tokens[..., None], axis=-1
++    )[..., 0]
++    draft_on_draft = mx.sum(
++        draft_probabilities * (draft_indices == draft_tokens[..., None]), axis=-1
++    )
++    accepted = mx.sum(
++        mx.cumprod(
++            (
++                mx.random.uniform(shape=draft_on_draft.shape) * draft_on_draft
++                < target_on_draft
++            ).astype(mx.int32),
++            axis=-1,
++        ),
++        axis=-1,
++    )[0].item()
++
++    if accepted == draft_count:
++        bonus = _dflash_sample_probs(target_probabilities[:, -1])[0].item()
++        return accepted, bonus
++
++    residual = target_probabilities[0, accepted]
++    candidate_ids = draft_indices[0, accepted]
++    candidate_values = (
++        mx.take(residual, candidate_ids) - draft_probabilities[0, accepted]
++    )
++    residual = mx.put_along_axis(
++        residual[None], candidate_ids[None], candidate_values[None], axis=-1
++    )[0]
++    residual = mx.maximum(residual, 0)
++    total = mx.sum(residual)
++    residual = mx.where(
++        total > 0,
++        residual / mx.maximum(total, 1e-30),
++        target_probabilities[0, accepted],
++    )
++    return accepted, _dflash_sample_probs(residual[None])[0].item()
++
++
++def _dflash_rejection_walk(
++    draft_tokens: mx.array,
++    target_probabilities: mx.array,
++    draft_probabilities: mx.array,
++    draft_indices: mx.array,
++    budget: int,
++) -> Tuple[int, List[int]]:
++    accepted, bonus = _dflash_rejection_sample(
++        draft_tokens,
++        target_probabilities,
++        draft_probabilities,
++        draft_indices,
++    )
++    draft_row = draft_tokens.reshape(-1).tolist()[: draft_tokens.shape[1]]
++    return accepted, (draft_row[:accepted] + [bonus])[:budget]
++
++
+ def _dflash_rounds(
+     model: nn.Module,
+     draft_model: nn.Module,
+@@ -87,6 +216,7 @@ def _dflash_rounds(
+     draft_block_size: Optional[int] = None,
+     token_dtype: mx.Dtype = mx.int32,
+     use_model_initial_block_size: bool = True,
++    greedy_sampling: bool = False,
+ ) -> Generator[Tuple[int, None], None, None]:
+     """DFlash speculative-decoding **round loop**.
+ 
+@@ -109,6 +239,9 @@ def _dflash_rounds(
+     if hidden_is_prepared:
+         hidden = prepare_target_hidden(hidden)
+         mx.async_eval(hidden)
++    rejection_sampling = _dflash_rejection_enabled(
++        draft_model, sampler, greedy_sampling
++    )
+ 
+     b = first_bonus
+     emitted = 1  # the first bonus has already been yielded by the caller
+@@ -127,36 +260,72 @@ def _dflash_rounds(
+         if bs <= 1:
+             break
+ 
+-        draft_kwargs = {"target_hidden_prepared": True} if hidden_is_prepared else {}
+-        draft_tokens = draft_model.draft_block(
+-            b,
+-            hidden,
+-            draft_cache,
+-            bs,
+-            sampler,
+-            token_dtype,
+-            **draft_kwargs,
+-        )
+-        mx.async_eval(draft_tokens)
++        if rejection_sampling:
++            draft_tokens, draft_indices, draft_probabilities = (
++                draft_model.propose_block(
++                    b,
++                    hidden,
++                    draft_cache,
++                    bs,
++                    float(sampler.temperature),
++                    token_dtype,
++                )
++            )
++            mx.async_eval(draft_tokens, draft_probabilities)
++        else:
++            draft_kwargs = {}
++            if hidden_is_prepared:
++                draft_kwargs["target_hidden_prepared"] = True
++            if getattr(draft_model, "supports_greedy_selector", False):
++                draft_kwargs["greedy_sampling"] = greedy_sampling
++            draft_tokens = draft_model.draft_block(
++                b, hidden, draft_cache, bs, sampler, token_dtype, **draft_kwargs
++            )
++            mx.async_eval(draft_tokens)
+ 
+         with mx.stream(generation_stream):
+             verify_input = mx.concatenate(
+                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
+                 axis=1,
+             )
+-            verify_out = lm(
+-                verify_input,
+-                cache=prompt_cache,
+-                capture_layer_ids=target_layer_ids,
+-            )
+-            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+-            target_tokens = sampler(verify_out.logits)
+-        mx.async_eval(target_tokens, hidden)
++            if rejection_sampling:
++                verify_out = lm(
++                    verify_input,
++                    cache=prompt_cache,
++                    capture_layer_ids=target_layer_ids,
++                    **_target_verify_kwargs(lm),
++                )
++                hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
++                target_probabilities = _dflash_target_probabilities(
++                    sampler, verify_out.logits
++                )
++            else:
++                verify_out, hidden, target_tokens = _dflash_verify_target(
++                    lm,
++                    verify_input,
++                    prompt_cache,
++                    target_layer_ids,
++                    sampler,
++                    greedy_sampling=greedy_sampling,
++                )
++        if rejection_sampling:
++            mx.async_eval(target_probabilities, hidden)
++        else:
++            mx.async_eval(target_tokens, hidden)
+ 
+         # Walk
+-        accepted, new_tokens = _speculative_walk(
+-            draft_tokens, target_tokens, max_tokens - emitted
+-        )
++        if rejection_sampling:
++            accepted, new_tokens = _dflash_rejection_walk(
++                draft_tokens,
++                target_probabilities,
++                draft_probabilities,
++                draft_indices,
++                max_tokens - emitted,
++            )
++        else:
++            accepted, new_tokens = _speculative_walk(
++                draft_tokens, target_tokens, max_tokens - emitted
++            )
+         _record_speculative_round(draft_model, accepted, bs - 1)
+ 
+         if accepted < bs - 1:
+@@ -196,6 +365,7 @@ def _dflash_rounds_batch(
+     draft_block_size: Optional[int] = None,
+     token_dtype: mx.Dtype = mx.int32,
+     stop_check: Optional[Callable[[int, int], bool]] = None,
++    greedy_sampling: bool = False,
+ ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+     """Batch DFlash speculative-decoding round loop (B > 1).
+ 
+@@ -221,6 +391,9 @@ def _dflash_rounds_batch(
+     block_total = _dflash_block_total(draft_model, draft_block_size)
+     draft_model.reset(model)
+     draft_caches = [draft_model.make_cache() for _ in range(B)]
++    rejection_sampling = _dflash_rejection_enabled(
++        draft_model, sampler, greedy_sampling
++    )
+ 
+     # Per-sequence state tracked by ORIGINAL index so the caller sees
+     # stable indices in the yielded token lists.
+@@ -248,39 +421,92 @@ def _dflash_rounds_batch(
+         # Draft rowwise: the DFlash drafter cache is scalar-offset and has
+         # proven unsafe as a single batched cache on MLX/Metal. Target verify
+         # remains batched below.
+-        draft_tokens = mx.concatenate(
+-            [
+-                draft_model.draft_block(
++        if rejection_sampling:
++            proposals = [
++                draft_model.propose_block(
+                     int(b_active[j]),
+                     hidden_by_orig[active_idx[j]],
+                     draft_caches[active_idx[j]],
+                     bs,
+-                    sampler,
++                    float(sampler.temperature),
+                     token_dtype,
+                 )
+                 for j in range(n_active)
+-            ],
+-            axis=0,
+-        )
+-        mx.async_eval(draft_tokens)
++            ]
++            draft_tokens = mx.concatenate([p[0] for p in proposals], axis=0)
++            draft_indices = mx.concatenate([p[1] for p in proposals], axis=0)
++            draft_probabilities = mx.concatenate([p[2] for p in proposals], axis=0)
++            mx.async_eval(draft_tokens, draft_probabilities)
++        else:
++            draft_kwargs = (
++                {"greedy_sampling": greedy_sampling}
++                if getattr(draft_model, "supports_greedy_selector", False)
++                else {}
++            )
++            draft_tokens = mx.concatenate(
++                [
++                    draft_model.draft_block(
++                        int(b_active[j]),
++                        hidden_by_orig[active_idx[j]],
++                        draft_caches[active_idx[j]],
++                        bs,
++                        sampler,
++                        token_dtype,
++                        **draft_kwargs,
++                    )
++                    for j in range(n_active)
++                ],
++                axis=0,
++            )
++            mx.async_eval(draft_tokens)
+ 
+         # Verify
+         with mx.stream(generation_stream):
+             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+-            verify_out = lm(
+-                verify_input,
+-                cache=prompt_cache,
+-                capture_layer_ids=target_layer_ids,
+-            )
+-            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
+-            target_tokens = sampler(verify_out.logits)
+-        mx.async_eval(target_tokens, hidden_full)
++            if rejection_sampling:
++                verify_out = lm(
++                    verify_input,
++                    cache=prompt_cache,
++                    capture_layer_ids=target_layer_ids,
++                    **_target_verify_kwargs(lm),
++                )
++                hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
++                target_probabilities = _dflash_target_probabilities(
++                    sampler, verify_out.logits
++                )
++            else:
++                verify_out, hidden_full, target_tokens = _dflash_verify_target(
++                    lm,
++                    verify_input,
++                    prompt_cache,
++                    target_layer_ids,
++                    sampler,
++                    greedy_sampling=greedy_sampling,
++                )
++        if rejection_sampling:
++            mx.async_eval(target_probabilities, hidden_full)
++        else:
++            mx.async_eval(target_tokens, hidden_full)
+ 
+         # Walk (per-sequence)
+         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+-        accepted_list, new_tokens_list = _speculative_walk_batch(
+-            draft_tokens, target_tokens, budgets
+-        )
++        if rejection_sampling:
++            walks = [
++                _dflash_rejection_walk(
++                    draft_tokens[j : j + 1],
++                    target_probabilities[j : j + 1],
++                    draft_probabilities[j : j + 1],
++                    draft_indices[j : j + 1],
++                    budgets[j],
++                )
++                for j in range(n_active)
++            ]
++            accepted_list = [walk[0] for walk in walks]
++            new_tokens_list = [walk[1] for walk in walks]
++        else:
++            accepted_list, new_tokens_list = _speculative_walk_batch(
++                draft_tokens, target_tokens, budgets
++            )
+ 
+         min_accepted = min(accepted_list)
+         accepted_arr = mx.array(accepted_list)
+diff --git a/mlx_vlm/speculative/drafters/__init__.py b/mlx_vlm/speculative/drafters/__init__.py
+index d7f3c2a..6cebfd2 100644
+--- a/mlx_vlm/speculative/drafters/__init__.py
++++ b/mlx_vlm/speculative/drafters/__init__.py
+@@ -150,8 +150,32 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
+     return kind
+ 
+ 
++def quantize_drafter(model: Any, bits: int, group_size: int = 64) -> Any:
++    """Quantize a loaded drafter in memory for faster draft forwards."""
++    if bits not in (4, 8):
++        raise ValueError(f"Drafter quantization bits must be 4 or 8; got {bits}.")
++    if group_size not in (32, 64, 128):
++        raise ValueError(
++            "Drafter quantization group size must be 32, 64, or 128; "
++            f"got {group_size}."
++        )
++
++    import mlx.core as mx
++    import mlx.nn as nn
++
++    nn.quantize(model, group_size=group_size, bits=bits)
++    mx.eval(model.parameters())
++    model.draft_quantization = {"bits": bits, "group_size": group_size}
++    return model
++
++
+ def load_drafter(
+-    path_or_repo: str, kind: Optional[str] = None, **kwargs
++    path_or_repo: str,
++    kind: Optional[str] = None,
++    *,
++    draft_bits: Optional[int] = None,
++    draft_group_size: int = 64,
++    **kwargs,
+ ) -> Tuple[object, str]:
+     """Load a speculative drafter and return ``(model, resolved_kind)``.
+ 
+@@ -168,7 +192,10 @@ def load_drafter(
+ 
+     path = get_model_path(path_or_repo)
+     resolved = resolve_drafter_kind(path, kind)
+-    return load_model(path, **kwargs), resolved
++    model = load_model(path, **kwargs)
++    if draft_bits is not None:
++        quantize_drafter(model, draft_bits, draft_group_size)
++    return model, resolved
+ 
+ 
+ __all__ = [
+@@ -178,6 +205,7 @@ __all__ = [
+     "DFlashDraftModel",
+     "LagunaDFlashDraftModel",
+     "MuseGlimmerAssistantDraftModel",
++    "quantize_drafter",
+     "load_drafter",
+     "resolve_drafter_kind",
+     "validate_drafter_compatibility",
+diff --git a/mlx_vlm/speculative/drafters/qwen3_dflash/__init__.py b/mlx_vlm/speculative/drafters/qwen3_dflash/__init__.py
+index cec5098..42ea1f9 100644
+--- a/mlx_vlm/speculative/drafters/qwen3_dflash/__init__.py
++++ b/mlx_vlm/speculative/drafters/qwen3_dflash/__init__.py
+@@ -1,11 +1,20 @@
+ from .config import DFlashConfig as ModelConfig
+-from .dflash import DFlashDraftModel
+-from .dflash import DFlashDraftModel as Model
+-from .dflash import DFlashKVCache
++from .dflash import DFlash2DraftModel, DFlashDraftModel, DFlashKVCache
++
++
++def Model(config: ModelConfig):
++    model_cls = (
++        DFlash2DraftModel
++        if "DFlash2DraftModel" in config.architectures
++        else DFlashDraftModel
++    )
++    return model_cls(config)
++
+ 
+ __all__ = [
+     "Model",
+     "ModelConfig",
++    "DFlash2DraftModel",
+     "DFlashDraftModel",
+     "DFlashKVCache",
+ ]
+diff --git a/mlx_vlm/speculative/drafters/qwen3_dflash/config.py b/mlx_vlm/speculative/drafters/qwen3_dflash/config.py
+index a608379..a3270a4 100644
+--- a/mlx_vlm/speculative/drafters/qwen3_dflash/config.py
++++ b/mlx_vlm/speculative/drafters/qwen3_dflash/config.py
+@@ -7,6 +7,7 @@ from ....models.base import BaseModelConfig
+ 
+ @dataclass
+ class DFlashConfig(BaseModelConfig):
++    architectures: List[str] = field(default_factory=list)
+     hidden_size: int = 2560
+     intermediate_size: int = 9728
+     num_hidden_layers: int = 5
+@@ -29,19 +30,41 @@ class DFlashConfig(BaseModelConfig):
+     final_logit_softcapping: Optional[float] = None
+     runtime_block_size: int | None = None
+     draft_window_size: int | None = None
++    input_embedding_scale: float = 1.0
++    output_multiplier: float = 1.0
++    conv_kernel_size: int = 0
++    conv_group_size: int = 0
++    selector_rank: int = 0
++    selector_top_k: int = 0
++    is_causal: bool | None = None
+ 
+     @classmethod
+     def from_dict(cls, params: dict) -> "DFlashConfig":
+         flat = dict(params)
+         dflash_cfg = flat.pop("dflash_config", None) or {}
+-        if "mask_token_id" in dflash_cfg:
+-            flat["mask_token_id"] = dflash_cfg["mask_token_id"]
++        rope = flat.pop("rope_parameters", None)
++        if rope is not None:
++            flat.setdefault("rope_scaling", rope)
++            flat.setdefault("rope_theta", rope.get("rope_theta", 10000.0))
++        nested_fields = (
++            "mask_token_id",
++            "runtime_block_size",
++            "draft_window_size",
++            "input_embedding_scale",
++            "output_multiplier",
++            "conv_kernel_size",
++            "conv_group_size",
++            "selector_rank",
++            "selector_top_k",
++            "final_logit_softcapping",
++        )
++        for name in nested_fields:
++            if name in dflash_cfg:
++                flat[name] = dflash_cfg[name]
++        if "block_size" in dflash_cfg:
++            flat["block_size"] = dflash_cfg["block_size"]
+         if "target_layer_ids" in dflash_cfg:
+             flat["target_layer_ids"] = list(dflash_cfg["target_layer_ids"])
+-        if "runtime_block_size" in dflash_cfg:
+-            flat["runtime_block_size"] = dflash_cfg["runtime_block_size"]
+-        if "draft_window_size" in dflash_cfg:
+-            flat["draft_window_size"] = dflash_cfg["draft_window_size"]
+         sig = inspect.signature(cls).parameters
+         return cls(**{k: v for k, v in flat.items() if k in sig})
+ 
+diff --git a/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py b/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
+index c1262ff..8e18ac7 100644
+--- a/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
++++ b/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
+@@ -32,6 +32,8 @@ class DFlashAttention(nn.Module):
+         )
+         self.is_sliding = layer_types[layer_idx] == "sliding_attention"
+         self.sliding_window = config.sliding_window if self.is_sliding else None
++        self.has_explicit_attention_mode = config.is_causal is not None
++        self.is_causal = bool(config.is_causal)
+         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
+         self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+         self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+@@ -42,7 +44,7 @@ class DFlashAttention(nn.Module):
+     def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache: KVCache):
+         B, L, _ = x.shape
+         S = x_ctx.shape[1]
+-        if self.is_sliding:
++        if self.is_sliding and self.has_explicit_attention_mode:
+             if self.sliding_window is None:
+                 raise ValueError(
+                     "DFlash draft config must define sliding_window for sliding layers."
+@@ -77,12 +79,26 @@ class DFlashAttention(nn.Module):
+         ctx_keys = rope(ctx_keys, offset=cache.offset)
+         prop_keys = rope(prop_keys, offset=cache.offset + S)
+         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
++        ctx_len = keys.shape[2]
+         keys = mx.concatenate([keys, prop_keys], axis=2)
+         values = mx.concatenate([values, prop_values], axis=2)
+-        # DFlash denoises the whole proposed block at once, so draft-block
+-        # self-attention is intentionally non-causal. Sliding layers already
+-        # limit resident prefix context through the rotating cache above.
++        # DFlash 2 explicitly declares its attention mode. Its non-causal
++        # proposal block stays global, while the oldest prefix keys fall out
++        # of the sliding window as the proposal position advances. Legacy
++        # checkpoints without ``is_causal`` retain the original unmasked path.
+         mask = None
++        if self.is_causal:
++            query = ctx_len + mx.arange(L)[:, None]
++            key = mx.arange(ctx_len + L)[None]
++            mask = key <= query
++        if self.is_sliding and self.has_explicit_attention_mode:
++            query = ctx_len + mx.arange(L)[:, None]
++            key = mx.arange(ctx_len + L)[None]
++            context = (key < ctx_len) & (query - key < self.sliding_window)
++            block = key >= ctx_len
++            if self.is_causal:
++                block = block & (key <= query)
++            mask = context | block
+         o = mx.fast.scaled_dot_product_attention(
+             queries, keys, values, scale=self.scale, mask=mask
+         )
+@@ -117,7 +133,152 @@ class DFlashDecoderLayer(nn.Module):
+         return h + self.mlp(self.post_attention_layernorm(h))
+ 
+ 
++@mx.compile
++def _grouped_dynamic_convolve(
++    hidden: mx.array,
++    dynamic: mx.array,
++    base: mx.array,
++    group_size: int,
++) -> mx.array:
++    """Apply DFlash 2's grouped, token-conditioned causal convolution."""
++    batch, length, hidden_size = hidden.shape
++    if group_size <= 0 or hidden_size % group_size:
++        raise ValueError(
++            "DFlash 2 conv_group_size must be positive and divide hidden_size; "
++            f"got hidden_size={hidden_size}, conv_group_size={group_size}."
++        )
++    groups = hidden_size // group_size
++    blocks = hidden.reshape(batch, length, groups, group_size)
++    dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
++    output = mx.zeros_like(blocks)
++    for offset in range(base.shape[0]):
++        if offset == 0:
++            values = blocks
++        else:
++            values = mx.concatenate(
++                [mx.zeros_like(blocks[:, :offset]), blocks[:, :-offset]], axis=1
++            )
++        kernel = base[offset].reshape(1, 1, groups, group_size)
++        output = output + (kernel + dynamic[:, :, offset]) * values
++    return output.reshape(hidden.shape)
++
++
++class GroupedDynamicCausalConv(nn.Module):
++    def __init__(self, hidden_size: int, kernel_size: int, group_size: int):
++        super().__init__()
++        if kernel_size <= 0:
++            raise ValueError(
++                f"DFlash 2 conv_kernel_size must be positive; got {kernel_size}."
++            )
++        if group_size <= 0 or hidden_size % group_size:
++            raise ValueError(
++                "DFlash 2 conv_group_size must be positive and divide hidden_size; "
++                f"got hidden_size={hidden_size}, conv_group_size={group_size}."
++            )
++        self.group_size = group_size
++        groups = hidden_size // group_size
++        self.base_kernel = mx.zeros((2, kernel_size, hidden_size))
++        self.kernel_projection = nn.Linear(
++            hidden_size, 2 * kernel_size * groups, bias=False
++        )
++
++    def prepare(self, hidden: mx.array):
++        groups = hidden.shape[-1] // self.group_size
++        dynamic = self.kernel_projection(hidden).reshape(
++            *hidden.shape[:-1], 2, self.base_kernel.shape[1], groups
++        )
++        return (
++            _grouped_dynamic_convolve(
++                hidden,
++                dynamic[..., 0, :, :],
++                self.base_kernel[0],
++                self.group_size,
++            ),
++            dynamic[..., 1, :, :],
++        )
++
++    def finish(self, hidden: mx.array, dynamic: mx.array) -> mx.array:
++        return _grouped_dynamic_convolve(
++            hidden, dynamic, self.base_kernel[1], self.group_size
++        )
++
++
++class DFlash2DecoderLayer(DFlashDecoderLayer):
++    def __init__(self, config: DFlashConfig, layer_idx: int):
++        super().__init__(config, layer_idx)
++        self.attention_conv = GroupedDynamicCausalConv(
++            config.hidden_size, config.conv_kernel_size, config.conv_group_size
++        )
++        self.mlp_conv = GroupedDynamicCausalConv(
++            config.hidden_size, config.conv_kernel_size, config.conv_group_size
++        )
++
++    def __call__(self, x, x_ctx, rope, cache):
++        residual = x
++        x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
++        x = residual + self.attention_conv.finish(
++            self.self_attn(x, x_ctx, rope, cache), kernel
++        )
++        residual = x
++        x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
++        return residual + self.mlp_conv.finish(self.mlp(x), kernel)
++
++
++class CandidateSelector(nn.Module):
++    """Trace a coherent path through per-position top-k candidates."""
++
++    def __init__(self, config: DFlashConfig):
++        super().__init__()
++        if config.selector_rank <= 0 or config.selector_top_k <= 0:
++            raise ValueError(
++                "DFlash 2 requires positive selector_rank and selector_top_k."
++            )
++        self.top_k = config.selector_top_k
++        self.predecessor_codebook = nn.Embedding(
++            config.vocab_size, config.selector_rank
++        )
++        self.successor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
++        self.hidden_projection = nn.Linear(
++            config.hidden_size, config.selector_rank, bias=False
++        )
++
++    def select(self, hidden, logits, anchor_ids, temperature: float = 0.0):
++        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k :]
++        unary = mx.take_along_axis(logits, candidates, axis=-1)
++        projected = self.hidden_projection(hidden)
++        predecessor = anchor_ids
++        path = []
++        probability_rows = []
++        for position in range(projected.shape[1]):
++            edges = mx.sum(
++                self.predecessor_codebook(predecessor)[:, None]
++                * projected[:, position, None]
++                * self.successor_codebook(candidates[:, position]),
++                axis=-1,
++            )
++            scores = unary[:, position] + edges
++            if temperature > 0:
++                probabilities = mx.softmax(
++                    scores.astype(mx.float32) * (1.0 / temperature), axis=-1
++                )
++                selected = mx.random.categorical(mx.log(probabilities))
++                probability_rows.append(probabilities)
++            else:
++                selected = mx.argmax(scores, axis=-1)
++            predecessor = mx.take_along_axis(
++                candidates[:, position], selected[:, None], axis=-1
++            )[:, 0]
++            path.append(predecessor)
++        return (
++            mx.stack(path, axis=1),
++            candidates,
++            mx.stack(probability_rows, axis=1) if probability_rows else None,
++        )
++
++
+ class DFlashDraftModel(nn.Module):
++    layer_class = DFlashDecoderLayer
++
+     def __init__(self, config: DFlashConfig):
+         super().__init__()
+         self.config = config
+@@ -127,7 +288,7 @@ class DFlashDraftModel(nn.Module):
+         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
+         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         self.layers = [
+-            DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)
++            self.layer_class(config, i) for i in range(config.num_hidden_layers)
+         ]
+         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         self.rope = _build_rope(config)
+@@ -155,8 +316,11 @@ class DFlashDraftModel(nn.Module):
+                 f"Cannot find embed_tokens in {type(target_model).__name__}"
+             )
+         self.embed_tokens = inner.embed_tokens
+-        self.embed_scale = getattr(
+-            self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0)
++        self.embed_scale = (
++            getattr(
++                self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0)
++            )
++            * self.config.input_embedding_scale
+         )
+         lm = getattr(target_model, "language_model", target_model)
+         self.lm_head = (
+@@ -216,7 +380,12 @@ class DFlashDraftModel(nn.Module):
+             )
+         draft_hidden = self._hidden(block, hidden, cache)
+         draft_logits = self._logits(draft_hidden[:, 1:])
+-        return sampler(draft_logits)
++        if float(getattr(sampler, "temperature", 0.0)) <= 0:
++            return sampler(draft_logits)
++        draft_logprobs = draft_logits - mx.logsumexp(
++            draft_logits, axis=-1, keepdims=True
++        )
++        return sampler(draft_logprobs)
+ 
+     def _hidden(
+         self,
+@@ -234,7 +403,7 @@ class DFlashDraftModel(nn.Module):
+         return self.embed_tokens(inputs) * self.embed_scale
+ 
+     def _logits(self, hidden: mx.array) -> mx.array:
+-        logits = self.lm_head(hidden)
++        logits = self.lm_head(hidden) * self.config.output_multiplier
+         if self.config.final_logit_softcapping is not None:
+             softcap = self.config.final_logit_softcapping
+             logits = mx.tanh(logits / softcap) * softcap
+@@ -257,4 +426,76 @@ class DFlashDraftModel(nn.Module):
+         return out
+ 
+ 
++class DFlash2DraftModel(DFlashDraftModel):
++    layer_class = DFlash2DecoderLayer
++    prefer_requested_block_size = True
++    supports_greedy_selector = True
++    supports_rejection_sampling = True
++
++    def __init__(self, config: DFlashConfig):
++        super().__init__(config)
++        self.candidate_selector = CandidateSelector(config)
++
++    def propose_block(
++        self,
++        last_bonus,
++        hidden: mx.array,
++        cache: List[KVCache],
++        block_size: int,
++        temperature: float,
++        token_dtype: mx.Dtype = mx.int32,
++    ):
++        mask_id = int(self.config.mask_token_id)
++        if isinstance(last_bonus, int):
++            block = mx.array(
++                [[last_bonus] + [mask_id] * (block_size - 1)],
++                dtype=token_dtype,
++            )
++        else:
++            batch = last_bonus.shape[0]
++            masks = mx.full((batch, block_size - 1), mask_id, dtype=token_dtype)
++            block = mx.concatenate(
++                [last_bonus[:, None].astype(token_dtype), masks], axis=1
++            )
++        draft_hidden = self._hidden(block, hidden, cache)[:, 1:]
++        return self.candidate_selector.select(
++            draft_hidden,
++            self._logits(draft_hidden),
++            block[:, 0],
++            temperature,
++        )
++
++    def draft_block(
++        self,
++        last_bonus,
++        hidden: mx.array,
++        cache: List[KVCache],
++        block_size: int,
++        sampler,
++        token_dtype: mx.Dtype = mx.int32,
++        *,
++        greedy_sampling: bool = False,
++    ) -> mx.array:
++        temperature = (
++            0.0 if greedy_sampling else float(getattr(sampler, "temperature", 1.0))
++        )
++        tokens, _, _ = self.propose_block(
++            last_bonus,
++            hidden,
++            cache,
++            block_size,
++            temperature,
++            token_dtype,
++        )
++        return tokens
++
++    def sanitize(self, weights: dict) -> dict:
++        out = super().sanitize(weights)
++        for name in ("predecessor_codebook", "successor_codebook"):
++            key = f"candidate_selector.{name}"
++            if key in out:
++                out[f"{key}.weight"] = out.pop(key)
++        return out
++
++
+ DFlashKVCache = KVCache
+diff --git a/mlx_vlm/speculative/eagle3.py b/mlx_vlm/speculative/eagle3.py
+index 2baaab3..336d102 100644
+--- a/mlx_vlm/speculative/eagle3.py
++++ b/mlx_vlm/speculative/eagle3.py
+@@ -7,6 +7,7 @@ from .common import (
+     _batch_cache_left_padding,
+     _record_speculative_round,
+     _SpeculativeSamplerRNG,
++    _target_verify_kwargs,
+     generation_stream,
+ )
+ 
+@@ -165,11 +166,13 @@ def _eagle3_verify_target(
+     sampler: Callable[[mx.array], mx.array],
+     target_layer_ids: List[int],
+ ):
++    target_verify_kwargs = _target_verify_kwargs(lm)
+     if verify_input.shape[1] > 1 and "gemma4" in type(lm).__module__:
+         first_out = lm(
+             verify_input[:, :1],
+             cache=prompt_cache,
+             capture_layer_ids=target_layer_ids,
++            **target_verify_kwargs,
+         )
+         hidden_chunks = [mx.concatenate(first_out.hidden_states, axis=-1)]
+         target_chunks = [sampler(first_out.logits)]
+@@ -180,6 +183,7 @@ def _eagle3_verify_target(
+                 verify_input[:, 1:],
+                 cache=prompt_cache,
+                 capture_layer_ids=target_layer_ids,
++                **target_verify_kwargs,
+             )
+             hidden_chunks.append(mx.concatenate(tail_out.hidden_states, axis=-1))
+             target_chunks.append(sampler(tail_out.logits))
+@@ -194,6 +198,7 @@ def _eagle3_verify_target(
+         verify_input,
+         cache=prompt_cache,
+         capture_layer_ids=target_layer_ids,
++        **target_verify_kwargs,
+     )
+     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+     target_tokens = sampler(verify_out.logits)
+diff --git a/mlx_vlm/speculative/utils.py b/mlx_vlm/speculative/utils.py
+index 0fe5527..5ef8014 100644
+--- a/mlx_vlm/speculative/utils.py
++++ b/mlx_vlm/speculative/utils.py
+@@ -16,8 +16,12 @@ from .common import (
+ from .dflash import (
+     _dflash_committed_hidden_segments,
+     _dflash_next_block_size,
++    _dflash_rejection_enabled,
++    _dflash_rejection_sample,
++    _dflash_rejection_walk,
+     _dflash_rounds,
+     _dflash_rounds_batch,
++    _dflash_verify_target,
+ )
+ from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
+ from .mtp import (
+@@ -40,8 +44,12 @@ __all__ = [
+     "_dflash_block_total",
+     "_dflash_committed_hidden_segments",
+     "_dflash_next_block_size",
++    "_dflash_rejection_enabled",
++    "_dflash_rejection_sample",
++    "_dflash_rejection_walk",
+     "_dflash_rounds",
+     "_dflash_rounds_batch",
++    "_dflash_verify_target",
+     "_effective_mtp_block_size",
+     "_format_speculative_stats",
+     "_mtp_draft_block_active",
+@@ -225,6 +233,7 @@ def run_speculative_server_rounds(
+             draft_block_size=draft_block_size,
+             token_dtype=token_dtype,
+             stop_check=stop_check,
++            greedy_sampling=greedy_sampling,
+         )
+         return
+ 
+@@ -367,6 +376,7 @@ def run_speculative_rounds(
+             sampler=sampler,
+             draft_block_size=draft_block_size,
+             token_dtype=input_ids.dtype,
++            greedy_sampling=sampler_is_greedy,
+         )
+     else:
+         mx.eval(first_token)
+@@ -382,4 +392,5 @@ def run_speculative_rounds(
+             sampler=sampler,
+             draft_block_size=draft_block_size,
+             token_dtype=input_ids.dtype,
++            greedy_sampling=sampler_is_greedy,
+         )
