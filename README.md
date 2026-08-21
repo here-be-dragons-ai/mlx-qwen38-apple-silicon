@@ -72,7 +72,7 @@ Metal-Selbsttest → Patches → Modell + MTP-Drafter → `~/.hermes/{logs,apc}`
 Pfade sind über Env steuerbar: `MLX_HOME` (Default `~/src/mlx`), `MLX_MODELS`,
 `PYTHON_VERSION`.
 
-**Gepinnter, verifizierter Stand:** `mlx 0.32.0`, `mlx-lm 0.31.3`,
+**Gepinnter, verifizierter Stand:** `mlx 0.32.1`, `mlx-lm 0.31.3`,
 **`mlx-vlm 0.6.15`**, `transformers 5.15.0`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 `mlx-vlm >= 0.6.13` ist Pflicht — erst dort ist Prefix-Caching upstream korrekt
@@ -80,17 +80,36 @@ Pfade sind über Env steuerbar: `MLX_HOME` (Default `~/src/mlx`), `MLX_MODELS`,
 Prompts. Ab `0.6.14` ist zusätzlich der Kurzprompt-Fix (PR #1901) enthalten,
 der vorher als lokaler Patch nötig war.
 
+`mlx 0.32.1` ist ein reiner Kompatibilitätsschritt und **kostet nichts**.
+Gemessen auf dieser Maschine (12 Läufe je Version, `temperature 0`, feste
+Prompts, Decode-Rate aus dem Server-Log):
+
+| | Median | Mittel | min–max |
+|---|---|---|---|
+| `mlx 0.32.0` | 43,2 t/s | 43,9 t/s | 42,8–45,4 |
+| `mlx 0.32.1` | 43,3 t/s | 43,3 t/s | 40,7–47,2 |
+
+Gleiche Token-Zahl in beiden Läufen, und die Ausgabe eines 400-Token-Prompts ist
+zwischen 0.32.0 und 0.32.1 **bit-identisch** (1696 Zeichen). Wichtig ist an
+0.32.1 etwas anderes: mlx-vlm 0.6.15 enthält bereits
+[#1949](https://github.com/Blaizzy/mlx-vlm/pull/1949) („Fix issues + tests with
+mlx 0.32.1", gemerged 34 Minuten *vor* dem 0.6.15-Release) — unter anderem
+`mx.clear_streams()` beim Thread-Ende und contiguous Views bei der
+KV-Dequantisierung. Der Stand passt also zusammen.
+
 > **Offen: mlx 0.32.2.** Für Qwen3.8 hängt daran der einzige echte
 > Kernel-Gewinn: `head_dim 256` bekommt wieder einen fused Full-Attention-Pfad
 > ([#4185](https://github.com/ml-explore/mlx/pull/4185), plus
 > [#3842](https://github.com/ml-explore/mlx/pull/3842) für NAX/M5). Beide sind
 > **nach** dem `0.32.1`-Tag gemerged; auf PyPI gibt es 0.32.2 noch nicht (auch
-> nicht als `mlx-metal`/`mlx-cpu`). Ein Quellbau scheitert hier an
+> nicht als `mlx-metal`/`mlx-cpu`), GitHub-Releases führen keine Wheels, und
+> conda-forge steht auf 0.32.0. Ein Quellbau scheitert an
 > `xcrun: unable to find utility "metal"` — der Metal-Compiler steckt in
 > Xcode.app, die Command Line Tools allein reichen nicht.
-> Patch `0013` liegt deshalb schon fertig im Baum und ist auf 0.32.0 als **inert
-> verifiziert** (`_FORCE_FUSED == False`). Er schaltet sich von selbst scharf,
-> sobald 0.32.2 installiert ist — der Versionsbump steht bereits auf `main`.
+> Patch `0013` liegt deshalb fertig im Baum und ist auf 0.32.0 **und** 0.32.1
+> als **inert verifiziert** (`_FORCE_FUSED == False`). Er schaltet sich von
+> selbst scharf, sobald 0.32.2 installiert ist — der Versionsbump steht bereits
+> auf `main`.
 
 ### Wired-Limit persistent machen
 
@@ -522,7 +541,22 @@ ps -o rss=,command= -p "$(pgrep -f mlx_vlm.server)" | awk '{printf "%.1f GiB\n",
 
 # Patch-Status (Patches liegen in site-packages und verschwinden bei JEDEM pip install)
 ./patches/apply-patches.sh --check
+
+# Ist die Maschine mitten in einem Request eingeschlafen? (s.u.)
+pmset -g log | grep -E "Entering Sleep state|Wake Requests" | tail -5
 ```
+
+> **Auf Akku schläft der Mac mitten in die Generierung hinein.** Signatur im
+> Log: `Decode completed` meldet eine plausible `elapsed`- und `rate`-Zahl,
+> aber zwischen zwei `Decode progress`-Zeilen springt die **Wanduhr** um
+> Minuten. Real gemessen am 2026-08-21: ein 400-Token-Request stand zwischen
+> Token 210 und 220 **989,7 s** still, während der Decode-Zähler nur 0,49 s
+> zählte. `pmset -g log` zeigte dazu passend
+> `06:22:20 Entering Sleep state due to 'Idle Sleep' … Using Batt` und einen
+> Weckauftrag mit `deltaSecs=991`.
+> Für Messungen und für jeden Agent-Lauf, der länger als der Idle-Timer dauert,
+> heißt das: `caffeinate -dimsu` davorsetzen (oder den Server gleich so
+> starten). Ohne das misst man Schlafphasen statt Durchsatz.
 
 | Symptom | Ursache |
 |---|---|
@@ -583,7 +617,7 @@ Im Einzelnen:
   PR begründet das damit, dass nur die Runtime ihr Speicherbudget kennt — was
   hier zutrifft. Eng gefasst: nur `qL > 1` (Prefill/Verify, nicht Decode), nur
   `head_dim` 192/256, ohne Array-Maske, ohne Sinks. **Auf mlx < 0.32.2 inert**
-  (Probe beim Import fällt auf `TypeError`; auf 0.32.0 verifiziert).
+  (Probe beim Import fällt auf `TypeError`; auf 0.32.0 und 0.32.1 verifiziert).
   Rollback: `QWEN38_FORCE_FUSED_SDPA=0`.
 - **`0014-quantized-kv-start-uniform.patch`** — lokal, kein Upstream-PR.
   `quantized_kv_start` galt auf dem Batch-Pfad nur für TurboQuant

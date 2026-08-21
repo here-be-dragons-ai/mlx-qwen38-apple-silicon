@@ -50,7 +50,7 @@ done
 # (heisst: upstream gemerged → Patch loeschen) und die Messwerte im Start-Skript
 # gelten nicht mehr unbesehen.
 PINS=(
-  "mlx==0.32.0"
+  "mlx==0.32.1"
   "mlx-lm==0.31.3"
   "mlx-vlm==0.6.15"
   "transformers==5.15.0"
