@@ -371,6 +371,38 @@ Zwei Konsequenzen, beide im Start-Skript:
   `iogpu.wired_limit_mb` (s. Profiltabelle) — ohne Limit passt der dritte
   Snapshot rechnerisch nicht ins Budget.
 
+### Nach jeder Kontextänderung den SSD-Tier leeren
+
+**Ein Snapshot ist so groß wie der Kontext, für den er geschrieben wurde.**
+Verkleinert man `context_length` später, liegen im SSD-Tier weiter die alten,
+großen Snapshots — und beim Restore sprengen sie das Working-Set, obwohl die
+Budgetrechnung für den neuen Kontext aufgeht.
+
+Gemessen am 2026-08-21: nach dem Wechsel des Client-Kontextfensters von 98304
+auf 65536 starb **jeder vierte Request** an
+`[METAL] Command buffer execution failed: Insufficient Memory` — bei
+Promptgrößen von nur 17 000 Token und 89 % freiem Systemspeicher. Ein
+Serverneustart half nicht. Die Ursache waren 77 GB Snapshots aus der Zeit mit
+98304 und 131072 Token.
+
+Isoliert wurde es mit `ENABLE_APC=0`: damit lief derselbe Request sofort
+durch. Nach `rm -rf ~/.hermes/apc/*` und Neustart mit APC vier Requests
+hintereinander ohne einen einzigen Speicherfehler, Prefill wieder bis
+57 000 tok/s.
+
+```sh
+# Nach jeder Aenderung an context_length / contextWindow:
+rm -rf ~/.hermes/apc/*
+```
+
+Der Preis ist gering: der Tier ist ein Cache, er füllt sich von selbst wieder.
+Die ersten Prompts danach laufen kalt.
+
+> **Diagnose-Reihenfolge bei `[METAL] Insufficient Memory`**, wenn die
+> Budgetrechnung eigentlich aufgeht: erst `ENABLE_APC=0` zum Isolieren, dann
+> den SSD-Tier leeren, erst danach an `APC_ENTRIES` oder `context_length`
+> drehen. Ein Neustart allein räumt den Tier **nicht** — er liegt auf der Platte.
+
 ---
 
 ## Wenn es zu eng wird
