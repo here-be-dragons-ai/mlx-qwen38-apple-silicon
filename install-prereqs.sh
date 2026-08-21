@@ -243,7 +243,7 @@ fi
 
 # ── Verzeichnisse ─────────────────────────────────────────────────────────────
 if (( CHECK_ONLY == 0 )); then
-  mkdir -p "$HOME/.hermes/logs" "$HOME/.hermes/apc"
+  mkdir -p "${STATE_DIR:-$HOME/.mlx-qwen38}/logs" "${STATE_DIR:-$HOME/.mlx-qwen38}/apc"
 fi
 
 echo
@@ -261,6 +261,6 @@ echo "  2) Server starten:"
 echo "       $BUNDLE_DIR/start-mlx_qwen3.8.sh"
 echo "     Das Start-Skript druckt das errechnete Kontext-Budget dieser Maschine."
 echo
-echo "  3) Hermes/Client auf das Budget einstellen (model.context_length,"
-echo "     model.max_tokens=8192) — Werte und Begruendung in README.md."
+echo "  3) Den Client auf das Budget einstellen (context_length,"
+echo "     max_tokens=8192) — Werte und Begruendung in README.md."
 echo "──────────────────────────────────────────────────────────────"

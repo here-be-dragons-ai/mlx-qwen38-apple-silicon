@@ -61,7 +61,7 @@ schaltet auf `lean`.
 
 `install-prereqs.sh` legt an bzw. prüft: Xcode CLT → [uv](https://astral.sh/uv)
 → venv unter `~/src/mlx/.venv` (Python 3.12) → mlx-vlm + Abhängigkeiten →
-Metal-Selbsttest → Patches → Modell + MTP-Drafter → `~/.hermes/{logs,apc}`.
+Metal-Selbsttest → Patches → Modell + MTP-Drafter → `~/.mlx-qwen38/{logs,apc}`.
 
 | Option | Wirkung |
 |---|---|
@@ -276,30 +276,68 @@ Inferenz-Maschine ohne Browser/IDE: 28672 geht.
 ## Client-Konfiguration
 
 Der Server spricht OpenAI-Chat-Completions auf `http://localhost:8888/v1`.
-Beispiel für [Hermes](https://github.com/gtonic/hermes) (`~/.hermes/config.yaml`);
-für andere Clients gelten dieselben zwei Regeln: **Modellname = Alias** und
+Für jeden Client gelten dieselben zwei Regeln: **Modellname = Alias** und
 **Kontext ≤ Budget**.
+
+| Einstellung | Wert | Warum |
+|---|---|---|
+| Modellname | `Qwen3.8-27B-local` | **muss** zum Symlink-Namen passen — bei mlx-vlm *ist* der Request-Modellname der Ladepfad |
+| `base_url` | `http://localhost:8888/v1` | |
+| `context_length` | `lean` 32768 · `balanced` 49152 · `roomy` 65536 (s. u.) | ≤ Kontext-Budget aus dem Start-Banner |
+| `max_tokens` | 8192 | **nicht erhöhen**, s. u. |
+| `reasoning_effort` | `low` | nur `low\|medium\|xhigh` — alles andere → HTTP 500 |
+| `enable_thinking` | `true` | |
+
+Ein Client mit YAML-Konfiguration im verbreiteten `model:`-Format sieht damit
+etwa so aus:
 
 ```yaml
 model:
-  default: Qwen3.8-27B-local      # MUSS zum Symlink-Namen passen
-  provider: custom:llama-local
+  default: Qwen3.8-27B-local
   base_url: http://localhost:8888/v1
   api_key: sk-local
-  api_mode: chat_completions
-  context_length: 49152            # ← Profil balanced (lean 32768, roomy 98304)
-  max_tokens: 8192                 # NICHT erhöhen: Kompaktierungs-Trigger ist
-  supports_vision: true            # (context_length − max_tokens) × threshold
+  context_length: 65536
+  max_tokens: 8192
+  supports_vision: true
   extra_body:
     enable_thinking: true
-    reasoning_effort: low          # nur low|medium|xhigh — alles andere → HTTP 500
+    reasoning_effort: low
 compression:
   threshold: 0.85
 ```
 
-Rechnung: (49152 − 8192) × 0,85 → Kompaktierung bei ~34,8k, Spitzenprompt ~43k,
-unter dem Budget von ~48k. Das Start-Skript warnt, wenn `context_length` über
-dem errechneten Budget liegt.
+**Warum `max_tokens` nicht hoch darf:** viele Clients lösen die Kompaktierung
+bei `(context_length − max_tokens) × threshold` aus. Ein größeres `max_tokens`
+verschiebt also den Trigger nach unten und verschenkt Kontext.
+
+Rechnung für 65536: (65536 − 8192) × 0,85 → Kompaktierung bei ~48,7k,
+Spitzenprompt ~57k — unter dem Budget.
+
+> **Warum für `roomy` hier 65536 steht und nicht die 98304 aus der
+> Profiltabelle:** die Profilzahl gilt **mit** gesetztem
+> `iogpu.wired_limit_mb=45056` (44 GiB Working-Set). Ohne das Limit gibt macOS
+> auf 48 GB nur 37,4 GiB, und dann ist 98304 rechnerisch am Anschlag — der
+> Bedarf liegt bei 35,9 GiB, es bleiben 0,1 GiB übrig:
+>
+> | `context_length` | Bedarf (3 Kopien) | bei 37,4 GiB | mit 44 GiB |
+> |---|---|---|---|
+> | 131072 | 41,9 GiB | **OOM** | +2,1 GiB knapp |
+> | 98304 | 35,9 GiB | +0,1 GiB knapp | +8,1 GiB |
+> | **65536** | **29,9 GiB** | **+7,5 GiB** | +14,1 GiB |
+>
+> Gemessen: mit 98304 und ohne Wired-Limit starb hier reproduzierbar jeder
+> vierte Request an `[METAL] Insufficient Memory` — bei Prompts von 17k Token.
+> 65536 trägt in beiden Fällen. Wer 98304 fahren will, setzt zuerst das Limit.
+
+Das Start-Skript prüft das auf Wunsch selbst mit:
+
+```sh
+CLIENT_CONFIG=~/pfad/zu/config.yaml ./start-mlx_qwen3.8.sh
+```
+
+Dann warnt es, wenn `model.context_length` über dem errechneten Budget liegt
+oder `model.default` nicht zum Alias passt. Ohne die Variable ist die Prüfung
+inert.
 
 **Thinking:** Das Chat-Template von Qwen3.8 akzeptiert nur `low|medium|xhigh`
 und wirft bei jedem anderen Wert — auch `none` — eine Exception (HTTP 500).
@@ -386,13 +424,13 @@ Serverneustart half nicht. Die Ursache waren 77 GB Snapshots aus der Zeit mit
 98304 und 131072 Token.
 
 Isoliert wurde es mit `ENABLE_APC=0`: damit lief derselbe Request sofort
-durch. Nach `rm -rf ~/.hermes/apc/*` und Neustart mit APC vier Requests
+durch. Nach `rm -rf ~/.mlx-qwen38/apc/*` und Neustart mit APC vier Requests
 hintereinander ohne einen einzigen Speicherfehler, Prefill wieder bis
 57 000 tok/s.
 
 ```sh
 # Nach jeder Aenderung an context_length / contextWindow:
-rm -rf ~/.hermes/apc/*
+rm -rf ~/.mlx-qwen38/apc/*
 ```
 
 Der Preis ist gering: der Tier ist ein Cache, er füllt sich von selbst wieder.
@@ -561,10 +599,10 @@ gemerged ist, bleibt `0021` lokal.
 
 ```sh
 # Trifft der Prefix-Cache? (Turn 2 muss cached_tokens > 0 zeigen)
-grep -o 'cached[_ ]tokens[=:] *[0-9]*' ~/.hermes/logs/mlx-qwen3.8.log | tail -20
+grep -o 'cached[_ ]tokens[=:] *[0-9]*' ~/.mlx-qwen38/logs/server.log | tail -20
 
 # Draft-Acceptance (unter ~40 % lohnt Speculative Decoding nicht)
-grep -i "accept" ~/.hermes/logs/mlx-qwen3.8.log | tail -10
+grep -i "accept" ~/.mlx-qwen38/logs/server.log | tail -10
 
 # Speicherlage
 ~/src/mlx/.venv/bin/python -c "import mlx.core as mx;print(mx.device_info())"
@@ -692,7 +730,7 @@ Im Einzelnen:
   Das Qwen3.8-Template kennt nur `system/user/assistant/tool` und wirft bei
   allem anderen `Unexpected message role.` → HTTP 500. Das Request-Schema
   erlaubt aber zusätzlich `developer`; genau diese eine Rolle rutscht durch die
-  Validierung in die Template-Ausnahme (Hermes schickt sie). Der Patch bildet
+  Validierung in die Template-Ausnahme (manche Clients schicken sie). Der Patch bildet
   `developer → system` und `function → tool` ab, alles andere fällt weiterhin
   durch.
 - **`0010-qwen38-apc-single-snapshot.patch`** — lokal, kein Upstream-PR.
