@@ -2,3 +2,4 @@
 *.log
 *.orig
 *.rej
+nohup.out
