@@ -2,19 +2,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Watchdog fuer start-mlx_qwen3.8.sh
 #
-# WARUM ES DAS GIBT
-# Der Serverprozess sammelt ueber eine lange Agent-Sitzung lebenden Speicher an,
-# der nie zurueckgegeben wird. Gemessen am 2026-08-21/22:
-#   nach Modell+Drafter, idle                    active = 15,96 GiB
-#   nach dem ersten Generieren (auch 16 Token!)  active = 25,42 GiB  (fixer Sockel)
-#   danach ~0,6 GiB pro Request, kumulativ       active = 36,51 GiB im Leerlauf
-# Bei 40 GiB Working-Set bleiben dann ~3,5 GiB, und der naechste groessere
-# Prefill stirbt in "[METAL] Insufficient Memory". Ein Neustart setzt
-# nachweislich auf die 15,96-GiB-Baseline zurueck.
+# WARUM ES DAS GIBT — UND WARUM ES INZWISCHEN OPTIONAL IST
+# Entstanden am 2026-08-22, als der Serverprozess ueber eine Sitzung immer mehr
+# Speicher hielt: nach Modell+Drafter 15,96 GiB, nach dem ersten Generieren
+# 25,42 GiB, im Leerlauf einer langen Sitzung 36,51 GiB — und der naechste
+# groessere Prefill starb in "[METAL] Insufficient Memory".
 #
-# Das hier ist SYMPTOMBEKAEMPFUNG. Die Ursachen sind nicht verstanden (Sockel
-# haengt an --draft-block-size >= 2, der Kriechgang ist offen). Bis dahin ist ein
-# rechtzeitiger Neustart billiger als ein Abbruch mitten in einer Antwort.
+# Der Sockel ist seit Patch 0015 weg (fusionierte Quantized-Linears, ~9 GiB).
+# Einen Zuwachs PRO REQUEST gibt es nicht: bei konstanter Kontextlaenge steht
+# der Idle-Wert ab dem zweiten Request still (8 x 13.460 Token, Delta 0,000).
+# Die frueher vermuteten "~0,6 GiB pro Request" waren ein Messfehler — in jenen
+# Reihen wuchs die Kontextlaenge mit, und das war der wachsende KV-Cache.
+#
+# Der Watchdog ist damit NICHT MEHR NOETIG, sondern ein Netz fuer
+# unbeaufsichtigte Laeufe: eine einzelne Konversation kann immer noch lang
+# genug werden, um den Working-Set zu fuellen.
 #
 # BENUTZUNG
 #   ./watchdog-mlx_qwen3.8.sh              # statt ./start-mlx_qwen3.8.sh
