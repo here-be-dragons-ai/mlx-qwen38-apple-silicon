@@ -313,6 +313,32 @@ Obergrenze markiert. **Maßgeblich sind die `mem`-Zeilen, nicht die Rechnung.**
 > APC-Snapshots bleiben f16. Gemessen: Decode 22,9 → 18,7 tok/s (Mittel aus 6
 > bzw. 8 Requests), `active` kletterte unverändert auf 37,78 GiB, gleicher OOM.
 
+### Watchdog: neu starten, bevor es knallt
+
+Solange die Ursachen offen sind, ist ein rechtzeitiger Neustart billiger als ein
+Abbruch mitten in einer Antwort. `watchdog-mlx_qwen3.8.sh` läuft **statt** des
+Start-Skripts und reicht alle Variablen durch:
+
+```sh
+./watchdog-mlx_qwen3.8.sh
+ENABLE_APC=0 WATCHDOG_PCT=85 ./watchdog-mlx_qwen3.8.sh
+```
+
+| Variable | Default | |
+|---|---|---|
+| `WATCHDOG_PCT` | `90` | Schwelle in % des Working-Sets |
+| `WATCHDOG_STREAK` | `3` | Messungen in Folge über der Schwelle |
+| `WATCHDOG_POLL` | `10` | Sekunden zwischen zwei Prüfungen |
+| `WATCHDOG_MAX_WAIT` | `180` | Sekunden auf Leerlauf warten, dann hart |
+
+Er wartet auf `in_flight=0`, bevor er neu startet, und erkennt auch einen
+weggestorbenen Serverprozess. **90 statt 95:** bei 95 % starb am 2026-08-22 ein
+29.632-Token-Prefill nach 34 % — die Schwelle muss noch Platz für den
+laufenden Prefill lassen.
+
+Ein Neustart setzt nachweislich auf die 15,96-GiB-Baseline zurück. Das behebt
+nichts, es kauft Zeit.
+
 ---
 
 ## Die Speicherrechnung
@@ -861,6 +887,7 @@ Im Einzelnen:
 | `install-prereqs.sh` | Komplettes Setup ab frischem macOS, idempotent |
 | `LICENSE` | MIT No Attribution (SPDX `MIT-0`) |
 | `start-mlx_qwen3.8.sh` | Server-Start, Profile lean/balanced/roomy, Live-Budgetrechnung |
+| `watchdog-mlx_qwen3.8.sh` | Startet den Server und startet ihn neu, bevor der Speicher volläuft |
 | `download-mlx-model.sh` | Resume-fähiger HuggingFace-Downloader (curl, mit Größenprüfung) |
 | `patches/apply-patches.sh` | Patches anwenden / prüfen / zurücknehmen |
 | `com.local.iogpu-wired-limit.plist` | LaunchDaemon für das Wired-Limit |

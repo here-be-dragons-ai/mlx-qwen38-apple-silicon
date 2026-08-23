@@ -810,7 +810,13 @@ if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   # Ohne das laufen Nicht-MTP-Drafter in einer eigenen Generierungsschleife, die
   # den APC-Manager nie verdrahtet: cached_tokens=0 in JEDEM Turn. Braucht
   # Patch 0021. Gemessen: cached 0 -> 5748/5788, Decode unveraendert.
-  [[ "$DRAFT_KIND" != "mtp" ]] && export MLX_VLM_SPECULATIVE_BATCH=1
+  # Seit 2026-08-21 ueberschreibbar, damit der Pfad messbar ist. Er stand im
+  # Verdacht, den fixen Speichersockel von ~9,4 GiB zu verursachen — GEMESSEN
+  # IST ER ES NICHT: mit BATCH=0 bleibt der Sockel unveraendert bei +9,46 GiB.
+  # Der Sockel haengt an --draft-block-size >= 2 (1 -> +0,16 GiB, 2 -> +9,31).
+  # BATCH=0 kostet unter dflash den Prefix-Cache, ist also nichts fuer den
+  # Produktivbetrieb — der Schalter existiert nur fuer Diagnoselaeufe.
+  [[ "$DRAFT_KIND" != "mtp" ]] && export MLX_VLM_SPECULATIVE_BATCH="${MLX_VLM_SPECULATIVE_BATCH:-1}"
   [[ -n "$DRAFT_BLOCK_SIZE" ]] && args+=( --draft-block-size "$DRAFT_BLOCK_SIZE" )
 fi
 
