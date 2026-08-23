@@ -469,6 +469,32 @@ else
   FUSED_STATUS="unfused (Patch 0013 inert: mlx $MLX_VER kennt force_fused nicht, braucht >= 0.32.2)"
 fi
 
+# ── Fusionierte Quantized-Linears (Patch 0015) ───────────────────────────────
+# _fused_quantized_linears() haelt eine ZWEITE, zusammenkopierte Fassung der
+# quantisierten Gewichte dauerhaft am Modul fest. Das ist der fixe Sockel, der
+# am 2026-08-21/22 die Sitzungen umgebracht hat: er entsteht beim ERSTEN
+# Generieren, ist von der Kontextlaenge unabhaengig (16 Token loesen ihn genauso
+# aus wie 44.452) und wird nie freigegeben.
+# GEMESSEN auf 40 GiB Working-Set, idle nach 5 Requests:
+#                     mit Fusion   ohne Fusion   Decode (Mittel aus je 5)
+#   mit SpecDecode      26,00 GiB     17,00 GiB   26,1 vs 25,7 tok/s
+#   ohne SpecDecode     17,08 GiB     14,96 GiB   18,4 vs 18,2 tok/s
+# 9 GiB gegen 1,5 %, und die Streuung beider Decode-Reihen ueberlappt
+# vollstaendig. Auf dieser Maschine ist der Speicher mehr wert.
+# Upstream-Verhalten zurueck:  QWEN38_FUSED_LINEARS=1 ./start-mlx_qwen3.8.sh
+export QWEN38_FUSED_LINEARS="${QWEN38_FUSED_LINEARS:-0}"
+QLIN_STATUS="unfusioniert (Patch 0015, spart ~9 GiB)"
+if ! grep -q "QWEN38_FUSED_LINEARS" \
+     "$SITE_PACKAGES/mlx_vlm/models/qwen3_5/language.py" 2>/dev/null; then
+  QLIN_STATUS="fusioniert — Patch 0015 FEHLT (~9 GiB Sockel)"
+  if [[ "$QWEN38_FUSED_LINEARS" == "0" ]]; then
+    echo "⚠️  WARNUNG: Patch 0015 fehlt — QWEN38_FUSED_LINEARS=0 ist wirkungslos." >&2
+    echo "    Der Server belegt ~9 GiB mehr als noetig. Fix: ./patches/apply-patches.sh" >&2
+  fi
+elif [[ "$QWEN38_FUSED_LINEARS" != "0" ]]; then
+  QLIN_STATUS="fusioniert (Upstream-Default, ~9 GiB Sockel)"
+fi
+
 # Mit fused Full-Attention faellt der Score-Transient weg — genau der Grund, aus
 # dem roomy ohne Wired-Limit auf Chunk 512 heruntergeht. Zusaetzlich verlangt der
 # NAX-Pfad (PR #3842) ausdruecklich qL >= 1024:
@@ -713,6 +739,7 @@ echo "  KV-Cache :  ${KV_BITS:-f16 unquantisiert} → ${KV_KIB} KiB/Token"
 echo "  Mem-Probe:  $([[ "$_MEM_PROBE_INTERVAL" == "0" ]] && echo "OFF" || echo "alle ${_MEM_PROBE_INTERVAL}s ins Log (MEM_PROBE_INTERVAL=0 schaltet ab)")"
 echo "  Prefill  :  Chunk $PREFILL_STEP   Slots: $MAX_NUM_SEQS   Vision-Cache: $VISION_CACHE$_PREFILL_NOTE"
 echo "  Full-Attn:  $FUSED_STATUS"
+echo "  Q-Linears:  $QLIN_STATUS"
 echo "  Log      :  $LOG_FILE"
 echo "  ──────────── Speicherbudget (gerechnet, keine Messung) ──────"
 echo "  RAM              : ${RAM_GIB} GiB"
