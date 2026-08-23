@@ -286,8 +286,32 @@ Patch in `site-packages` wäre nach jedem `mlx-vlm`-Update wieder weg. Von auße
 ist die Zahl nicht messbar: RSS enthält die Metal-Buffer nicht (gemessen 2,3 GiB
 RSS bei 16 GiB Gewichten).
 
-**Warum das drin ist.** Die Speicherrechnung unten ist eine Obergrenze, keine
-Zusage. Erster Lauf mit Sampler, `roomy`, Working-Set 40 GiB, `APC_ENTRIES=3`:
+**Was er gefunden hat.** Zwei Posten, die in keiner Rechnung standen.
+
+**Der fixe Sockel: ~9 GiB, behoben.** `active` sprang beim ersten Generieren von
+15,96 auf 25,42 GiB — unabhängig von der Kontextlänge (ein 16-Token-Request löst
+ihn genauso aus wie 44.452 Token) und wurde nie freigegeben. Eine Sonde um
+`mx.eval` zeigte die Quelle:
+
+```
+8,71 GiB kumuliert  n=128  language.py:1098  _target_verify_quantized_linears
+```
+
+`_fused_quantized_linears()` kopiert QKV- und MLP-Gewichte je Layer zu einem
+fusionierten Tensor zusammen und hängt ihn dauerhaft ans Modul — eine zweite
+Fassung der quantisierten Gewichte. Kein Leck, eine Optimierung, die niemand
+wieder abräumt. Patch `0015` macht sie abschaltbar, das Start-Skript schaltet
+sie ab. Ergebnis: `active` nach dem ersten Request **16,70 statt 25,42 GiB**.
+
+**Der Kriechgang: ~0,6 GiB pro Request, offen.** Davon unabhängig. In der
+Rampe stieg der Idle-Wert über vier Requests von 25,89 auf 27,80 GiB, obwohl der
+APC aus war. Über eine lange Agent-Sitzung summiert sich das — am 2026-08-22
+stand `active` im Leerlauf bei 36,51 GiB, und der nächste Prefill hatte keine
+Luft mehr. Ursache noch nicht gefunden; bis dahin hilft der Watchdog.
+
+**Warum der Sampler bleibt.** Die Speicherrechnung unten ist eine Obergrenze,
+keine Zusage. Erster Lauf mit Sampler, `roomy`, Working-Set 40 GiB,
+`APC_ENTRIES=3`, noch **ohne** Patch 0015:
 
 | Zeitpunkt | `active` |
 |---|---|
@@ -827,6 +851,23 @@ Im Einzelnen:
   bei `qL=512` / `kL=22747`: Peak 662 → 123 MiB, Prefill-Decke 22.747 → 37.822
   Token. Das Start-Banner zeigt den Zustand in der Zeile `Full-Attn:`.
   Rollback: `QWEN38_FORCE_FUSED_SDPA=0`.
+- **`0015-optional-fused-quantized-linears.patch`** — lokal, kein Upstream-PR.
+  `_fused_quantized_linears()` kopiert QKV- und MLP-Gewichte je Layer zu einem
+  fusionierten Tensor zusammen und hängt ihn als
+  `_qwen3_5_fused_decode_linears` **dauerhaft ans Modul** — eine zweite Fassung
+  der quantisierten Gewichte. Das war der fixe Speichersockel: er entsteht beim
+  ersten Generieren, ist längenunabhängig und wird nie freigegeben. Gemessen,
+  idle nach 5 Requests auf 40 GiB Working-Set:
+
+  | | mit Fusion | ohne Fusion | Decode (Mittel aus je 5) |
+  |---|---|---|---|
+  | mit SpecDecode | 26,00 GiB | **17,00 GiB** | 26,1 vs 25,7 tok/s |
+  | ohne SpecDecode | 17,08 GiB | **14,96 GiB** | 18,4 vs 18,2 tok/s |
+
+  9 GiB gegen 1,5 %, und die Streuung beider Decode-Reihen überlappt
+  vollständig. Der Patch selbst ändert nichts — er fügt nur den Schalter hinzu,
+  Default bleibt Upstream-Verhalten. Abgeschaltet wird die Fusion vom
+  Start-Skript. Rollback: `QWEN38_FUSED_LINEARS=1`.
 - **`0014-quantized-kv-start-uniform.patch`** — lokal, kein Upstream-PR.
   `quantized_kv_start` galt auf dem Batch-Pfad nur für TurboQuant
   (`generate/ar.py:786`, `defer_turbo`). Auf dem uniform-Pfad — `--kv-bits` ohne
