@@ -303,11 +303,35 @@ Fassung der quantisierten Gewichte. Kein Leck, eine Optimierung, die niemand
 wieder abräumt. Patch `0015` macht sie abschaltbar, das Start-Skript schaltet
 sie ab. Ergebnis: `active` nach dem ersten Request **16,70 statt 25,42 GiB**.
 
-**Der Kriechgang: ~0,6 GiB pro Request, offen.** Davon unabhängig. In der
-Rampe stieg der Idle-Wert über vier Requests von 25,89 auf 27,80 GiB, obwohl der
-APC aus war. Über eine lange Agent-Sitzung summiert sich das — am 2026-08-22
-stand `active` im Leerlauf bei 36,51 GiB, und der nächste Prefill hatte keine
-Luft mehr. Ursache noch nicht gefunden; bis dahin hilft der Watchdog.
+**Ein „Kriechgang pro Request" existiert nicht.** Er war zwischenzeitlich mit
+~0,6 GiB je Request angesetzt — das war ein Messfehler. In den betroffenen
+Reihen wuchs mit jedem Request auch die **Kontextlänge**, und was wie
+Retention aussah, war schlicht der wachsende KV-Cache der laufenden
+Konversation. Der Gegentest mit **konstanter** Länge (8 × 13.460 Token,
+APC aus) zeigt den Idle-Wert ab dem zweiten Request unbewegt:
+
+| Request | idle davor | Peak | Δ idle |
+|---|---|---|---|
+| 1 | 15,96 GiB | 18,73 GiB | — |
+| 2 | 18,14 GiB | 21,20 GiB | +2,18 |
+| 3 | 17,85 GiB | 21,07 GiB | −0,29 |
+| 4 | 18,14 GiB | 21,26 GiB | +0,29 |
+| 5–8 | **18,14 GiB** | 21,1–21,5 GiB | **0,000** |
+
+Der einmalige Sprung ist der KV-Cache *einer* Konversation (13.460 × 64 KiB =
+0,82 GiB) plus dem Restsockel von ~1,3 GiB. Danach: nichts. Der Speicher folgt
+der Kontextlänge, wie die Rechnung es vorsieht — es gibt kein Leck.
+
+**Was danach möglich ist.** Einzelne kalte Requests nach Patch 0015, Working-Set
+40 GiB:
+
+| Prompt | Ergebnis |
+|---|---|
+| 85.730 Token | ✅ 264 s, Peak 89 % |
+| 128.570 Token | ✅ 464 s, Peak 95 % |
+| ~171.000 Token | ❌ — aber am **600-s-Timeout**, nicht an Speicher |
+
+Vor Patch 0015 starb dieselbe Maschine in der Agent-Kette bei ~23k Token.
 
 **Warum der Sampler bleibt.** Die Speicherrechnung unten ist eine Obergrenze,
 keine Zusage. Erster Lauf mit Sampler, `roomy`, Working-Set 40 GiB,
@@ -337,11 +361,13 @@ Obergrenze markiert. **Maßgeblich sind die `mem`-Zeilen, nicht die Rechnung.**
 > APC-Snapshots bleiben f16. Gemessen: Decode 22,9 → 18,7 tok/s (Mittel aus 6
 > bzw. 8 Requests), `active` kletterte unverändert auf 37,78 GiB, gleicher OOM.
 
-### Watchdog: neu starten, bevor es knallt
+### Watchdog: Netz, kein Muss
 
-Solange die Ursachen offen sind, ist ein rechtzeitiger Neustart billiger als ein
-Abbruch mitten in einer Antwort. `watchdog-mlx_qwen3.8.sh` läuft **statt** des
-Start-Skripts und reicht alle Variablen durch:
+Entstanden, als der Speichersockel noch unerklärt war. Seit Patch `0015` ist er
+**nicht mehr nötig** — der Speicher folgt der Kontextlänge und läuft nicht mehr
+von selbst voll. Als Netz für unbeaufsichtigte Läufe schadet er nicht.
+`watchdog-mlx_qwen3.8.sh` läuft **statt** des Start-Skripts und reicht alle
+Variablen durch:
 
 ```sh
 ./watchdog-mlx_qwen3.8.sh
@@ -360,8 +386,9 @@ weggestorbenen Serverprozess. **90 statt 95:** bei 95 % starb am 2026-08-22 ein
 29.632-Token-Prefill nach 34 % — die Schwelle muss noch Platz für den
 laufenden Prefill lassen.
 
-Ein Neustart setzt nachweislich auf die 15,96-GiB-Baseline zurück. Das behebt
-nichts, es kauft Zeit.
+Ein Neustart setzt auf die 15,96-GiB-Baseline zurück. Nach Patch `0015` ist das
+nur noch relevant, wenn eine einzelne Konversation wirklich sehr lang wird —
+gegen einen Sockel, der von selbst wächst, muss er nicht mehr anlaufen.
 
 ---
 
