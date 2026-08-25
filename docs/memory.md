@@ -214,6 +214,26 @@ Requirement at 65536 (64 KiB/token f16 — `dequantize_for_apc()`, see box — p
 | **3** | **4** | **33.3 GiB** | 4.7 GiB spare — one warm slot per instance |
 | 4 | 5 | 37.4 GiB | too tight |
 
+#### Verified end to end (2026-08-25)
+
+The arithmetic above says three conversations stay warm. Measured on mlx-vlm
+0.6.16 with `APC_ENTRIES=3`, three distinct conversations of ~15k tokens each,
+built in sequence and then continued in the same order:
+
+| | turn 1 (cold) | turn 2 |
+|---|---|---|
+| A | 14,958 tok, 32.99 s | 14,942 of 14,983 cached, **0.48 s** |
+| B | 14,980 tok, 34.57 s | 14,964 of 15,011 cached, **0.49 s** |
+| C | 14,988 tok, 33.46 s | 14,972 of 15,019 cached, **0.50 s** |
+
+Three out of three warm, a factor of about 68 on the prefill. Peak memory during
+the run was 26.10 GiB, 65% of the working set.
+
+> A first attempt at this test used ~200-token prompts and showed all three cold.
+> That was the test being wrong, not the cache: at that size the APC machinery
+> (block size 16, checkpoint at len-16) stores nothing worth reusing. Any APC
+> measurement needs prompts of a realistic size, or it measures nothing.
+
 > **The 3 depends on the clients.** Raising one instance to 98304 requires
 > pulling `APC_ENTRIES` back with it — otherwise the guard silently caps to 1 and
 > *all* three lose their warm slot. The warning for this is in the start banner
