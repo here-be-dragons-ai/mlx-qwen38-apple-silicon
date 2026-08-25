@@ -634,16 +634,18 @@ fi
 # For anyone who wants it anyway:  KV_BITS=8 QUANT_KV_START=8192 ./start-...
 
 # ── Check the drafter ─────────────────────────────────────────────────────────
-# DFlash 2 hangs on two patches. If 0040 (= upstream PR #1959) is missing, the
-# server would abort hard while loading the drafter (unexpected weights) --
-# so catch it here and fall back to MTP rather than losing the start.
-# The candidate_selector marker matches both the earlier own patch 0020 and the
-# upstream version that replaced it.
+# DFlash 2 ships upstream since mlx-vlm 0.6.16 (PR #2014) at
+# speculative/drafters/dflash2/. Local patch 0040 carried the earlier upstream
+# PR #1959, which was closed unmerged in favour of #2014 -- it is gone.
+#
+# CAREFUL, THE OLD PATH STILL EXISTS: speculative/drafters/qwen3_dflash/dflash.py
+# is still shipped and is the v1 drafter. Probing that file would pass on 0.6.16
+# while saying nothing about DFlash 2 -- which is why the probe below targets the
+# v2 module.
 if [[ "$DRAFT_KIND" == "dflash" && "$ENABLE_SPEC_DECODE" != "0" ]]; then
-  if ! grep -q "candidate_selector" \
-       "$SITE_PACKAGES/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py" 2>/dev/null; then
-    echo "⚠️  WARNING: patch 0040 missing -- DFlash 2 not loadable, falling back to MTP." >&2
-    echo "    Fix:  ./patches/apply-patches.sh" >&2
+  if [[ ! -f "$SITE_PACKAGES/mlx_vlm/speculative/drafters/dflash2/dflash2.py" ]]; then
+    echo "⚠️  WARNING: DFlash 2 not present (needs mlx-vlm >= 0.6.16) -- falling back to MTP." >&2
+    echo "    Fix:  uv pip install -U 'mlx-vlm>=0.6.16'" >&2
     DRAFT_KIND=mtp
     DRAFT_MODEL="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit"
     DRAFT_BLOCK_SIZE=""

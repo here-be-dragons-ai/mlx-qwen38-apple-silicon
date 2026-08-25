@@ -12,6 +12,11 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
+# STATE 2026-08-25: written against mlx-vlm 0.6.16 and mlx 0.32.2 (PyPI, no
+# source build needed). Patch 0040 was removed -- DFlash 2 ships upstream since
+# 0.6.16 (PR #2014); the earlier PR #1959 it carried was closed unmerged.
+# 0015, 0030 and 0041 were rebased for 0.6.16, see their blocks below.
+#
 # ── INCLUDED PATCHES ─────────────────────────────────────────────────────────
 #
 # 0010-qwen38-apc-single-snapshot.patch   (LOCAL, no upstream PR)
@@ -28,6 +33,8 @@
 #   that is the rollback path.
 #
 # 0013-force-fused-sdpa-head-dim-256.patch   (LOCAL, no upstream PR)
+#   STILL NEEDED on mlx 0.32.2 from PyPI: the kernels are there, but the default
+#   dispatch still does not route to them -- only force_fused=True does.
 #   Qwen3.8 has head_dim 256. mlx's default dispatch only permits fused full
 #   attention for head_dim 64/80/128 -- the 16 full-attn layers therefore run on
 #   the unfused graph and materialise a score transient of O(n_heads x qL x kL)
@@ -76,6 +83,9 @@
 #   9 GiB against 1.5%, and the spread of the decode series overlaps completely.
 #   The patch does NOT change behaviour by itself -- the default stays upstream.
 #   The fusion is switched off by the start script via QWEN38_FUSED_LINEARS=0.
+#   REBASED 2026-08-25: upstream renamed the function to
+#   _decode_quantized_linears_fused in 0.6.16. The floor itself is NOT fixed
+#   upstream -- _qwen3_5_fused_decode_linears is still attached to the module.
 #   Rollback: QWEN38_FUSED_LINEARS=1
 #
 # 0021-speculative-apc-routing.patch   (LOCAL, upstream-PR candidate)
@@ -99,9 +109,12 @@
 #   the dependency remains until #1923 is merged.
 #
 # 0041-dflash2-guard-invalid-bonus-token.patch   (LOCAL, no upstream PR)
-#   Successor to 0022, moved onto the upstream code from 0040. DFlash 2 builds
-#   the next block in DFlash2DraftModel.propose_block, no longer in
-#   DFlashDraftModel.draft_block -- the v1 method is dead for this drafter.
+#   Successor to 0022. Rebased on 2026-08-25 onto the upstream DFlash 2 from
+#   PR #2014: the guard now sits in draft_block() of
+#   speculative/drafters/dflash2/dflash2.py.
+#   CAREFUL: speculative/drafters/qwen3_dflash/dflash.py still exists in 0.6.16
+#   and is the v1 drafter. The patch applied cleanly there too -- and would have
+#   been inert, guarding a path DFlash 2 no longer takes.
 #   Content unchanged: for values outside the int64 range, mx.array() throws only
 #   "RuntimeError: std::bad_cast", without the value, without an index
 #   (reproducible with mx.array([[2**63]], dtype=mx.int32)). That is exactly how
@@ -114,27 +127,6 @@
 # Other people's bugfixes that are still open upstream. As soon as they are
 # merged, this script reports "CONFLICT" -- remove them then.
 #
-# 0040-pr1959-dflash2.patch   (PR #1959, open, draft)
-#   "Add DFlash 2 speculative decoding" -- the upstream version of what lived
-#   here as local patch 0020 until 2026-08-20. REPLACES 0020 entirely.
-#   Brings three things over 0020 that the own transcription did not have:
-#     - a dedicated bit-exact 4bit M=4 Metal verifier kernel: streams the four
-#       verify rows together, reuses packed weights across all four tokens
-#     - distribution-preserving rejection sampling for temperature > 0
-#       (0020 was only checked for bit equality against greedy)
-#     - optional in-memory quantisation of the drafter (MLX_VLM_DRAFT_BITS)
-#   Upstream measurement (M3 Ultra, BF16 drafter, block 4): 31.85 -> 47.07 t/s
-#   (1.48x), 500/500 tokens identical to the run without a drafter, acceptance
-#   60.5%.
-#   VERIFIED HERE: applies cleanly to v0.6.15 (no rebase onto #1899 needed) and
-#   collides with none of the local patches. The existing checkpoint
-#   Qwen3.8-27B-DFlash2-4bit loads unchanged (DFlash2DraftModel, 179 parameters,
-#   1.008 GiB) -- no reconversion needed.
-#   The codebook rename (candidate_selector.{predecessor,successor}_codebook ->
-#   ...weight) sits upstream in DFlash2DraftModel.sanitize and is identical to
-#   what 0020 had and what z-lab does in dflash/model_mlx.py (e128a7e).
-#   MUST RUN AS THE LAST PATCH: generated against the state WITH 0010..0031.
-#
 # 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, open)
 #   "Fix speculative decoding against a quantized KV cache".
 #   REPRODUCED HERE: with KV_BITS=8 and MAX_NUM_SEQS=2, two parallel requests die
@@ -142,6 +134,11 @@
 #     AttributeError: 'tuple' object has no attribute 'shape'
 #   The verify path assumes keys is ONE array; a quantized cache yields a tuple.
 #   With the patch the same two requests run through correctly.
+#   REBASED 2026-08-25: PR #2014 moved the verify path out of
+#   models/qwen3_5/language.py into models/qwen3_5/speculative_verifier.py. The
+#   bug moved with it -- speculative_verifier.py:1269 still does keys.shape[-2]
+#   on something that is a tuple under a quantized cache. Both #1956 and #1938
+#   are still open.
 #   CLASSIFICATION CORRECTED ON 2026-08-20 -- this used to say the patch was only
 #   relevant at MAX_NUM_SEQS > 1. That held while MTP was the default. Since
 #   DFlash 2 became the default the start script sets MLX_VLM_SPECULATIVE_BATCH=1,
@@ -170,6 +167,15 @@
 #
 # ── DONE / OBSOLETE ──────────────────────────────────────────────────────────
 #
+# 0040-pr1959-dflash2.patch   REMOVED 2026-08-25.
+#   Carried upstream PR #1959 ("Add DFlash 2 speculative decoding"). That PR was
+#   CLOSED UNMERGED on 2026-08-24 in favour of PR #2014, which landed in
+#   mlx-vlm 0.6.16 and ships DFlash 2 at speculative/drafters/dflash2/.
+#   The patch conflicts against 0.6.16 and is not needed -- the feature is
+#   upstream. It lives in this repository's git history.
+#   Note that speculative/drafters/qwen3_dflash/dflash.py still exists in 0.6.16
+#   and is the v1 drafter; do not probe it to detect DFlash 2.
+
 # 0020-dflash2-qwen38.patch   REPLACED 2026-08-20 by 0040 (upstream PR #1959).
 #   The own transcription from z-lab/dflash was correct -- including the codebook
 #   rename that z-lab itself only canonicalised on 2026-08-18 with e128a7e and
@@ -225,13 +231,16 @@ echo "  mlx-vlm      : $("$VENV_PY" -c 'import importlib.metadata as m;print(m.v
 patches=( "$PATCH_DIR"/*.patch(N) )
 [[ ${#patches[@]} -gt 0 ]] || { echo "  No .patch files in $PATCH_DIR"; exit 0; }
 
-# Reverting happens in REVERSE order. Since 0041 sits on code that 0040 creates
-# in the first place, the chain is ordered: trying to revert 0040 before 0041
-# no longer finds the expected context, the reverse dry-run fails and the patch
-# would stay in silently. (${(Oa)...} reverses.)
+# Reverting happens in REVERSE order. That mattered while 0041 sat on code that
+# 0040 created: reverting 0040 first no longer found the expected context, the
+# reverse dry-run failed, and the patch stayed in silently. 0040 is gone since
+# 2026-08-25, so no patch currently depends on another -- the reverse order and
+# the copy-based probe below are kept because the next stacked patch would
+# reintroduce exactly that failure, and it fails quietly.
+# (${(Oa)...} reverses.)
 # IMPORTANT: revert_order stays a separate variable. Reversing `patches` itself
 # would make the probe below reverse it a second time -- it would then check in
-# apply instead of teardown order and report 0040 as "not applied".
+# apply instead of teardown order.
 revert_order=( ${(Oa)patches} )
 
 # ── Determine applied status ─────────────────────────────────────────────────

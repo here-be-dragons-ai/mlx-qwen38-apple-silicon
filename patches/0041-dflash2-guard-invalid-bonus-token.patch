@@ -1,30 +1,30 @@
---- a/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
-+++ b/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
-@@ -447,6 +447,27 @@
-     ):
-         mask_id = int(self.config.mask_token_id)
-         if isinstance(last_bonus, int):
-+            # ── Guard gegen korrupte Bonus-Tokens (lokaler Patch, 2026-08-20)
-+            # mx.array() wirft fuer Elemente ausserhalb des int64-Bereichs ein
-+            # nacktes "RuntimeError: std::bad_cast" ohne Hinweis auf die Ursache
-+            # (reproduzierbar: mx.array([[2**63]], dtype=mx.int32)). Genau so ist
-+            # am 2026-08-20 10:07 ein Request nach 250 Tokens gestorben:
-+            # last_bonus kam aus new_tokens[-1] des vorigen _speculative_walk und
-+            # war kein gueltiges Token. Der Guard macht den Fehler lesbar und
-+            # nennt den Wert, damit der naechste Treffer zur Quelle fuehrt statt
-+            # im C++-Cast zu enden. Kein Clamping: ein stillschweigend ersetztes
-+            # Token wuerde die Ausgabe verfaelschen statt den Bug zu zeigen.
-+            # Sitzt seit PR #1959 hier statt in DFlashDraftModel.draft_block:
-+            # DFlash2 baut den Block in propose_block, die v1-Methode ist fuer
-+            # diesen Drafter tot. Nur der int-Zweig kann bad_cast ausloesen —
-+            # der Array-Zweig geht ueber astype() und wirft lesbar.
+--- a/mlx_vlm/speculative/drafters/dflash2/dflash2.py
++++ b/mlx_vlm/speculative/drafters/dflash2/dflash2.py
+@@ -173,6 +173,27 @@
+         if proposal_length <= 0:
+             batch = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
+             return mx.zeros((batch, 0), dtype=token_dtype)
++        # Guard against corrupt bonus tokens (local patch 0041).
++        # For elements outside the int64 range, mx.array() throws a bare
++        # "RuntimeError: std::bad_cast" with no hint at the cause (reproducible:
++        # mx.array([[2**63]], dtype=mx.int32)). That is exactly how a request
++        # died after 250 tokens on 2026-08-20 at 10:07: last_bonus came from
++        # new_tokens[-1] of the previous walk and was not a valid token. The
++        # guard makes the error readable and names the value so the next
++        # occurrence leads to the source instead of ending in a C++ cast.
++        # No clamping: a silently replaced token would corrupt the output
++        # instead of showing the bug.
++        # Only the int branch can trigger bad_cast -- the array branch goes
++        # through astype() and throws readably.
++        # Upstream (PR #2014) does not have this guard.
++        if isinstance(last_bonus, int):
 +            _vocab = int(getattr(self.config, "vocab_size", 0) or 0) or (1 << 31)
 +            if not 0 <= last_bonus < _vocab:
 +                raise ValueError(
-+                    "DFlash2 propose_block: Bonus-Token ausserhalb des "
-+                    f"Vokabulars ({last_bonus!r}, erwartet 0..{_vocab - 1}). "
-+                    "Der Wert stammt aus dem vorigen _speculative_walk."
++                    "DFlash2 draft_block: bonus token outside the vocabulary "
++                    f"({last_bonus!r}, expected 0..{_vocab - 1}). The value comes "
++                    "from the previous speculative walk."
 +                )
-             block = mx.array(
-                 [[last_bonus] + [mask_id] * (block_size - 1)],
-                 dtype=token_dtype,
+         anchor = (
+             mx.array([last_bonus], dtype=token_dtype)
+             if isinstance(last_bonus, int)

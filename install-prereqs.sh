@@ -42,18 +42,24 @@ for a in "$@"; do
   esac
 done
 
-# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-08-19).
-# mlx-vlm 0.6.15 is the version the patches in patches/ are written against. APC
-# is correct upstream from 0.6.13; the short-prompt fix (PR #1901) is included
-# from 0.6.14.
+# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-08-25).
+# mlx-vlm 0.6.16 is the version the patches in patches/ are written against.
+# 0.6.16 matters for three reasons: DFlash 2 ships upstream (PR #2014, which
+# made local patch 0040 obsolete), the ArraysCache buffer leak that killed
+# generations at ~10.3k tokens is fixed (#1972 via PR #1984), and Qwen3.8-27B
+# support landed (#1899).
+# mlx 0.32.2 is on PyPI since 2026-08-25, including mlx-metal and
+# macosx_26_0_arm64 wheels -- the source build documented in docs/build-mlx.md
+# is no longer needed. Patch 0013 is still required (the default dispatch still
+# does not route to force_fused) and applies unchanged.
 # --latest gets you something newer; apply-patches.sh may then report "CONFLICT"
 # (meaning: merged upstream -> delete the patch) and the measured values in the
 # start script no longer hold unexamined.
 PINS=(
-  "mlx==0.32.1"
+  "mlx==0.32.2"
   "mlx-lm==0.31.3"
-  "mlx-vlm==0.6.15"
-  "transformers==5.15.0"
+  "mlx-vlm==0.6.16"
+  "transformers==5.15.1"
   "numpy==2.5.2"
   "huggingface-hub==1.27.0"
   "pillow==12.3.0"

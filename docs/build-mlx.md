@@ -1,7 +1,18 @@
 # Building mlx 0.32.2 from source
 
-Optional. Everything runs without it -- only `head_dim 256` stays unfused, which
-costs prefill headroom. The README links here from the installation section.
+> **No longer necessary.** mlx 0.32.2 has been on PyPI since 2026-08-25,
+> including `mlx-metal` and `macosx_26_0_arm64` wheels:
+>
+> ```sh
+> uv pip install --python ~/src/mlx/.venv/bin/python "mlx==0.32.2"
+> ```
+>
+> Verified on 2026-08-25: the PyPI build accepts `force_fused`, so patch 0013
+> engages and the start banner reports `Full-attn: fused (patch 0013 active)`.
+> The Xcode.app plus Metal-toolchain requirement is gone with it.
+>
+> This page is kept for the history, and for anyone who needs a build newer than
+> the latest release.
 
 ## Why
 

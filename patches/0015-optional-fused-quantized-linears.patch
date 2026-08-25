@@ -5,19 +5,19 @@
  from functools import lru_cache, partial
  from typing import Any, List, Optional
  
-@@ -1030,6 +1031,15 @@
+@@ -75,6 +76,15 @@
  
  
- def _fused_quantized_linears(linears, x: mx.array):
-+    # QWEN38_FUSED_LINEARS=0 schaltet die Fusion ab (lokaler Patch 0015).
-+    # Der Cache unten haelt eine ZWEITE, zusammenkopierte Fassung der
-+    # quantisierten Gewichte dauerhaft am Modul fest. Auf Qwen3.8-27B sind das
-+    # gemessen 9,0 GiB mit Speculative Decoding und 2,1 GiB ohne — bei einem
-+    # Durchsatzgewinn, der in der Messstreuung untergeht (26,1 vs 25,7 tok/s
-+    # aus je 5 Laeufen). Auf einer 48-GiB-Maschine ist das der schlechtere
-+    # Handel, deshalb der Schalter. Default bleibt das Upstream-Verhalten.
+ def _decode_quantized_linears_fused(linears, x: mx.array):
++    # QWEN38_FUSED_LINEARS=0 disables the fusion (local patch 0015).
++    # The cache below keeps a SECOND, concatenated copy of the quantized weights
++    # attached to the module permanently. On Qwen3.8-27B that is a measured
++    # 9.0 GiB with speculative decoding and 2.1 GiB without -- for a throughput
++    # gain that disappears in the measurement spread (26.1 vs 25.7 tok/s from
++    # 5 runs each). On a 48 GiB machine that is the worse trade, hence the
++    # switch. The default stays upstream behaviour.
 +    if os.environ.get("QWEN38_FUSED_LINEARS") == "0":
 +        return None
      if (
          x.ndim != 3
-         or len(linears) < 2
+         or x.shape[1] != 1

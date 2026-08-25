@@ -65,10 +65,20 @@ self-test → patches → model + drafter → `~/.mlx-qwen38/{logs,apc}`.
 
 Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 
-**Pinned, verified state:** `mlx 0.32.1`, `mlx-lm 0.31.3`, **`mlx-vlm 0.6.15`**,
-`transformers 5.15.0`, `numpy 2.5.2`, `huggingface-hub 1.27.0`, `pillow 12.3.0`,
-Python 3.12. `mlx-vlm >= 0.6.13` is mandatory -- only there is prefix caching
-correct upstream.
+**Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`, **`mlx-vlm 0.6.16`**,
+`transformers 5.15.1`, `numpy 2.5.2`, `huggingface-hub 1.27.0`, `pillow 12.3.0`,
+Python 3.12.
+
+`mlx-vlm >= 0.6.16` is what the patches are written against. It also removes two
+long-standing constraints: DFlash 2 ships upstream (PR #2014), and the
+ArraysCache buffer leak that killed generations at ~10.3k tokens is fixed
+(#1972 via PR #1984) -- verified here with 11,436 tokens in one response, peak
+18.56 GiB. `max_tokens` no longer needs the old 8192 cap.
+
+`mlx 0.32.2` has been on PyPI since 2026-08-25 including `mlx-metal` and
+`macosx_26_0_arm64` wheels, so **no source build is required** for the fused
+`head_dim 256` path -- see [docs/build-mlx.md](docs/build-mlx.md) for the
+history.
 
 ### Making the wired limit persistent
 
@@ -156,7 +166,7 @@ alias** and **context ≤ budget**.
 | model name | `Qwen3.8-27B-local` | must match the symlink name |
 | `base_url` | `http://localhost:8888/v1` | |
 | `context_length` | `lean` 32768 · `balanced` 49152 · `roomy` 65536 | ≤ the budget from the start banner |
-| `max_tokens` | 8192 | **do not raise**, see below |
+| `max_tokens` | 16384 | matches the client's response reserve, see below |
 | `reasoning_effort` | `low` | only `low\|medium\|xhigh`, or `none`/`off` to disable thinking; anything else → HTTP 500 |
 
 ```yaml
@@ -165,7 +175,7 @@ model:
   base_url: http://localhost:8888/v1
   api_key: sk-local
   context_length: 65536
-  max_tokens: 8192
+  max_tokens: 16384
   extra_body:
     enable_thinking: true
     reasoning_effort: low
@@ -173,9 +183,13 @@ compression:
   threshold: 0.85
 ```
 
-**Why `max_tokens` must not go up:** many clients trigger compaction at
-`(context_length − max_tokens) × threshold`. A larger `max_tokens` moves the
-trigger down and wastes context.
+**Why `max_tokens` is not simply maximised:** many clients trigger compaction at
+`(context_length − max_tokens) × threshold`, so a larger `max_tokens` moves the
+trigger down and wastes context. Pick the value your client reserves for a
+response and no more.
+
+The old hard cap of 8192 came from an upstream bug (#1972) that killed
+generations at ~10.3k tokens; it is fixed in mlx-vlm 0.6.16.
 
 The start script can cross-check a YAML config for you:
 
@@ -210,7 +224,7 @@ SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
 
 ## Patches
 
-Eleven patches against `site-packages`, applied by `patches/apply-patches.sh`
+Ten patches against `site-packages`, applied by `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). **They vanish on every
 `pip install -U mlx-vlm`** -- run it again afterwards.
 

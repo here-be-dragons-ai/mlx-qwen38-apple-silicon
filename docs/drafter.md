@@ -1,7 +1,50 @@
-# Speculative decoding: DFlash 2 vs MTP
+# Speculative decoding: DFlash 2 vs MTP vs DSpark
 
 Background and measurements for the drafter. The README states only that DFlash 2
 is the default and how to switch back.
+
+## Status since mlx-vlm 0.6.16 (2026-08-24)
+
+**DFlash 2 ships upstream** (PR #2014) at `speculative/drafters/dflash2/`. Local
+patch `0040` carried the earlier PR #1959, which was closed unmerged in favour of
+#2014 -- that patch is gone.
+
+Two things to know when probing for it:
+
+- The **old path still exists**: `speculative/drafters/qwen3_dflash/dflash.py` is
+  still shipped and is the *v1* drafter. Probing that file passes on 0.6.16 while
+  saying nothing about DFlash 2. The start script probes the v2 module instead.
+- Patch `0041` (the bonus-token guard) moved with it, from `propose_block` to
+  `draft_block` in `dflash2.py`. Applied to the old file it would have been
+  inert -- present, and protecting a code path that no longer runs.
+
+## DSpark measured, and rejected
+
+mlx-vlm 0.6.16 also added a DSpark drafter for exactly this model (PR #1998,
+checkpoint `RadixArk/Qwen3.8-27B-DSpark`, 2.72 GB bf16). Measured against the
+DFlash 2 4bit drafter on 2026-08-25, identical prompts, `temperature 0`,
+`max_tokens 400`, decode rate from the server log:
+
+| case | DFlash 2 (4bit, block 4) | DSpark (bf16, block 4) | DSpark (bf16, block 7) |
+|---|---|---|---|
+| JSON | **41.6 t/s** | 35.6 | 29.2 |
+| code | **43.8 t/s** | 40.8 | 35.9 |
+| prose | **29.5 t/s** | 19.2 | 19.4 |
+| tool call | **31.6 t/s** | 30.1 | 29.9 |
+
+DSpark loses in every case, at its own native block size (7, from its config) as
+well as at 4. Block 7 is worse than block 4, which matches the known dispatch
+cliff on a 4bit target. On top of that it costs memory: 2.5 GiB as bf16 against
+1.0 GiB for the 4bit DFlash 2 checkpoint, so the idle baseline rises from 15.96
+to 17.48 GiB.
+
+Completion token counts were identical across all three configurations
+(288/400/400/26), so this is a throughput difference, not a quality one.
+
+A 4bit DSpark conversion might narrow the gap, but `convert-dflash2-drafter.py`
+does not fit it -- the DSpark config has no `selector_rank` and needs the
+`DSparkDraftModel` classes. Given a 34% deficit on prose, that was not worth
+building. **DFlash 2 stays the default.**
 
 ## DFlash 2 is the default drafter
 
