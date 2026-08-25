@@ -210,8 +210,8 @@ case "$PROFILE" in
   #   after model+drafter, idle    active = 15.96 GiB
   #   after 1 request of 13,112 tk active = 27.35 GiB   <- +11.4 instead of 1.6
   # That "factor 7" IS EXPLAINED and was not a snapshot problem: 9.46 GiB of it
-  # is the fixed floor from _fused_quantized_linears() (patch 0015, README "The
-  # fixed floor"). 11.4 - 9.46 = 1.94 GiB against a computed 1.2-1.6 -- that
+  # is the fixed floor from _fused_quantized_linears() (patch 0015, see
+  # docs/memory.md "The fixed floor"). 11.4 - 9.46 = 1.94 GiB against a computed 1.2-1.6 -- that
   # matches. The floor has been switched off since patch 0015, `active` after the
   # first request is 16.70 instead of 25.42 GiB, and there is no creep per
   # request (counter-test at constant length, commit 72ba66c).
