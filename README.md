@@ -17,7 +17,7 @@ selbst:
 |---|---|---|---|
 | `lean` | 32 GB **ohne** `sudo` | ~18,8 GiB | 32768 |
 | `balanced` | 32 GB mit `wired_limit 26624` | ~25,0 GiB | 49152 |
-| `roomy` | 48 GB mit `wired_limit 40960` | ~28 GiB | 98304 |
+| `roomy` | 48 GB mit `wired_limit 40960` | ~33 GiB | 65536 |
 
 Getestet auf macOS 26. `roomy` ist das ursprüngliche, über Wochen produktiv
 gefahrene M5-Pro-Setup; die 32-GB-Profile sind daraus gerechnet. Das
@@ -164,10 +164,47 @@ Memory`, danach liefen **37.822 Token in 91,8 s** durch.
 `sysctl -w` überlebt keinen Neustart. Dauerhaft:
 
 ```sh
-sudo cp com.local.iogpu-wired-limit.plist /Library/LaunchDaemons/
-sudo chown root:wheel /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
-sudo launchctl load -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+sudo ./install-wired-limit-daemon.sh
 ```
+
+Das war bis 2026-08-24 eine Kette aus vier `sudo`-Zeilen mit
+Fortsetzungszeichen — und die **zerbricht beim Kopieren**: bricht die Zeile an
+der falschen Stelle um, führt zsh das Zielverzeichnis als Kommando aus
+(`permission denied: /usr/local/libexec/`), `launchctl` läuft ohne `sudo`
+weiter (`Warning: Expecting a LaunchAgents path …`) und quittiert mit
+`Load failed: 5: Input/output error`. Ergebnis: Verzeichnis da, Skript und
+plist nicht. Der `Load failed: 5` hatte dabei **zwei** Ursachen gleichzeitig —
+fehlendes root *und* ein `ProgramArguments`, das auf eine noch nicht
+installierte Datei zeigte. Das Installationsskript setzt beides in der
+richtigen Reihenfolge und ist idempotent (`--uninstall` entfernt wieder).
+
+Prüfen: `sysctl iogpu.wired_limit_mb`, Vorschau ohne Setzen:
+`sudo /usr/local/libexec/set-iogpu-wired-limit.sh --dry-run`.
+Der Daemon greift durch `RunAtLoad` sofort — der Wert muss also direkt nach der
+Installation stehen, nicht erst nach dem Reboot.
+
+**Der Wert steht nicht mehr in der plist.** Bis 2026-08-24 setzte sie hart
+`26624` — den 32-GB-Wert. So installiert nahm sie einer 48-GB-Maschine 14 GiB
+Working-Set, und `install-prereqs.sh` schlug daneben `45056` vor: zwei
+verschiedene falsche Werte in einer Anleitung, davon einer der
+Kernel-Panik-Wert. Jetzt rechnet `set-iogpu-wired-limit.sh` beim Boot aus
+`hw.memsize` — RAM minus 6 GiB (≤ 32 GB) bzw. 8 GiB (darüber):
+
+| RAM | `wired_limit_mb` | Reserve |
+|---|---|---|
+| 32 GB | 26624 | 6 GiB |
+| 48 GB | **40960** | 8 GiB |
+| 64 GB | 57344 | 8 GiB |
+
+Das Skript **clampt nach oben, auch bei manuell übergebenen Werten** — `45056`
+auf 48 GB wird zu `40960`. Es verweigert außerdem Werte *unter* dem
+macOS-Default, die den Working-Set senken würden. Abweichender Wert: eine Zahl
+in `/etc/iogpu-wired-limit.conf`.
+
+> **Der Folgefehler war still.** Ohne gesetztes Limit fällt `roomy` auf
+> `PREFILL_STEP=512`, und weil der NAX-Pfad aus PR #3842 `qL >= 1024` verlangt,
+> greift er nicht mehr — der Gewinn aus Patch 0013 ist zwischen zwei Neustarts
+> weg, ohne Warnung. Das Start-Skript meldet diesen Fall jetzt explizit.
 
 ---
 
@@ -186,13 +223,13 @@ ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh   # ohne Drafter
 | | `lean` | `balanced` | `roomy` |
 |---|---|---|---|
 | Zielmaschine | 32 GB ohne sudo | 32 GB, `wired_limit 26624` | 48 GB, `wired_limit 40960` |
-| `APC_ENTRIES` | 1 | 2 | 1 (s. Messung unten) |
+| `APC_ENTRIES` | 1 | 2 | 3 (s. Messung unten) |
 | `KV_BITS` | 8 (ab 8k Token) | — (f16) | — (f16) |
 | `PREFILL_STEP` | 512 | 1024 | 2048 (ohne `wired_limit` 512) |
 | `VISION_CACHE` | 1 | 4 | 20 |
 | `APC_DISK_MAX_GB` | 40 | 40 | 80 (plattenabhängig gekappt) |
 | **Peak-RAM** | **~18,8 GiB** @ 29k | ~25,0 GiB @ 43k | ~30 GiB @ 90k (ger.) |
-| `context_length` | 32768 | 49152 | 98304 |
+| `context_length` | 32768 | 49152 | 65536 (s. „Warum 3") |
 
 > **Bei aktivem fused Pfad** (mlx-Quellbau, s. o.) zieht das Skript
 > `PREFILL_STEP` automatisch auf mindestens **1024** — der NAX-Kernel aus #3842
@@ -215,7 +252,7 @@ f16).
 > vier Einträgen (5 Kopien) waren das bei 44 GiB Working-Set nur ~85k Token,
 > also weniger als die empfohlenen 98304. Dass das produktiv trotzdem mit
 > 131072 trug, lag daran, dass die Snapshots real nie alle gleichzeitig am
-> Anschlag stehen: Glück, keine Garantie. Mit `APC_ENTRIES=2` (3 Kopien) sind
+> Anschlag stehen: Glück, keine Garantie. Mit `APC_ENTRIES=3` (4 Kopien) sind
 > es ~142k Token, das Profil deckt seine eigene Empfehlung jetzt ab.
 >
 > **Aber nur mit gesetztem `wired_limit`.** Ohne `sudo sysctl -w
@@ -236,8 +273,10 @@ f16).
 > Speicher-Sampler am 2026-08-21 widerlegt hat (s. „Was der Sampler misst").
 > Sie hatte einen unangenehmen Nebeneffekt: `sudo sysctl -w
 > iogpu.wired_limit_mb=40960` hob zwar die Decke um 2,5 GiB, verdoppelte aber
-> gleichzeitig die Snapshot-Zahl — netto ein Rückschritt. `roomy` steht jetzt
-> fest auf `APC_ENTRIES=1`.
+> gleichzeitig die Snapshot-Zahl — netto ein Rückschritt. `roomy` steht seit
+> 2026-08-24 fest auf `APC_ENTRIES=3` — die Messung, die für die 1 sprach, ist
+> mit Patch 0015 aufgeklärt (s. „Was der Sampler misst"), und die 3 trägt, seit
+> `_CTX_HINT` auf 65536 steht (s. „Warum 3").
 
 Beim Start druckt das Skript das errechnete Speicherbudget dieser Maschine:
 
@@ -286,8 +325,56 @@ Patch in `site-packages` wäre nach jedem `mlx-vlm`-Update wieder weg. Von auße
 ist die Zahl nicht messbar: RSS enthält die Metal-Buffer nicht (gemessen 2,3 GiB
 RSS bei 16 GiB Gewichten).
 
-**Warum das drin ist.** Die Speicherrechnung unten ist eine Obergrenze, keine
-Zusage. Erster Lauf mit Sampler, `roomy`, Working-Set 40 GiB, `APC_ENTRIES=3`:
+**Was er gefunden hat.** Zwei Posten, die in keiner Rechnung standen.
+
+**Der fixe Sockel: ~9 GiB, behoben.** `active` sprang beim ersten Generieren von
+15,96 auf 25,42 GiB — unabhängig von der Kontextlänge (ein 16-Token-Request löst
+ihn genauso aus wie 44.452 Token) und wurde nie freigegeben. Eine Sonde um
+`mx.eval` zeigte die Quelle:
+
+```
+8,71 GiB kumuliert  n=128  language.py:1098  _target_verify_quantized_linears
+```
+
+`_fused_quantized_linears()` kopiert QKV- und MLP-Gewichte je Layer zu einem
+fusionierten Tensor zusammen und hängt ihn dauerhaft ans Modul — eine zweite
+Fassung der quantisierten Gewichte. Kein Leck, eine Optimierung, die niemand
+wieder abräumt. Patch `0015` macht sie abschaltbar, das Start-Skript schaltet
+sie ab. Ergebnis: `active` nach dem ersten Request **16,70 statt 25,42 GiB**.
+
+**Ein „Kriechgang pro Request" existiert nicht.** Er war zwischenzeitlich mit
+~0,6 GiB je Request angesetzt — das war ein Messfehler. In den betroffenen
+Reihen wuchs mit jedem Request auch die **Kontextlänge**, und was wie
+Retention aussah, war schlicht der wachsende KV-Cache der laufenden
+Konversation. Der Gegentest mit **konstanter** Länge (8 × 13.460 Token,
+APC aus) zeigt den Idle-Wert ab dem zweiten Request unbewegt:
+
+| Request | idle davor | Peak | Δ idle |
+|---|---|---|---|
+| 1 | 15,96 GiB | 18,73 GiB | — |
+| 2 | 18,14 GiB | 21,20 GiB | +2,18 |
+| 3 | 17,85 GiB | 21,07 GiB | −0,29 |
+| 4 | 18,14 GiB | 21,26 GiB | +0,29 |
+| 5–8 | **18,14 GiB** | 21,1–21,5 GiB | **0,000** |
+
+Der einmalige Sprung ist der KV-Cache *einer* Konversation (13.460 × 64 KiB =
+0,82 GiB) plus dem Restsockel von ~1,3 GiB. Danach: nichts. Der Speicher folgt
+der Kontextlänge, wie die Rechnung es vorsieht — es gibt kein Leck.
+
+**Was danach möglich ist.** Einzelne kalte Requests nach Patch 0015, Working-Set
+40 GiB:
+
+| Prompt | Ergebnis |
+|---|---|
+| 85.730 Token | ✅ 264 s, Peak 89 % |
+| 128.570 Token | ✅ 464 s, Peak 95 % |
+| ~171.000 Token | ❌ — aber am **600-s-Timeout**, nicht an Speicher |
+
+Vor Patch 0015 starb dieselbe Maschine in der Agent-Kette bei ~23k Token.
+
+**Warum der Sampler bleibt.** Die Speicherrechnung unten ist eine Obergrenze,
+keine Zusage. Erster Lauf mit Sampler, `roomy`, Working-Set 40 GiB,
+`APC_ENTRIES=3`, noch **ohne** Patch 0015:
 
 | Zeitpunkt | `active` |
 |---|---|
@@ -303,15 +390,113 @@ also nicht die Ursache: mlx gibt ihn bei `gc_limit_ = 0,95 × Working-Set`
 korrekt frei (`mlx/backend/metal/allocator.cpp`). Es ist **lebender** Speicher,
 und für den gibt es unterhalb des Working-Sets keine Bremse.
 
-Wohin die Differenz genau geht, ist offen. Bis das geklärt ist, steht
-`APC_ENTRIES` auf `roomy` fest auf 1, und das `KONTEXT-BUDGET` im Banner ist als
-Obergrenze markiert. **Maßgeblich sind die `mem`-Zeilen, nicht die Rechnung.**
+**Aufgelöst — es war der Sockel, nicht der Cache.** Diese Messung lief *ohne*
+Patch 0015. Von den 11,4 GiB sind **9,46 GiB** der fixe Sockel aus
+`_fused_quantized_linears()` (s. „Der fixe Sockel" oben): 11,4 − 9,46 =
+**1,94 GiB** gegen angesetzte 1,2–1,6 — das deckt sich, der „Faktor 7" ist weg.
+Dass `active` zwischen den Requests nicht zurückfiel, war dieselbe Ursache; der
+vermutete „Kriechgang pro Request" war zusätzlich ein Messfehler (wachsende
+Kontextlänge, Gegentest mit konstanter Länge oben).
+
+Damit ist die Begründung für `APC_ENTRIES=1` entfallen. `roomy` steht seit
+2026-08-24 auf **3** (zunächst 2, s. „Warum 3" unten). Was die 1 gekostet hat, aus `server.log`
+(810 Prefills, 118 Serverläufe, 37,9 % kalt):
+
+| | Anzahl | Prefill-Zeit |
+|---|---|---|
+| warm | 503 | 9,71 M Token wiederverwendet |
+| kalt < 8k | 184 | 602 s (irrelevant) |
+| kalt 8–20k | 40 | 1128 s |
+| kalt > 20k | 83 | 5331 s |
+| **kalt ≥ 8k** | **123** | **107,7 min** |
+
+Diese 107,7 min sind **zwei** Fehler, nicht einer:
+
+* **72,7 min** (81 Prefills) folgen im selben Serverlauf auf einen früheren
+  großen Request — Verdrängung auf einem Snapshot-Platz (`in_flight=2` steht
+  5× im Log). Das ist die Obergrenze: ein Teil davon sind echte neue
+  Konversationen, die kein zusätzlicher Platz retten würde. Fix: `APC_ENTRIES`.
+* **34,9 min** (42 Prefills) sind der *erste* große Request ihres Laufs — die
+  hätte der Disk-Tier fangen müssen. Fix: Namespace-GC + korrigierte
+  Deckel-Rechnung (s. unten), nicht `APC_ENTRIES`.
+
+#### Warum 3 — und warum das am `context_length` der Clients hängt
+
+Hier stand zuerst **2**, gerechnet gegen den damaligen `_CTX_HINT` von 98.304.
+Diese Rechnung war nicht falsch, sie beantwortete die falsche Frage — und die
+Einstellung hat deshalb **nie gegriffen**.
+
+**`mlx-vlm` hat kein `-c`-Flag.** Der Serverkontext kommt aus der `config.json`
+(262144); der effektive Deckel ist allein das `context_length` des *Clients*.
+`_CTX_HINT` ist eine Empfehlung fürs Banner und der Eingabewert der
+Überbuchungs-Sperre — **kein Serverlimit**. Diese Sperre reduziert `APC_ENTRIES`,
+solange `ctx_hint > Budget × 0,8`. Nachgerechnet mit dem Budget-Block des
+Skripts selbst (Working-Set 40,0 GiB, Gewichte 16,0 GiB, Patch 0013 aktiv):
+
+| `_CTX_HINT` | gesetzt | `entries_used` | Kopien | Budget |
+|---|---|---|---|---|
+| 98304 | 2 | **1** | 2 | 182133 |
+| 98304 | 3 | **1** | 2 | 182133 |
+| 65536 | 2 | 2 | 3 | 120654 |
+| **65536** | **3** | **3** | **4** | **89914** |
+
+Mit 98.304 landet *jede* Einstellung bei 1. Da alle drei pi-Instanzen auf
+`contextWindow` 65536 stehen, beschrieb `_CTX_HINT=98304` einen Client, den es
+nicht gibt — und verplante Speicher für Prompts, die niemand schickt. Beide
+Werte sind deshalb korrigiert: `_CTX_HINT` 98304 → **65536**, `APC_ENTRIES`
+2 → **3**.
+
+Bedarf bei 65536 (64 KiB/Token f16 — `dequantize_for_apc()`, s. Kasten — plus
+152 MiB GDN je Kopie, Basis 16,70 GiB, nutzbar 0,95 × 40 GiB = 38,0 GiB):
+
+| `APC_ENTRIES` | Kopien | Bedarf | |
+|---|---|---|---|
+| 2 | 3 | 29,1 GiB | |
+| **3** | **4** | **33,3 GiB** | 4,7 GiB Luft — ein warmer Platz je Instanz |
+| 4 | 5 | 37,4 GiB | zu knapp |
+
+> **Die 3 hängt an den Clients.** Wer eine Instanz auf 98304 hebt, muss
+> `APC_ENTRIES` mit zurückziehen — sonst kappt die Sperre still auf 1 und *alle*
+> drei verlieren ihren warmen Platz. Die Warnung dazu steht im Startbanner
+> (`APC_ENTRIES N → M gekappt`); sie geht dort leicht unter.
+
+Das `KONTEXT-BUDGET` im Banner bleibt als Obergrenze markiert: **maßgeblich sind
+die `mem`-Zeilen, nicht die Rechnung.**
 
 > **`KV_BITS=8` hilft hier nicht.** Naheliegend, weil ohne Score-Transient die
 > 64 KiB/Token dominieren — aber `apc_adapters.py:515` ruft beim Snapshot-Store
 > `dequantize_for_apc()`. Quantisiert wird nur der lebende Cache, die
 > APC-Snapshots bleiben f16. Gemessen: Decode 22,9 → 18,7 tok/s (Mittel aus 6
 > bzw. 8 Requests), `active` kletterte unverändert auf 37,78 GiB, gleicher OOM.
+
+### Watchdog: Netz, kein Muss
+
+Entstanden, als der Speichersockel noch unerklärt war. Seit Patch `0015` ist er
+**nicht mehr nötig** — der Speicher folgt der Kontextlänge und läuft nicht mehr
+von selbst voll. Als Netz für unbeaufsichtigte Läufe schadet er nicht.
+`watchdog-mlx_qwen3.8.sh` läuft **statt** des Start-Skripts und reicht alle
+Variablen durch:
+
+```sh
+./watchdog-mlx_qwen3.8.sh
+ENABLE_APC=0 WATCHDOG_PCT=85 ./watchdog-mlx_qwen3.8.sh
+```
+
+| Variable | Default | |
+|---|---|---|
+| `WATCHDOG_PCT` | `90` | Schwelle in % des Working-Sets |
+| `WATCHDOG_STREAK` | `3` | Messungen in Folge über der Schwelle |
+| `WATCHDOG_POLL` | `10` | Sekunden zwischen zwei Prüfungen |
+| `WATCHDOG_MAX_WAIT` | `180` | Sekunden auf Leerlauf warten, dann hart |
+
+Er wartet auf `in_flight=0`, bevor er neu startet, und erkennt auch einen
+weggestorbenen Serverprozess. **90 statt 95:** bei 95 % starb am 2026-08-22 ein
+29.632-Token-Prefill nach 34 % — die Schwelle muss noch Platz für den
+laufenden Prefill lassen.
+
+Ein Neustart setzt auf die 15,96-GiB-Baseline zurück. Nach Patch `0015` ist das
+nur noch relevant, wenn eine einzelne Konversation wirklich sehr lang wird —
+gegen einen Sockel, der von selbst wächst, muss er nicht mehr anlaufen.
 
 ---
 
@@ -331,7 +516,7 @@ rekurrentem State. Und es ist **dense** — kein MoE, jeder Token liest alle
 ~15 GiB.
 
 Der KV-Posten fällt **pro Kopie** an: einmal für die laufende Sequenz, einmal
-pro Prefix-Cache-Snapshot. Mit `APC_ENTRIES=2` sind das 3 Kopien:
+pro Prefix-Cache-Snapshot. Mit `APC_ENTRIES=3` sind das 4 Kopien:
 
 ```
 Budget = (Working-Set − Gewichte − 1,5 GiB − Kopien × 152 MiB) / (Kopien × KV_pro_Token)
@@ -515,8 +700,43 @@ Zwei Konsequenzen, beide im Start-Skript:
   das, was das Volume mit 25 GB Reserve trägt. Das Skript rechnet das beim
   Start aus und meldet die Kappung.
 - **`APC_ENTRIES` auf `roomy` von 2 auf 3**, aber nur mit gesetztem
-  `iogpu.wired_limit_mb` (s. Profiltabelle) — ohne Limit passt der dritte
-  Snapshot rechnerisch nicht ins Budget.
+  `iogpu.wired_limit_mb` — diese Kopplung ist seit 2026-08-21 zurückgenommen,
+  der Wert steht jetzt fest auf 2 (s. „Aufgelöst — es war der Sockel").
+
+#### Der Deckel gilt pro Namespace — die Rechnung tat es nicht
+
+Gefunden am 2026-08-24, Volume bei 91 %:
+
+```
+10G  ...apc/Qwen3.8-27B-local_s1-0c1f0816/   ← 21.8., alter Settings-Hash
+53G  ...apc/Qwen3.8-27B-local_s1-e063a74c/   ← aktiv
+```
+
+`apc_disk_namespace()` (`apc.py:221`) fingerprintet den Verzeichnisnamen aus
+Modellpfad, Adapter **und KV-Quantisierung**. Jede Änderung an `KV_BITS` legt
+also einen neuen Namespace an — der `0c1f0816` oben ist der `KV_BITS=8`-Hash aus
+der Sampler-Messung. **Aufgeräumt wird nie:** der Store setzt
+`self.dir = root/<namespace>` (`apc.py:892`), und `_rebuild_index()` globt nur
+darin (`apc.py:1113`). Die Eviction sieht fremde Namespaces nicht.
+
+Daraus zwei Fehler, beide behoben:
+
+- **Der Deckel wirkt pro Namespace, die Kappungsrechnung rechnete über alle.**
+  `du -sk "$APC_DISK"` summierte das ganze Verzeichnis und behandelte damit
+  Bytes als wiederverwendbar, die die Eviction nie anfassen kann — hier 10 GB
+  zu viel (63 statt 53), also 125 statt korrekt 115 GB Deckel. Das Skript
+  rechnet jetzt nur den aktiven Namespace.
+- **Toter Namespace ⇒ GC.** Beim Start werden inaktive Namespaces entfernt, die
+  länger als `APC_NS_KEEP_DAYS` (Default 3) unberührt sind. Der Namespace mit
+  der jüngsten `mtime` gilt als aktiv und wird **nie** geräumt — ein laufender
+  Server schreibt permanent, ist also immer der jüngste; die Regel ist damit
+  auch gegen eine zweite Instanz robust. Sofort räumen:
+  `APC_NS_KEEP_DAYS=0 ./start-mlx_qwen3.8.sh`.
+
+Das ist zugleich der Fix für die 34,9 min kalte Prefills, die der Disk-Tier
+hätte fangen müssen (s. oben): ein Tier, der sich am Deckel des aktiven
+Namespace kaputträumt, während totes Gewicht daneben liegt, ist genau die
+löchrige Rückfallebene, die einen Miss 50–70 s kostet.
 
 ### Nach jeder Kontextänderung den SSD-Tier leeren
 
@@ -559,7 +779,7 @@ Erster Griff ist `PROFILE=lean`. Was dahintersteckt, einzeln und mit Preis
 
 | Hebel | spart | Preis |
 |---|---|---|
-| `APC_ENTRIES=1` | **−2,8 GiB** | gering — der SSD-Tier bleibt, ein verdrängter Snapshot ist in 350 ms zurück statt in 90 s Vollprefill |
+| `APC_ENTRIES` senken (je Stufe) | **−4,2 GiB** @ 65536 | **höher als lange angenommen.** Die Annahme war „gering, der SSD-Tier fängt es". Gemessen über 810 Prefills kostete `APC_ENTRIES=1` bis zu **72,7 min** kalten Prefill durch Verdrängung — der Tier fängt es nur, wenn er nicht selbst am Deckel räumt (s. „Der Deckel gilt pro Namespace") |
 | `KV_BITS=8 QUANT_KV_START=8192` | **−4,2 GiB** | Durchsatz auf dem MLX-Pfad *nicht* gemessen; bei llama.cpp kostete KV-Quantisierung an vergleichbarer Stelle bis 8× Prefill und 1,9× Decode → A/B messen |
 | `context_length` 49152 → 32768 | −2,6 GiB | kürzere Läufe bis zur Kompaktierung |
 | `PREFILL_STEP=512` | ~−0,2 GiB | praktisch keiner (Prefill ist rechen-, nicht chunklimitiert) |
@@ -801,6 +1021,23 @@ Im Einzelnen:
   bei `qL=512` / `kL=22747`: Peak 662 → 123 MiB, Prefill-Decke 22.747 → 37.822
   Token. Das Start-Banner zeigt den Zustand in der Zeile `Full-Attn:`.
   Rollback: `QWEN38_FORCE_FUSED_SDPA=0`.
+- **`0015-optional-fused-quantized-linears.patch`** — lokal, kein Upstream-PR.
+  `_fused_quantized_linears()` kopiert QKV- und MLP-Gewichte je Layer zu einem
+  fusionierten Tensor zusammen und hängt ihn als
+  `_qwen3_5_fused_decode_linears` **dauerhaft ans Modul** — eine zweite Fassung
+  der quantisierten Gewichte. Das war der fixe Speichersockel: er entsteht beim
+  ersten Generieren, ist längenunabhängig und wird nie freigegeben. Gemessen,
+  idle nach 5 Requests auf 40 GiB Working-Set:
+
+  | | mit Fusion | ohne Fusion | Decode (Mittel aus je 5) |
+  |---|---|---|---|
+  | mit SpecDecode | 26,00 GiB | **17,00 GiB** | 26,1 vs 25,7 tok/s |
+  | ohne SpecDecode | 17,08 GiB | **14,96 GiB** | 18,4 vs 18,2 tok/s |
+
+  9 GiB gegen 1,5 %, und die Streuung beider Decode-Reihen überlappt
+  vollständig. Der Patch selbst ändert nichts — er fügt nur den Schalter hinzu,
+  Default bleibt Upstream-Verhalten. Abgeschaltet wird die Fusion vom
+  Start-Skript. Rollback: `QWEN38_FUSED_LINEARS=1`.
 - **`0014-quantized-kv-start-uniform.patch`** — lokal, kein Upstream-PR.
   `quantized_kv_start` galt auf dem Batch-Pfad nur für TurboQuant
   (`generate/ar.py:786`, `defer_turbo`). Auf dem uniform-Pfad — `--kv-bits` ohne
@@ -861,9 +1098,12 @@ Im Einzelnen:
 | `install-prereqs.sh` | Komplettes Setup ab frischem macOS, idempotent |
 | `LICENSE` | MIT No Attribution (SPDX `MIT-0`) |
 | `start-mlx_qwen3.8.sh` | Server-Start, Profile lean/balanced/roomy, Live-Budgetrechnung |
+| `watchdog-mlx_qwen3.8.sh` | Startet den Server und startet ihn neu, bevor der Speicher volläuft |
 | `download-mlx-model.sh` | Resume-fähiger HuggingFace-Downloader (curl, mit Größenprüfung) |
 | `patches/apply-patches.sh` | Patches anwenden / prüfen / zurücknehmen |
-| `com.local.iogpu-wired-limit.plist` | LaunchDaemon für das Wired-Limit |
+| `com.local.iogpu-wired-limit.plist` | LaunchDaemon für das Wired-Limit (ruft das Skript unten) |
+| `install-wired-limit-daemon.sh` | Installiert Helper + LaunchDaemon in einem Aufruf, idempotent |
+| `set-iogpu-wired-limit.sh` | Rechnet `iogpu.wired_limit_mb` aus `hw.memsize`, clampt nach oben |
 
 ---
 

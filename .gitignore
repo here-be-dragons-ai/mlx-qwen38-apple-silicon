@@ -3,3 +3,5 @@
 *.orig
 *.rej
 nohup.out
+plans/
+Agent.md

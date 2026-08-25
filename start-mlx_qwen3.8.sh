@@ -210,21 +210,72 @@ case "$PROFILE" in
   # Patch 0013 scharf, der Score-Tensor faellt weg, und die 512 werden weiter
   # unten auf 1024 angehoben — der NAX-Pfad aus PR #3842 verlangt qL >= 1024.
   # Die Zeilen hier bleiben stehen, weil sie ohne Quellbau wieder gelten.
-  # ── APC_ENTRIES haengt NICHT mehr am Wired-Limit ────────────────────────────
-  # Bis 2026-08-21 stand hier "3 Snapshots, sobald das Limit gesetzt ist",
-  # begruendet ueber die Budgetrechnung weiter unten (1 + APC_ENTRIES Kopien
-  # a 64 KiB/Token). Diese Rechnung ist WIDERLEGT. Gemessen am 2026-08-21 mit
-  # dem Speicher-Sampler (Working-Set 40 GiB, APC_ENTRIES=3, KV_BITS=8):
-  #   nach Modell+Drafter, idle   active = 15,96 GiB   <- Baseline, sauber
-  #   nach 1 Request a 13.112 Tok active = 27,35 GiB   <- +11,4 GiB
-  #   nach 4 Requests             active = 35,54 GiB
-  #   bei  23.091 Tok             active = 37,78 GiB   -> 95 %, danach OOM
-  # Das Modell erwartet fuer diesen einen 13k-Request 1,6 GiB. Real sind es
-  # 11,4 — Faktor 7. Und active faellt zwischen den Requests NICHT zurueck.
-  # Solange nicht geklaert ist, wohin die Differenz geht, ist jede Erhoehung
-  # der Snapshot-Zahl eine Wette gegen eine Rechnung, die nachweislich luegt.
-  # Deshalb konservativ 1. Wer mehr will, setzt APC_ENTRIES explizit und liest
-  # die mem-Zeilen im Log mit.
+  # ── APC_ENTRIES: 2, und der "Faktor 7" ist erledigt ────────────────────────
+  # Bis 2026-08-21 stand hier 3 ("sobald das Limit gesetzt ist"), danach
+  # konservativ 1. Begruendung fuer die 1 war der Speicher-Sampler vom
+  # 2026-08-21 (Working-Set 40 GiB, APC_ENTRIES=3, KV_BITS=8):
+  #   nach Modell+Drafter, idle   active = 15,96 GiB
+  #   nach 1 Request a 13.112 Tok active = 27,35 GiB   <- +11,4 statt 1,6 GiB
+  # Dieser "Faktor 7" IST AUFGEKLAERT und war kein Snapshot-Problem: 9,46 GiB
+  # davon sind der fixe Sockel aus _fused_quantized_linears() (Patch 0015,
+  # README "Der fixe Sockel"). 11,4 − 9,46 = 1,94 GiB gegen gerechnete 1,2–1,6 —
+  # das deckt sich. Der Sockel ist seit Patch 0015 abgeschaltet, `active` nach
+  # dem ersten Request liegt bei 16,70 statt 25,42 GiB, und einen Kriechgang pro
+  # Request gibt es nicht (Gegentest mit konstanter Laenge, Commit 72ba66c).
+  # Die Rechnung luegt also nicht mehr, und die 1 kostet messbar Prefill.
+  #
+  # WAS DIE 1 KOSTET, aus server.log (810 Prefills, 118 Serverlaeufe):
+  #   warm 503 (62,1 %, 9,71 M Token wiederverwendet) · kalt 307 (37,9 %)
+  #   kalt <8k    184   602 s   (irrelevant)
+  #   kalt 8–20k   40  1128 s
+  #   kalt >20k    83  5331 s
+  #   ------------------------------------------  kalt >=8k = 107,7 min
+  # Diese 107,7 min zerfallen in ZWEI verschiedene Fehler, und nur der erste
+  # haengt an APC_ENTRIES:
+  #   72,7 min (81 Prefills) folgen im selben Serverlauf auf einen frueheren
+  #            grossen Request — das ist Verdraengung auf einem Snapshot-Platz
+  #            (in_flight=2 steht 5x im Log). Obergrenze: ein Teil davon sind
+  #            echte neue Konversationen, die kein Platz retten wuerde.
+  #   34,9 min (42 Prefills) sind der erste grosse Request ihres Laufs. Die
+  #            haette der DISK-Tier fangen muessen — genau den hat der
+  #            Namespace-Muell + die falsche Deckel-Rechnung kaputtgeraeumt
+  #            (19 Evictions im Log, s. APC-GC weiter unten). Anderer Fix.
+  #
+  # WARUM 3, UND WARUM _CTX_HINT DAFUER AUF 65536 MUSS.
+  # Hier stand am 2026-08-24 zuerst 2, gerechnet gegen _CTX_HINT=98304. Diese
+  # Rechnung war nicht falsch — sie beantwortete die falsche Frage. Denn:
+  #
+  #   mlx-vlm hat KEIN -c-Flag. Der Serverkontext kommt aus der config.json
+  #   (262144); der effektive Deckel ist ALLEIN das contextWindow des Clients
+  #   (s. Block "Client-Abgleich" unten). _CTX_HINT ist eine Empfehlung ans
+  #   Banner und der Eingabewert der Ueberbuchungs-Sperre — kein Serverlimit.
+  #
+  # Alle drei pi-Instanzen (~/.pi/agent, ~/.pi/ea, ~/.pi/code) stehen auf
+  # contextWindow 65536. _CTX_HINT=98304 beschrieb also einen Client, den es
+  # nicht gibt, und verplante Speicher fuer Prompts, die niemand schickt.
+  #
+  # DIE FOLGE WAR STILL UND TEUER. Die Ueberbuchungs-Sperre weiter unten
+  # reduziert entries, solange ctx_hint > budget * 0,8. Nachgerechnet mit dem
+  # Budget-Block dieses Skripts (Working-Set 40,0 GiB, Gewichte 16,0 GiB,
+  # Patch 0013 aktiv), Feld entries_used:
+  #   _CTX_HINT   gesetzt   entries_used   Kopien   Budget
+  #     98304        2          1 (!)         2     182133
+  #     98304        3          1 (!)         2     182133
+  #     65536        2          2             3     120654
+  #     65536        3          3             4      89914
+  # Mit 98304 landet JEDE Einstellung bei 1 — die 2 vom Vormittag hat also nie
+  # gegriffen, und der Gewinn, um den es dabei ging (72,7 min kalte Prefills,
+  # s.o.), ist nie eingetreten. Das Skript warnt zwar, die Zeile geht im
+  # Startbanner unter.
+  #
+  # Mit _CTX_HINT=65536 traegt 3: 4 Kopien x (4,0 GiB + 152 MiB GDN) = 16,6 GiB
+  # + 16,70 GiB Basis = 33,3 von 38,0 GiB nutzbar, 4,7 GiB Luft. Das gibt jeder
+  # der drei Instanzen einen eigenen warmen Snapshot-Platz.
+  #
+  # DIE 3 HAENGT AN DEN CLIENTS. Wer eine Instanz auf 98304 hebt, muss
+  # APC_ENTRIES mit zurueckziehen — sonst kappt die Sperre still auf 1 und ALLE
+  # drei verlieren ihren warmen Platz. Massgeblich bleiben die mem-Zeilen im
+  # Log, nicht diese Rechnung.
   #
   # Nebenbefund derselben Messung: KV_BITS=8 greift den Verbraucher NICHT an.
   # apc_adapters.py:515 ruft beim Snapshot-Store dequantize_for_apc() — der
@@ -232,12 +283,28 @@ case "$PROFILE" in
   # Gekostet hat es 22,9 -> 18,7 tok/s Decode (Mittel aus 6 bzw. 8 Requests).
   # Deshalb bleibt _KV_BITS hier leer.
   roomy)
-    _APC_ENTRIES=1
+    _APC_ENTRIES=3
     if [[ "${_WIRED_MB:-0}" -ge 40960 ]]; then _PREFILL=2048; else _PREFILL=512; fi
-    _KV_BITS="";  _VISION=20; _APC_MAXGB=80; _APC_MINFREE=2.0; _CTX_HINT=98304 ;;
+    _KV_BITS="";  _VISION=20; _APC_MAXGB=80; _APC_MINFREE=2.0; _CTX_HINT=65536 ;;
   *)
     echo "ERROR: unbekanntes PROFILE='$PROFILE' (gueltig: auto | lean | balanced | roomy)" >&2; exit 1 ;;
 esac
+
+# ── Das Wired-Limit fehlt: laut sagen ─────────────────────────────────────────
+# Der Rueckfall oben ist STILL. sysctl ist nicht persistent, und ohne den
+# LaunchDaemon steht nach jedem Reboot wieder der macOS-Default (48 GB -> 36864).
+# Dann faellt _PREFILL auf 512, und weil der NAX-Pfad aus PR #3842 qL >= 1024
+# verlangt, greift er nicht mehr — ohne dass irgendwo etwas auffaellt. Genau so
+# verliert man den Gewinn aus Patch 0013 zwischen zwei Neustarts.
+_WIRED_WANT=$(( _RAM_MB > 32768 ? _RAM_MB - 8192 : _RAM_MB - 6144 ))
+if [[ "$PROFILE" == "roomy" && "${_WIRED_MB:-0}" -lt 40960 ]]; then
+  echo "  ⚠️  iogpu.wired_limit_mb = ${_WIRED_MB:-<nicht gesetzt>} (< 40960)." >&2
+  echo "      Profil roomy laeuft damit im Sparmodus: PREFILL_STEP ${_PREFILL}" >&2
+  echo "      statt 2048, und der NAX-Pfad (qL >= 1024) greift nicht." >&2
+  echo "      Sofort:     sudo ./set-iogpu-wired-limit.sh        # -> ${_WIRED_WANT}" >&2
+  echo "      Persistent: s. com.local.iogpu-wired-limit.plist (sysctl allein" >&2
+  echo "                  ueberlebt keinen Reboot)." >&2
+fi
 
 # ── Speculative Decoding (MTP) ────────────────────────────────────────────────
 # DEFAULT AN. Auf der 48-GB-Maschine am 2026-08-17 durchgemessen:
@@ -301,11 +368,67 @@ APC_DISK_MAX_GB="${APC_DISK_MAX_GB:-$_APC_MAXGB}"
 # RAM-Snapshots loechrig, und genau dann kostet ein Miss die vollen 50-70 s.
 # roomy geht deshalb auf 80 GB — aber nur soweit das Volume es traegt.
 _APC_RESERVE_GB=25
+
+# ── Toter Namespace: GC ───────────────────────────────────────────────────────
+# apc.py:221 (apc_disk_namespace) fingerprintet den Verzeichnisnamen aus
+# Modellpfad, Adapter UND KV-Quantisierung. Jede Aenderung an KV_BITS legt also
+# einen NEUEN Namespace an — und mlx-vlm raeumt den alten NIE: der Store setzt
+# `self.dir = root/<namespace>` (apc.py:892) und _rebuild_index() globt nur
+# darin (apc.py:1113). Die Eviction sieht fremde Namespaces nicht.
+# GEFUNDEN am 2026-08-24: 10 GB in ...-0c1f0816 (Stand 21.8., der
+# KV_BITS=8-Hash aus der Sampler-Messung) neben 53 GB im aktiven ...-e063a74c,
+# auf einem Volume mit 91 % Fuellstand. Der Tier raeumt sich also am 80-GB-
+# Deckel des AKTIVEN Namespace kaputt, waehrend 10 GB tot daneben liegen.
+# Als aktiv gilt der Namespace mit der juengsten mtime; er wird nie geraeumt.
+# Ein laufender Server schreibt permanent, sein Verzeichnis ist damit immer das
+# juengste — deshalb ist die Regel auch gegen eine zweite Instanz robust.
+APC_NS_KEEP_DAYS="${APC_NS_KEEP_DAYS:-3}"
+_ns_active=""
 if [[ -d "$APC_DISK" ]]; then
-  _apc_used_gb=$(( $(du -sk "$APC_DISK" 2>/dev/null | cut -f1) / 1048576 ))
+  _ns_all=( "$APC_DISK"/*(N/) )
+  if (( ${#_ns_all} > 0 )); then
+    _ns_active_mt=-1
+    for _d in "${_ns_all[@]}"; do
+      _mt=$(stat -f %m "$_d" 2>/dev/null || echo 0)
+      if (( _mt > _ns_active_mt )); then _ns_active_mt=$_mt; _ns_active="$_d"; fi
+    done
+  fi
+  if (( ${#_ns_all} > 1 )); then
+    _now=$(date +%s); _freed_mb=0
+    for _d in "${_ns_all[@]}"; do
+      [[ "$_d" == "$_ns_active" ]] && continue
+      # Defensiv: nur unterhalb von $APC_DISK loeschen.
+      [[ "$_d" == "$APC_DISK"/?* ]] || continue
+      _mt=$(stat -f %m "$_d" 2>/dev/null || echo 0)
+      # Ganztage, abgeschnitten — im Zweifel behalten statt loeschen.
+      _age_d=$(( (_now - _mt) / 86400 ))
+      # In MB, nicht GB: ein 400-MB-Namespace soll nicht als "0 GB" dastehen.
+      _sz_mb=$(( $(du -sk "$_d" 2>/dev/null | cut -f1) / 1024 ))
+      if (( _age_d >= APC_NS_KEEP_DAYS )); then
+        echo "  APC-GC: Namespace ${_d:t} (${_sz_mb} MB, ${_age_d} Tage inaktiv) entfernt" >&2
+        rm -rf -- "$_d" && _freed_mb=$(( _freed_mb + _sz_mb ))
+      else
+        echo "  Hinweis: APC-Namespace ${_d:t} (${_sz_mb} MB) ist inaktiv, aber erst" \
+             "${_age_d} Tage alt — bleibt stehen (APC_NS_KEEP_DAYS=${APC_NS_KEEP_DAYS})." >&2
+        echo "           Sofort raeumen: APC_NS_KEEP_DAYS=0 $ZSH_ARGZERO" >&2
+      fi
+    done
+    (( _freed_mb > 0 )) && echo "  APC-GC: ${_freed_mb} MB freigegeben." >&2
+  fi
+fi
+
+# Der Deckel ist eine Obergrenze PRO NAMESPACE — nicht pro Volume. Deshalb darf
+# nur der AKTIVE Namespace als wiederverwendbar gelten: Bytes fremder
+# Namespaces zaehlt `df` schon als belegt, und die Eviction kann sie nicht
+# zurueckholen. Bis 2026-08-24 summierte `du -sk "$APC_DISK"` hier ALLE
+# Namespaces und ueberschaetzte den Spielraum um genau deren Groesse — auf
+# dieser Maschine um 10 GB (63 statt 53), also 125 statt korrekt 115 GB Deckel.
+if [[ -n "$_ns_active" && -d "$_ns_active" ]]; then
+  _apc_used_gb=$(( $(du -sk "$_ns_active" 2>/dev/null | cut -f1) / 1048576 ))
 else
   _apc_used_gb=0
 fi
+# df NACH dem GC, damit freigegebene Bytes mitzaehlen.
 _apc_free_gb=$(( $(df -k "${APC_DISK:h}" 2>/dev/null | tail -1 | awk '{print $4}') / 1048576 ))
 _apc_cap_max=$(( _apc_used_gb + _apc_free_gb - _APC_RESERVE_GB ))
 if [[ "$_apc_cap_max" -lt 10 ]]; then _apc_cap_max=10; fi
@@ -467,6 +590,32 @@ elif [[ "$_FUSED_PROBE" == "ok" ]]; then
   FUSED_OK=1
 else
   FUSED_STATUS="unfused (Patch 0013 inert: mlx $MLX_VER kennt force_fused nicht, braucht >= 0.32.2)"
+fi
+
+# ── Fusionierte Quantized-Linears (Patch 0015) ───────────────────────────────
+# _fused_quantized_linears() haelt eine ZWEITE, zusammenkopierte Fassung der
+# quantisierten Gewichte dauerhaft am Modul fest. Das ist der fixe Sockel, der
+# am 2026-08-21/22 die Sitzungen umgebracht hat: er entsteht beim ERSTEN
+# Generieren, ist von der Kontextlaenge unabhaengig (16 Token loesen ihn genauso
+# aus wie 44.452) und wird nie freigegeben.
+# GEMESSEN auf 40 GiB Working-Set, idle nach 5 Requests:
+#                     mit Fusion   ohne Fusion   Decode (Mittel aus je 5)
+#   mit SpecDecode      26,00 GiB     17,00 GiB   26,1 vs 25,7 tok/s
+#   ohne SpecDecode     17,08 GiB     14,96 GiB   18,4 vs 18,2 tok/s
+# 9 GiB gegen 1,5 %, und die Streuung beider Decode-Reihen ueberlappt
+# vollstaendig. Auf dieser Maschine ist der Speicher mehr wert.
+# Upstream-Verhalten zurueck:  QWEN38_FUSED_LINEARS=1 ./start-mlx_qwen3.8.sh
+export QWEN38_FUSED_LINEARS="${QWEN38_FUSED_LINEARS:-0}"
+QLIN_STATUS="unfusioniert (Patch 0015, spart ~9 GiB)"
+if ! grep -q "QWEN38_FUSED_LINEARS" \
+     "$SITE_PACKAGES/mlx_vlm/models/qwen3_5/language.py" 2>/dev/null; then
+  QLIN_STATUS="fusioniert — Patch 0015 FEHLT (~9 GiB Sockel)"
+  if [[ "$QWEN38_FUSED_LINEARS" == "0" ]]; then
+    echo "⚠️  WARNUNG: Patch 0015 fehlt — QWEN38_FUSED_LINEARS=0 ist wirkungslos." >&2
+    echo "    Der Server belegt ~9 GiB mehr als noetig. Fix: ./patches/apply-patches.sh" >&2
+  fi
+elif [[ "$QWEN38_FUSED_LINEARS" != "0" ]]; then
+  QLIN_STATUS="fusioniert (Upstream-Default, ~9 GiB Sockel)"
 fi
 
 # Mit fused Full-Attention faellt der Score-Transient weg — genau der Grund, aus
@@ -713,6 +862,7 @@ echo "  KV-Cache :  ${KV_BITS:-f16 unquantisiert} → ${KV_KIB} KiB/Token"
 echo "  Mem-Probe:  $([[ "$_MEM_PROBE_INTERVAL" == "0" ]] && echo "OFF" || echo "alle ${_MEM_PROBE_INTERVAL}s ins Log (MEM_PROBE_INTERVAL=0 schaltet ab)")"
 echo "  Prefill  :  Chunk $PREFILL_STEP   Slots: $MAX_NUM_SEQS   Vision-Cache: $VISION_CACHE$_PREFILL_NOTE"
 echo "  Full-Attn:  $FUSED_STATUS"
+echo "  Q-Linears:  $QLIN_STATUS"
 echo "  Log      :  $LOG_FILE"
 echo "  ──────────── Speicherbudget (gerechnet, keine Messung) ──────"
 echo "  RAM              : ${RAM_GIB} GiB"
@@ -788,12 +938,32 @@ fi
 
 # ── Thinking ──────────────────────────────────────────────────────────────────
 # Serverseitig AUS (mlx-vlm schickt enable_thinking immer ans Template, Default
-# false). Der Client setzt pro Request enable_thinking:true +
-# reasoning_effort:low. GUELTIG SIND NUR low|medium|xhigh — jeder andere Wert,
-# auch "none", wirft im Template eine Exception → HTTP 500. Ohne Angabe
-# defaultet das Template auf 'xhigh' (gemessen 1269 statt 428 Completion-Tokens).
-# Auf dieser Maschine ist 'low' nicht nur billiger, sondern ueberlebenswichtig:
-# bei ~9 t/s sind 1269 Tokens ueber zwei Minuten reines Nachdenken.
+# false). Gesteuert wird pro Request vom Client.
+#
+# DAS TEMPLATE kennt nur xhigh|medium|low und wirft bei allem anderen eine
+# Exception -> HTTP 500. Ohne Angabe defaultet es auf 'xhigh'. Kurioserweise
+# setzt NUR xhigh und low eine Anweisung; 'medium' setzt gar keine und faellt
+# damit auf das Default-Verhalten des Modells zurueck.
+#
+# MLX-VLM FAENGT VORHER AB. request_normalization.py:21:
+#   _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+# Diese Werte erreichen das Template nie, sie werden nach enable_thinking=false
+# uebersetzt — und das Template macht daraus einen VORAB GESCHLOSSENEN Block
+# ('<think>\n\n</think>'), das Modell denkt also gar nicht erst.
+# Die frueher hier stehende Behauptung, auch "none" werfe 500, ist WIDERLEGT:
+# nur unbekannte Werte wie "minimal" schlagen durch.
+#
+# GEMESSEN am 2026-08-23, gleicher Prompt, temperature 0:
+#   reasoning_effort=none / off      76 Tok   3,2 s   (denkt nicht)
+#   enable_thinking=false            76 Tok   3,2 s   (identisch)
+#   reasoning_effort=low            234 Tok   7,8 s
+# Fuer Werkzeugaufrufe und kurze Turns ist 'none' der guenstigste Weg; wo das
+# Modell wirklich nachdenken soll, bleibt 'low'. Das entscheidet der Client
+# pro Request, hier ist nichts einzustellen.
+#
+# --thinking-budget waere die harte Token-Grenze INNERHALB des Denkblocks,
+# ist aber mit Speculative Decoding gesperrt (generation.py:1257) — sie zu
+# nutzen hiesse, den Drafter aufzugeben.
 
 args=(
   --host                  "$BIND_HOST"
@@ -810,7 +980,13 @@ if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   # Ohne das laufen Nicht-MTP-Drafter in einer eigenen Generierungsschleife, die
   # den APC-Manager nie verdrahtet: cached_tokens=0 in JEDEM Turn. Braucht
   # Patch 0021. Gemessen: cached 0 -> 5748/5788, Decode unveraendert.
-  [[ "$DRAFT_KIND" != "mtp" ]] && export MLX_VLM_SPECULATIVE_BATCH=1
+  # Seit 2026-08-21 ueberschreibbar, damit der Pfad messbar ist. Er stand im
+  # Verdacht, den fixen Speichersockel von ~9,4 GiB zu verursachen — GEMESSEN
+  # IST ER ES NICHT: mit BATCH=0 bleibt der Sockel unveraendert bei +9,46 GiB.
+  # Der Sockel haengt an --draft-block-size >= 2 (1 -> +0,16 GiB, 2 -> +9,31).
+  # BATCH=0 kostet unter dflash den Prefix-Cache, ist also nichts fuer den
+  # Produktivbetrieb — der Schalter existiert nur fuer Diagnoselaeufe.
+  [[ "$DRAFT_KIND" != "mtp" ]] && export MLX_VLM_SPECULATIVE_BATCH="${MLX_VLM_SPECULATIVE_BATCH:-1}"
   [[ -n "$DRAFT_BLOCK_SIZE" ]] && args+=( --draft-block-size "$DRAFT_BLOCK_SIZE" )
 fi
 

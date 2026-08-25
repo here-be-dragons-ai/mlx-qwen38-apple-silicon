@@ -59,6 +59,25 @@
 #   — der Batch-Pfad laeuft also nicht mehr nur bei MAX_NUM_SEQS > 1.
 #   Rollback: QUANT_KV_START=0
 #
+# 0015-optional-fused-quantized-linears.patch   (LOKAL, kein Upstream-PR)
+#   _fused_quantized_linears() kopiert QKV- und MLP-Gewichte je Layer zu einem
+#   fusionierten Tensor zusammen und haengt ihn als _qwen3_5_fused_decode_linears
+#   dauerhaft ans Modul — eine ZWEITE Fassung der quantisierten Gewichte. Kein
+#   Leck, eine Optimierung, die niemand freigibt.
+#   Das war der fixe Speichersockel: entsteht beim ERSTEN Generieren, ist von
+#   der Kontextlaenge unabhaengig (16 Token loesen ihn genauso aus wie 44.452),
+#   kommt nie zurueck. Gefunden ueber eine Sonde um mx.eval:
+#     8,71 GiB kumuliert, n=128, language.py:1098 _target_verify_quantized_linears
+#   GEMESSEN, idle nach 5 Requests auf 40 GiB Working-Set:
+#                       mit Fusion   ohne Fusion   Decode (Mittel aus je 5)
+#     mit SpecDecode      26,00 GiB     17,00 GiB   26,1 vs 25,7 tok/s
+#     ohne SpecDecode     17,08 GiB     14,96 GiB   18,4 vs 18,2 tok/s
+#   9 GiB gegen 1,5 %, Streuung der Decode-Reihen ueberlappt vollstaendig.
+#   Der Patch aendert das Verhalten NICHT von sich aus — Default bleibt
+#   Upstream. Abgeschaltet wird die Fusion vom Start-Skript per
+#   QWEN38_FUSED_LINEARS=0.
+#   Rollback: QWEN38_FUSED_LINEARS=1
+#
 # 0021-speculative-apc-routing.patch   (LOKAL, Upstream-PR-Kandidat)
 #   Macht den Prefix-Cache fuer Nicht-MTP-Drafter ueberhaupt erst erreichbar.
 #   server/generation.py routet jeden Drafter ausser mtp in eine zweite
