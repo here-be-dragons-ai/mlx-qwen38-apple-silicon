@@ -1,40 +1,45 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Setzt beim Boot das GPU-Wired-Limit auf 26 GiB (26624 MB).
-  Gedacht fuer eine 32-GB-Maschine: macOS defaultet dort auf 2/3 = 21,33 GiB,
-  was nach den 15,2 GiB Modellgewichten nur ~4,6 GiB fuer KV-Cache laesst.
+  Setzt beim Boot das GPU-Wired-Limit. Der WERT STEHT NICHT MEHR HIER, sondern
+  wird von /usr/local/libexec/set-iogpu-wired-limit.sh aus hw.memsize berechnet
+  (RAM minus 6 GiB bis 32 GB RAM, minus 8 GiB darueber):
 
-  26624 laesst ~5,5 GB fuer macOS + Apps. NICHT hoeher setzen, wenn nebenher
-  Browser/IDE laufen — zu wenig Rest-RAM tauscht Metal-OOM gegen Beachball
-  bzw. Kernel-Panic. Konservativ: 24576. Nur-Inferenz-Maschine: 28672.
+      32 GB → 26624      48 GB → 40960      64 GB → 57344
 
-  AUF ANDEREN RAM-GROESSEN den Wert unten anpassen (Faustregel: RAM minus
-  6-8 GB fuer macOS — der Rest zaehlt absolut, nicht relativ, also auf
-  groesseren Maschinen eher mehr abziehen):
-      32 GB → 26624   (Profil balanced, laesst 6 GiB)
-      48 GB → 40960   (Profil roomy,    laesst 8 GiB)
-      64 GB → 57344   (                 laesst 8 GiB)
+  WARUM: bis 2026-08-24 stand hier hart 26624 — der 32-GB-Wert. Auf der
+  48-GB-Maschine nimmt diese plist so installiert 14 GiB Working-Set weg, und
+  der Folgefehler ist still: start-mlx_qwen3.8.sh prueft `_WIRED_MB >= 40960`
+  und faellt darunter auf PREFILL_STEP=512 zurueck, womit der NAX-Pfad
+  (qL >= 1024) nicht mehr greift — ohne Warnung. Ein Wert pro RAM-Groesse in
+  einer versionierten Datei ist genau die Sorte Fussangel, die niemand bemerkt;
+  deshalb rechnet das Skript.
 
-  GEGENBEISPIEL, gemessen: 48 GB mit 45056 (44 GiB) laesst macOS ~2 GiB. Am
-  2026-08-21 um 12:30 ist die Testmaschine damit in eine Kernel-Panik gelaufen
-  ("watchdog timeout: no checkins from watchdogd in 93 seconds"): 45,8 GiB von
-  48 GiB standen als wired, der auslagerbare Pool unter 1 MB, und der
-  Pageout-Scanner bekam nur 252 von 3086 Seiten zurueck. Es gibt dabei KEINE
-  Vorwarnung — macOS' memoryPressure bewertet den Compressor, nicht Wired, und
-  meldete waehrenddessen "false". Jetsam greift deshalb auch nicht ein. Der
-  einzige Schutz ist dieser Wert.
+  Das Skript clampt nach oben. 48 GB mit 45056 (44 GiB) ist am 2026-08-21 in
+  eine Kernel-Panik gelaufen — macOS blieben ~2 GiB, ohne jede Vorwarnung
+  (memoryPressure bewertet den Compressor, nicht Wired). S. README + Skript.
 
-  Installation (braucht sudo, aendert Systemzustand):
-    sudo cp com.local.iogpu-wired-limit.plist /Library/LaunchDaemons/
-    sudo chown root:wheel /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
-    sudo chmod 644       /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+  Abweichender Wert: eine Zahl in /etc/iogpu-wired-limit.conf. Wird ebenfalls
+  geclampt.
+
+  INSTALLATION (braucht sudo, aendert Systemzustand). Das Helper-Skript MUSS
+  root:wheel und 755 sein — ein LaunchDaemon laeuft als root, und ein
+  schreibbares Skript an dieser Stelle waere eine Rechteausweitung:
+
+    sudo install -d -o root -g wheel -m 755 /usr/local/libexec
+    sudo install -o root -g wheel -m 755 set-iogpu-wired-limit.sh \
+         /usr/local/libexec/set-iogpu-wired-limit.sh
+    sudo install -o root -g wheel -m 644 com.local.iogpu-wired-limit.plist \
+         /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
     sudo launchctl load -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
 
   Pruefen:      sysctl iogpu.wired_limit_mb
+                sudo /usr/local/libexec/set-iogpu-wired-limit.sh --dry-run
+                log show --last 5m --predicate 'process == "sysctl"'
   Entfernen:    sudo launchctl unload -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
                 sudo rm /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
-  Einmalig ohne Daemon:  sudo sysctl -w iogpu.wired_limit_mb=26624
+                sudo rm /usr/local/libexec/set-iogpu-wired-limit.sh
+  Einmalig:     sudo ./set-iogpu-wired-limit.sh
 -->
 <plist version="1.0">
 <dict>
@@ -42,13 +47,15 @@
     <string>com.local.iogpu-wired-limit</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/sbin/sysctl</string>
-        <string>-w</string>
-        <string>iogpu.wired_limit_mb=26624</string>
+        <string>/usr/local/libexec/set-iogpu-wired-limit.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <false/>
+    <key>StandardOutPath</key>
+    <string>/var/log/iogpu-wired-limit.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/iogpu-wired-limit.log</string>
 </dict>
 </plist>
