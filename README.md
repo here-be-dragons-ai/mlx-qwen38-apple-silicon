@@ -257,7 +257,7 @@ A profile only sets *defaults* — individual env variables still win, e.g.
 > **But only with `wired_limit` set.** Without `sudo sysctl -w
 > iogpu.wired_limit_mb=40960`, macOS gives only 37.4 GiB of working set on
 > 48 GB, and that yields ~107k tokens — 98304 carries, 131072 does not. The
-> authoritative number appears on every start in the `→ KONTEXT-BUDGET` line of
+> authoritative number appears on every start in the `CONTEXT BUDGET` line of
 > the banner.
 >
 > **The 44 GiB numbers here are historical.** They come from `wired_limit 45056`
@@ -280,12 +280,12 @@ A profile only sets *defaults* — individual env variables still win, e.g.
 On start the script prints the computed memory budget of this machine:
 
 ```
-  ──────────── Speicherbudget (gerechnet, keine Messung) ──────
+  ──────────── memory budget (computed, not measured) ─────────
   RAM              : 32 GiB
-  Metal-Working-Set: 26.0 GiB   (folgt iogpu.wired_limit_mb)
-  Gewichte         : 15.2 GiB   (+1,5 GiB Reserve fuer Aktivierungen)
-  frei fuer KV     : 8.9 GiB  auf 3 Kopien (1 live + APC)
-  →  KONTEXT-BUDGET: ~48486 Token pro Konversation
+  Metal working set: 26.0 GiB   (follows iogpu.wired_limit_mb)
+  weights          : 15.2 GiB   (+1.5 GiB reserve for activations)
+  free for KV      : 8.9 GiB  across 3 copies (1 live + APC)
+  ->  CONTEXT BUDGET: ~48486 tokens
 ```
 
 Most important env switches (all documented with rationale in the script
@@ -455,9 +455,9 @@ Requirement at 65536 (64 KiB/token f16 — `dequantize_for_apc()`, see box — p
 > **The 3 depends on the clients.** Raising one instance to 98304 requires
 > pulling `APC_ENTRIES` back with it — otherwise the guard silently caps to 1 and
 > *all* three lose their warm slot. The warning for this is in the start banner
-> (`APC_ENTRIES N → M gekappt`); it is easy to miss there.
+> (`APC_ENTRIES N -> capped to M`); it is easy to miss there.
 
-The `KONTEXT-BUDGET` in the banner remains marked as an upper bound:
+The `CONTEXT BUDGET` in the banner remains marked as an upper bound:
 **the `mem` lines are authoritative, not the calculation.**
 
 > **`KV_BITS=8` does not help here.** Tempting, because without the score
@@ -991,7 +991,7 @@ against corrupt DFlash bonus tokens).
 > `0030` covers both.
 
 As soon as one of them is merged upstream, `apply-patches.sh` reports
-"KONFLIKT" — that is the signal to delete the file.
+"CONFLICT" — that is the signal to delete the file.
 
 In detail:
 

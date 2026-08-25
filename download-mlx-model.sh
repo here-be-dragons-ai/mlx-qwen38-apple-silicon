@@ -1,44 +1,44 @@
 #!/usr/bin/env zsh
 # ─────────────────────────────────────────────────────────────────────────────
-# HuggingFace-Modell-Downloader (curl, resume-fähig)
+# HuggingFace model downloader (curl, resumable)
 #
-# Laedt ein MLX-Modell in ein FLACHES Verzeichnis (kein HF-Cache-Layout mit
-# blobs/+snapshots/+refs/). Gruende:
-#   - mlx-vlm/mlx-lm laden problemlos von einem normalen Pfad
-#   - das HF-Cache-Layout von Hand nachzubauen (Blob-Hashes, Symlinks, refs)
-#     ist fehleranfaellig; ein flaches Verzeichnis ist robuster und inspizierbar
+# Downloads an MLX model into a FLAT directory (no HF cache layout with
+# blobs/+snapshots/+refs/). Reasons:
+#   - mlx-vlm/mlx-lm load from a normal path without trouble
+#   - rebuilding the HF cache layout by hand (blob hashes, symlinks, refs) is
+#     error-prone; a flat directory is more robust and can be inspected
 #
-# curl -C - setzt abgebrochene Downloads an der Byte-Position fort. Bei bereits
-# vollstaendigen Dateien meldet curl "already been transferred" (Exit 33) — das
-# wird hier als Erfolg behandelt.
+# curl -C - resumes aborted downloads at the byte position. For files that are
+# already complete, curl reports "already been transferred" (exit 33) -- treated
+# as success here.
 #
-# Verwendung:
-#   ./download-mlx-model.sh <hf-repo-id> <zielverzeichnis>
+# Usage:
+#   ./download-mlx-model.sh <hf-repo-id> <target-dir>
 #   ./download-mlx-model.sh unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit ~/src/mlx/models/qwen36
 #
-# Erneut ausfuehren = Resume. Abbruch mit Ctrl-C ist jederzeit gefahrlos.
+# Running it again = resume. Aborting with Ctrl-C is safe at any time.
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
-REPO="${1:?Usage: download-mlx-model.sh <hf-repo-id> <target-dir> [datei-filter]}"
-DEST="${2:?Usage: download-mlx-model.sh <hf-repo-id> <target-dir> [datei-filter]}"
-# Optionaler Substring-Filter auf den Dateinamen. PFLICHT bei GGUF-Repos, die
-# mehrere Quantisierungen fuehren (bartowski/ggml-org/...) — ohne Filter wuerden
-# dort alle Varianten geladen, also hunderte GB. Nicht-.gguf-Dateien (config,
-# tokenizer, ...) werden vom Filter NICHT ausgeschlossen, damit das Modell
-# vollstaendig bleibt.
+REPO="${1:?Usage: download-mlx-model.sh <hf-repo-id> <target-dir> [file-filter]}"
+DEST="${2:?Usage: download-mlx-model.sh <hf-repo-id> <target-dir> [file-filter]}"
+# Optional substring filter on the file name. MANDATORY for GGUF repos that
+# carry several quantisations (bartowski/ggml-org/...) -- without a filter all
+# variants would be downloaded there, i.e. hundreds of GB. Non-.gguf files
+# (config, tokenizer, ...) are NOT excluded by the filter, so the model stays
+# complete.
 FILTER="${3:-}"
 
 mkdir -p "$DEST"
 
 echo "Repo   : $REPO"
-echo "Ziel   : $DEST"
-[[ -n "$FILTER" ]] && echo "Filter : *${FILTER}* (nur passende .gguf)"
-echo "Dateiliste von HuggingFace holen..."
+echo "Target : $DEST"
+[[ -n "$FILTER" ]] && echo "Filter : *${FILTER}* (matching .gguf only)"
+echo "Fetching file list from HuggingFace..."
 
-# .gitattributes/README werden nicht gebraucht (README ist bei unsloth ~65 KB Doku,
-# schadet aber nicht — hier bewusst mitgenommen, damit die Modellkarte lokal bleibt).
+# .gitattributes/README are not needed (unsloth's README is ~65 KB of docs, but
+# it does no harm -- deliberately included so the model card stays local).
 FILES=$(curl -sL "https://huggingface.co/api/models/${REPO}" \
   | FILTER="$FILTER" python3 -c "
 import sys, json, os
@@ -47,20 +47,20 @@ for f in json.load(sys.stdin).get('siblings', []):
     n = f['rfilename']
     if n == '.gitattributes':
         continue
-    # Filter greift nur auf .gguf — Metadaten immer mitnehmen.
+    # The filter only applies to .gguf -- always take the metadata.
     if flt and n.endswith('.gguf') and flt not in n:
         continue
     print(n)")
 
-[[ -n "$FILES" ]] || { echo "ERROR: Keine Dateien gefunden — Repo-ID pruefen: $REPO"; exit 1; }
+[[ -n "$FILES" ]] || { echo "ERROR: no files found -- check the repo id: $REPO"; exit 1; }
 
-# Erwartete Groessen aus den Repo-Metadaten holen. Ohne sie ist ein Resume blind:
-# `curl -C -` setzt an der lokalen Dateigroesse an, und wenn der Server statt
-# eines 206 (Partial Content) ein volles 200 liefert — bei HF nach Redirects und
-# abgerissenen Verbindungen beobachtet — haengt curl den kompletten Body ANS ENDE
-# der vorhandenen Datei. Ergebnis: eine zu grosse, unbrauchbare Datei, OHNE dass
-# curl einen Fehler meldet. Genau so sind hier Shards mit 5,18 statt 4,77 GiB und
-# 7,27 statt 4,93 GiB entstanden (2026-08-11, nach mehreren Neustarts).
+# Fetch the expected sizes from the repo metadata. Without them a resume is
+# blind: `curl -C -` starts at the local file size, and when the server returns
+# a full 200 instead of a 206 (Partial Content) -- observed with HF after
+# redirects and dropped connections -- curl appends the complete body TO THE END
+# of the existing file. Result: an oversized, unusable file, WITHOUT curl
+# reporting an error. That is exactly how shards of 5.18 instead of 4.77 GiB and
+# 7.27 instead of 4.93 GiB appeared here (2026-08-11, after several restarts).
 typeset -A SIZES
 while IFS=$'\t' read -r _name _size; do
   [[ -n "$_name" ]] && SIZES[$_name]=$_size
@@ -72,7 +72,7 @@ for f in json.load(sys.stdin).get('siblings', []):
     if s:
         print(f\"{f['rfilename']}\t{s}\")")
 
-fetch_one() {   # $1 = relativer Dateiname; Rueckgabe: curl-Exitcode
+fetch_one() {   # $1 = relative file name; returns: curl exit code
   local f="$1"
   local url="https://huggingface.co/${REPO}/resolve/main/${f}"
   local out="${DEST}/${f}"
@@ -83,22 +83,22 @@ fetch_one() {   # $1 = relativer Dateiname; Rueckgabe: curl-Exitcode
   if [[ -f "$out" && "$exp" -gt 0 ]]; then
     have=$(stat -f%z "$out" 2>/dev/null || echo 0)
     if [[ "$have" -eq "$exp" ]]; then
-      echo "── $f  (vollstaendig, uebersprungen)"
+      echo "── $f  (complete, skipped)"
       return 0
     elif [[ "$have" -gt "$exp" ]]; then
-      # Groesser als erwartet = durch einen fehlgeschlagenen Resume beschaedigt.
-      # Teilweise reparieren geht nicht, weil unklar ist, ab welchem Offset der
-      # Muell beginnt — also verwerfen und sauber neu holen.
-      echo "── $f  ⚠️  lokal $have > erwartet $exp Bytes — beschaedigt, laedt neu"
+      # Larger than expected = corrupted by a failed resume. Partial repair is
+      # impossible because it is unclear at which offset the garbage starts --
+      # so discard and fetch cleanly.
+      echo "── $f  ⚠️  local $have > expected $exp bytes -- corrupted, re-downloading"
       rm -f "$out"
     fi
   fi
 
   echo "── $f"
-  # -C -  : Resume ab vorhandener Byte-Position
-  # -L    : HF leitet auf CDN (cdn-lfs) um
-  # --retry: transiente Netz-/CDN-Fehler automatisch neu versuchen
-  # Fortschrittsbalken nur im Terminal (im Log sonst zehntausende Zeilen).
+  # -C -  : resume from the existing byte position
+  # -L    : HF redirects to a CDN (cdn-lfs)
+  # --retry: retry transient network/CDN errors automatically
+  # Progress bar only on a terminal (tens of thousands of lines in a log).
   if [[ -t 1 ]]; then progress=(--progress-bar); else progress=(--no-progress-meter); fi
 
   set +e
@@ -106,7 +106,7 @@ fetch_one() {   # $1 = relativer Dateiname; Rueckgabe: curl-Exitcode
        "${progress[@]}" -o "$out" "$url"
   rc=$?
   set -e
-  # Exit 33 = Server unterstuetzt kein Resume, weil die Datei schon komplett ist.
+  # Exit 33 = server does not support resume because the file is already complete.
   [[ $rc -eq 33 ]] && rc=0
   return $rc
 }
@@ -117,12 +117,12 @@ echo "$FILES" | while IFS= read -r f; do
 
   fetch_one "$f"; rc=$?
 
-  # Groesse gegenpruefen. Ein "erfolgreicher" curl-Lauf sagt NICHTS darueber,
-  # ob die Datei stimmt (siehe Resume-Falle oben) — deshalb hart verifizieren.
+  # Verify the size. A "successful" curl run says NOTHING about whether the file
+  # is correct (see the resume trap above) -- so verify hard.
   if [[ $rc -eq 0 && "$exp" -gt 0 ]]; then
     have=$(stat -f%z "${DEST}/${f}" 2>/dev/null || echo 0)
     if [[ "$have" -ne "$exp" ]]; then
-      echo "   Groesse falsch ($have statt $exp) — einmaliger Neuversuch von vorn"
+      echo "   wrong size ($have instead of $exp) -- one clean retry from scratch"
       rm -f "${DEST}/${f}"
       fetch_one "$f"; rc=$?
       have=$(stat -f%z "${DEST}/${f}" 2>/dev/null || echo 0)
@@ -131,12 +131,12 @@ echo "$FILES" | while IFS= read -r f; do
   fi
 
   if [[ $rc -ne 0 ]]; then
-    echo "ERROR: Download fehlgeschlagen ($f, exit $rc). Skript erneut starten = Resume."
+    echo "ERROR: download failed ($f, exit $rc). Run the script again = resume."
     exit $rc
   fi
 done
 
 echo
-echo "Fertig. Groesse: $(du -sh "$DEST" | cut -f1)"
-echo "Inhalt:"
+echo "Done. Size: $(du -sh "$DEST" | cut -f1)"
+echo "Contents:"
 ls -la "$DEST"
