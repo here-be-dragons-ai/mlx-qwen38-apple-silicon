@@ -86,15 +86,30 @@ echo "[1/8] Hardware & macOS"
 CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "?")
 RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 ok "$CHIP · ${RAM_GB} GB RAM · macOS $(sw_vers -productVersion)"
-# Empfehlung fuers Wired-Limit: so viel wie moeglich, aber 5-6 GB fuer macOS
-# lassen. Die beiden Stufen entsprechen den Profilen balanced (32 GB) und
-# roomy (48 GB) im Start-Skript.
-if (( RAM_GB >= 44 )); then
-  WIRED_SUGGEST=45056; PROFILE_HINT="roomy"
-elif (( RAM_GB >= 32 )); then
-  WIRED_SUGGEST=26624; PROFILE_HINT="balanced"
+# Empfehlung fuers Wired-Limit: RAM minus Reserve fuer macOS, absolut gerechnet
+# (6 GiB bis 32 GB RAM, 8 GiB darueber). Dieselbe Regel wie in
+# set-iogpu-wired-limit.sh — dort steht die Begruendung.
+#
+# ACHTUNG, HIER STAND EIN GEFAEHRLICHER WERT: bis 2026-08-24 schlug dieser
+# Zweig fuer RAM >= 44 GB die 45056 vor. Das sind auf einer 48-GB-Maschine nur
+# 4 GiB Reserve, und genau an diesem Wert ist die Testmaschine am 2026-08-21 in
+# eine Kernel-Panik gelaufen (watchdog timeout, s. README). Zusaetzlich
+# widersprach der Vorschlag der plist, die 26624 setzte — zwei verschiedene
+# falsche Werte in einer Anleitung. Beides rechnet jetzt dasselbe Skript.
+if (( RAM_GB <= 32 )); then
+  WIRED_SUGGEST=$(( RAM_GB * 1024 - 6144 ))
 else
-  WIRED_SUGGEST=$(( (RAM_GB - 6) * 1024 )); PROFILE_HINT="lean"
+  WIRED_SUGGEST=$(( RAM_GB * 1024 - 8192 ))
+fi
+# Unter dem macOS-Default (2/3 des RAM) waere der Eingriff eine VERSCHLECHTERUNG.
+# Trifft nur sehr kleine Maschinen (16 GB: 10240 < 10922), die laut Warnung
+# unten ohnehin nicht tragen. set-iogpu-wired-limit.sh verweigert solche Werte —
+# hier gaebe es sonst einen Vorschlag, den das Skript danach ablehnt.
+_WIRED_FLOOR=$(( RAM_GB * 1024 * 2 / 3 ))
+(( WIRED_SUGGEST < _WIRED_FLOOR )) && WIRED_SUGGEST=$_WIRED_FLOOR
+if   (( RAM_GB >= 44 )); then PROFILE_HINT="roomy"
+elif (( RAM_GB >= 32 )); then PROFILE_HINT="balanced"
+else                          PROFILE_HINT="lean"
 fi
 if (( RAM_GB < 32 )); then
   warn "Nur ${RAM_GB} GB RAM. Die Gewichte allein belegen 15,2 GiB — unter 32 GB"
@@ -251,11 +266,12 @@ echo "────────────────────────�
 echo "  Fertig. Naechste Schritte:"
 echo
 echo "  1) Wired-Limit anheben (WICHTIGSTER Schritt, braucht sudo):"
-echo "       sudo sysctl -w iogpu.wired_limit_mb=$WIRED_SUGGEST"
-echo "     Persistent (ueberlebt Neustarts):"
-echo "       sudo cp $BUNDLE_DIR/com.local.iogpu-wired-limit.plist /Library/LaunchDaemons/"
-echo "       sudo chown root:wheel /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist"
-echo "       sudo launchctl load -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist"
+echo "       sudo $BUNDLE_DIR/set-iogpu-wired-limit.sh          # ${RAM_GB} GB -> $WIRED_SUGGEST"
+echo "     Persistent (ueberlebt Neustarts — sysctl selbst tut das NICHT):"
+echo "       sudo $BUNDLE_DIR/install-wired-limit-daemon.sh"
+echo "     Der Daemon rechnet den Wert bei jedem Boot aus hw.memsize — kein"
+echo "     RAM-spezifischer Wert liegt irgendwo fest. Ein Aufruf statt vier"
+echo "     sudo-Zeilen: die brachen beim Kopieren um und liefen halb durch."
 echo
 echo "  2) Server starten:"
 echo "       $BUNDLE_DIR/start-mlx_qwen3.8.sh"
