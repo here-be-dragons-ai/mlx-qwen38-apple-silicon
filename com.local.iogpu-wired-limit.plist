@@ -1,45 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Setzt beim Boot das GPU-Wired-Limit. Der WERT STEHT NICHT MEHR HIER, sondern
-  wird von /usr/local/libexec/set-iogpu-wired-limit.sh aus hw.memsize berechnet
-  (RAM minus 6 GiB bis 32 GB RAM, minus 8 GiB darueber):
+  Sets the GPU wired limit at boot. THE VALUE IS NO LONGER IN HERE; it is
+  computed by /usr/local/libexec/set-iogpu-wired-limit.sh from hw.memsize
+  (RAM minus 6 GiB up to 32 GB of RAM, minus 8 GiB above that):
 
-      32 GB → 26624      48 GB → 40960      64 GB → 57344
+      32 GB -> 26624      48 GB -> 40960      64 GB -> 57344
 
-  WARUM: bis 2026-08-24 stand hier hart 26624 — der 32-GB-Wert. Auf der
-  48-GB-Maschine nimmt diese plist so installiert 14 GiB Working-Set weg, und
-  der Folgefehler ist still: start-mlx_qwen3.8.sh prueft `_WIRED_MB >= 40960`
-  und faellt darunter auf PREFILL_STEP=512 zurueck, womit der NAX-Pfad
-  (qL >= 1024) nicht mehr greift — ohne Warnung. Ein Wert pro RAM-Groesse in
-  einer versionierten Datei ist genau die Sorte Fussangel, die niemand bemerkt;
-  deshalb rechnet das Skript.
+  WHY: until 2026-08-24 a fixed 26624 sat here -- the 32 GB value. Installed on
+  a 48 GB machine this plist takes away 14 GiB of working set, and the follow-on
+  error is silent: start-mlx_qwen3.8.sh checks `_WIRED_MB >= 40960` and falls
+  back to PREFILL_STEP=512 below that, which stops the NAX path (qL >= 1024)
+  from engaging -- with no warning. One value per RAM size in a version
+  controlled file is precisely the kind of trap nobody notices, so the script
+  does the arithmetic instead.
 
-  Das Skript clampt nach oben. 48 GB mit 45056 (44 GiB) ist am 2026-08-21 in
-  eine Kernel-Panik gelaufen — macOS blieben ~2 GiB, ohne jede Vorwarnung
-  (memoryPressure bewertet den Compressor, nicht Wired). S. README + Skript.
+  The script clamps upwards. 48 GB with 45056 (44 GiB) ran into a kernel panic
+  on 2026-08-21 -- macOS was left with ~2 GiB, without any warning
+  (memoryPressure evaluates the compressor, not wired memory). See README and
+  the script itself.
 
-  Abweichender Wert: eine Zahl in /etc/iogpu-wired-limit.conf. Wird ebenfalls
-  geclampt.
+  Different value: a number in /etc/iogpu-wired-limit.conf. It is clamped too.
 
-  INSTALLATION (braucht sudo, aendert Systemzustand). Das Helper-Skript MUSS
-  root:wheel und 755 sein — ein LaunchDaemon laeuft als root, und ein
-  schreibbares Skript an dieser Stelle waere eine Rechteausweitung:
+  INSTALLATION (needs sudo, changes system state). The helper script MUST be
+  root:wheel and 755 -- a LaunchDaemon runs as root, and a writable script in
+  that location would be a privilege escalation:
 
-    sudo install -d -o root -g wheel -m 755 /usr/local/libexec
-    sudo install -o root -g wheel -m 755 set-iogpu-wired-limit.sh \
-         /usr/local/libexec/set-iogpu-wired-limit.sh
-    sudo install -o root -g wheel -m 644 com.local.iogpu-wired-limit.plist \
-         /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
-    sudo launchctl load -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+    sudo ./install-wired-limit-daemon.sh
 
-  Pruefen:      sysctl iogpu.wired_limit_mb
-                sudo /usr/local/libexec/set-iogpu-wired-limit.sh --dry-run
-                log show --last 5m --predicate 'process == "sysctl"'
-  Entfernen:    sudo launchctl unload -w /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
-                sudo rm /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
-                sudo rm /usr/local/libexec/set-iogpu-wired-limit.sh
-  Einmalig:     sudo ./set-iogpu-wired-limit.sh
+  Verify:      sysctl iogpu.wired_limit_mb
+               sudo /usr/local/libexec/set-iogpu-wired-limit.sh --dry-run
+               log show --last 5m --predicate 'process == "sysctl"'
+  Remove:      sudo ./install-wired-limit-daemon.sh --uninstall
+  One-off:     sudo ./set-iogpu-wired-limit.sh
 -->
 <plist version="1.0">
 <dict>

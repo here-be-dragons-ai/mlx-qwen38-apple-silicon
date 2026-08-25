@@ -1,23 +1,23 @@
 #!/usr/bin/env zsh
 # ─────────────────────────────────────────────────────────────────────────────
-# Prerequisites fuer Qwen3.8-27B auf MLX  –  Apple Silicon ab 32 GB
+# Prerequisites for Qwen3.8-27B on MLX  -  Apple Silicon, 32 GB and up
 #
-# Richtet von einem frischen macOS aus alles ein, was start-mlx_qwen3.8.sh
-# braucht: Xcode CLT → uv → venv (Python 3.12) → mlx-vlm + Patches → Modell +
-# MTP-Drafter → Verzeichnisse. Idempotent: erneut ausfuehrbar, bereits erledigte
-# Schritte werden uebersprungen, Downloads setzen fort.
+# Sets up everything start-mlx_qwen3.8.sh needs, starting from a fresh macOS:
+# Xcode CLT -> uv -> venv (Python 3.12) -> mlx-vlm + patches -> model + MTP
+# drafter -> directories. Idempotent: re-runnable, completed steps are skipped,
+# downloads resume.
 #
-# Verwendung:
-#   ./install-prereqs.sh                 # alles, mit gepinnten Versionen
-#   ./install-prereqs.sh --skip-model    # nur Software, kein 15-GB-Download
-#   ./install-prereqs.sh --latest        # neueste Versionen statt der gepinnten
-#   ./install-prereqs.sh --check         # nur pruefen, nichts aendern
+# Usage:
+#   ./install-prereqs.sh                 # everything, with pinned versions
+#   ./install-prereqs.sh --skip-model    # software only, no 15 GB download
+#   ./install-prereqs.sh --latest        # newest versions instead of the pinned ones
+#   ./install-prereqs.sh --check         # verify only, change nothing
 #
-# Env-Overrides:  MLX_HOME (Default ~/src/mlx), MLX_MODELS, PYTHON_VERSION
+# Env overrides:  MLX_HOME (default ~/src/mlx), MLX_MODELS, PYTHON_VERSION
 #
-# WAS DAS SKRIPT NICHT TUT: sudo. Das Wired-Limit (iogpu.wired_limit_mb) ist der
-# wichtigste Tuning-Schritt, aendert aber Systemzustand — die noetigen
-# Befehle werden am Ende nur AUSGEGEBEN, s. auch README.md.
+# WHAT THIS SCRIPT DOES NOT DO: sudo. The wired limit (iogpu.wired_limit_mb) is
+# the most important tuning step but changes system state -- the necessary
+# commands are only PRINTED at the end, see also README.md.
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -38,17 +38,17 @@ for a in "$@"; do
     --latest)     PINNED=0 ;;
     --check)      CHECK_ONLY=1 ;;
     -h|--help)    sed -n '2,25p' "$0"; exit 0 ;;
-    *) echo "Unbekannte Option: $a"; exit 1 ;;
+    *) echo "Unknown option: $a"; exit 1 ;;
   esac
 done
 
-# Gepinnter, auf einem M5 Pro / macOS 26 als funktionierend VERIFIZIERTER Stand
-# (2026-08-19). mlx-vlm 0.6.15 ist die Version, gegen die der Patch in
-# patches/ geschrieben ist. APC ist ab 0.6.13 upstream korrekt; der
-# Kurzprompt-Fix (PR #1901) ist ab 0.6.14 enthalten.
-# Mit --latest bekommt man Neueres; dann kann apply-patches.sh "KONFLIKT" melden
-# (heisst: upstream gemerged → Patch loeschen) und die Messwerte im Start-Skript
-# gelten nicht mehr unbesehen.
+# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-08-19).
+# mlx-vlm 0.6.15 is the version the patches in patches/ are written against. APC
+# is correct upstream from 0.6.13; the short-prompt fix (PR #1901) is included
+# from 0.6.14.
+# --latest gets you something newer; apply-patches.sh may then report "KONFLIKT"
+# (meaning: merged upstream -> delete the patch) and the measured values in the
+# start script no longer hold unexamined.
 PINS=(
   "mlx==0.32.1"
   "mlx-lm==0.31.3"
@@ -64,7 +64,7 @@ MODEL_DIR="$MLX_MODELS/Qwen3.8-27B-MLX-4bit"
 DRAFT_REPO="mlx-community/Qwen3.8-27B-MTP-4bit"
 DRAFT_DIR="$MLX_MODELS/Qwen3.8-27B-MTP-4bit"
 MODEL_ALIAS="${MODEL_ALIAS:-Qwen3.8-27B-local}"
-# Downloadgroesse: Modell ~15,0 GiB (3 Shards + Tokenizer), Drafter ~0,25 GiB.
+# Download size: model ~15.0 GiB (3 shards + tokenizer), drafter ~0.25 GiB.
 NEEDED_GB=20
 
 ok()   { echo "  ✓ $*" }
@@ -73,38 +73,39 @@ warn() { echo "  ⚠️  $*" >&2 }
 die()  { echo "  ✗ $*" >&2; exit 1 }
 
 echo "──────────────────────────────────────────────────────────────"
-echo "  Qwen3.8-27B / MLX  —  Setup fuer Apple Silicon (32 / 48 GB)"
-echo "  Ziel-venv : $VENV_DIR"
-echo "  Modelle   : $MLX_MODELS"
+echo "  Qwen3.8-27B / MLX  -  setup for Apple Silicon (32 / 48 GB)"
+echo "  Target venv : $VENV_DIR"
+echo "  Models      : $MLX_MODELS"
 echo "──────────────────────────────────────────────────────────────"
 
 # ── 1. Hardware/OS ────────────────────────────────────────────────────────────
 echo
 echo "[1/8] Hardware & macOS"
-[[ "$(uname -s)" == "Darwin" ]] || die "Kein macOS."
-[[ "$(uname -m)" == "arm64" ]]  || die "Kein Apple Silicon (uname -m = $(uname -m)). MLX braucht arm64."
+[[ "$(uname -s)" == "Darwin" ]] || die "Not macOS."
+[[ "$(uname -m)" == "arm64" ]]  || die "Not Apple Silicon (uname -m = $(uname -m)). MLX needs arm64."
 CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "?")
 RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 ok "$CHIP · ${RAM_GB} GB RAM · macOS $(sw_vers -productVersion)"
-# Empfehlung fuers Wired-Limit: RAM minus Reserve fuer macOS, absolut gerechnet
-# (6 GiB bis 32 GB RAM, 8 GiB darueber). Dieselbe Regel wie in
-# set-iogpu-wired-limit.sh — dort steht die Begruendung.
+# Wired-limit recommendation: RAM minus a reserve for macOS, computed in
+# absolute terms (6 GiB up to 32 GB of RAM, 8 GiB above). Same rule as in
+# set-iogpu-wired-limit.sh -- the rationale lives there.
 #
-# ACHTUNG, HIER STAND EIN GEFAEHRLICHER WERT: bis 2026-08-24 schlug dieser
-# Zweig fuer RAM >= 44 GB die 45056 vor. Das sind auf einer 48-GB-Maschine nur
-# 4 GiB Reserve, und genau an diesem Wert ist die Testmaschine am 2026-08-21 in
-# eine Kernel-Panik gelaufen (watchdog timeout, s. README). Zusaetzlich
-# widersprach der Vorschlag der plist, die 26624 setzte — zwei verschiedene
-# falsche Werte in einer Anleitung. Beides rechnet jetzt dasselbe Skript.
+# CAREFUL, A DANGEROUS VALUE USED TO LIVE HERE: until 2026-08-24 this branch
+# suggested 45056 for RAM >= 44 GB. On a 48 GB machine that is only 4 GiB of
+# reserve, and that exact value is what drove the test machine into a kernel
+# panic on 2026-08-21 (watchdog timeout, see README). It also contradicted the
+# plist, which set 26624 -- two different wrong values in one set of
+# instructions. Both now come from the same script.
 if (( RAM_GB <= 32 )); then
   WIRED_SUGGEST=$(( RAM_GB * 1024 - 6144 ))
 else
   WIRED_SUGGEST=$(( RAM_GB * 1024 - 8192 ))
 fi
-# Unter dem macOS-Default (2/3 des RAM) waere der Eingriff eine VERSCHLECHTERUNG.
-# Trifft nur sehr kleine Maschinen (16 GB: 10240 < 10922), die laut Warnung
-# unten ohnehin nicht tragen. set-iogpu-wired-limit.sh verweigert solche Werte —
-# hier gaebe es sonst einen Vorschlag, den das Skript danach ablehnt.
+# Below the macOS default (2/3 of RAM) the intervention would be a REGRESSION.
+# Only affects very small machines (16 GB: 10240 < 10922), which per the warning
+# below do not carry this model anyway. set-iogpu-wired-limit.sh refuses such
+# values -- otherwise there would be a suggestion here that the script then
+# rejects.
 _WIRED_FLOOR=$(( RAM_GB * 1024 * 2 / 3 ))
 (( WIRED_SUGGEST < _WIRED_FLOOR )) && WIRED_SUGGEST=$_WIRED_FLOOR
 if   (( RAM_GB >= 44 )); then PROFILE_HINT="roomy"
@@ -112,78 +113,78 @@ elif (( RAM_GB >= 32 )); then PROFILE_HINT="balanced"
 else                          PROFILE_HINT="lean"
 fi
 if (( RAM_GB < 32 )); then
-  warn "Nur ${RAM_GB} GB RAM. Die Gewichte allein belegen 15,2 GiB — unter 32 GB"
-  warn "bleibt kein brauchbarer Kontext. Kleineres Modell/Quant waehlen."
+  warn "Only ${RAM_GB} GB of RAM. The weights alone occupy 15.2 GiB -- below 32 GB"
+  warn "no usable context is left. Choose a smaller model/quant."
 elif (( RAM_GB == 32 )); then
-  info "32 GB: knapp, aber tragfaehig — Profil '$PROFILE_HINT'. S. README.md."
+  info "32 GB: tight but viable -- profile '$PROFILE_HINT'. See README.md."
 else
-  info "Profil '$PROFILE_HINT' passt zu dieser Maschine (PROFILE=auto waehlt es selbst)."
+  info "Profile '$PROFILE_HINT' fits this machine (PROFILE=auto picks it by itself)."
 fi
 FREE_GB=$(( $(df -k "$HOME" | awk 'NR==2{print $4}') / 1048576 ))
-info "Freier Plattenplatz: ${FREE_GB} GB (gebraucht: ~${NEEDED_GB} GB fuer Modell+Drafter,"
-info "dazu bis zu 40 GB fuer den APC-SSD-Cache — der Deckel steht im Start-Skript)"
-(( SKIP_MODEL == 1 || FREE_GB > NEEDED_GB )) || die "Zu wenig Plattenplatz."
+info "Free disk space: ${FREE_GB} GB (needed: ~${NEEDED_GB} GB for model+drafter,"
+info "plus up to 40 GB for the APC SSD cache -- the cap lives in the start script)"
+(( SKIP_MODEL == 1 || FREE_GB > NEEDED_GB )) || die "Not enough disk space."
 
 # ── 2. Xcode Command Line Tools ───────────────────────────────────────────────
 echo
 echo "[2/8] Xcode Command Line Tools"
 if xcode-select -p &>/dev/null; then
-  ok "vorhanden ($(xcode-select -p))"
+  ok "present ($(xcode-select -p))"
 else
-  warn "fehlen. Metal-Toolchain wird gebraucht. Installieren mit:"
+  warn "missing. The Metal toolchain is required. Install with:"
   echo "      xcode-select --install"
-  (( CHECK_ONLY == 1 )) || die "Erst CLT installieren, dann dieses Skript erneut."
+  (( CHECK_ONLY == 1 )) || die "Install the CLT first, then run this script again."
 fi
 
 # ── 3. uv ─────────────────────────────────────────────────────────────────────
 echo
-echo "[3/8] uv (Paket-/venv-Manager)"
+echo "[3/8] uv (package/venv manager)"
 if command -v uv &>/dev/null; then
   ok "uv $(uv --version | awk '{print $2}')"
 elif (( CHECK_ONLY == 1 )); then
-  warn "uv fehlt"
+  warn "uv missing"
 else
-  info "installiere uv nach ~/.local/bin (offizieller Installer von astral.sh)"
+  info "installing uv into ~/.local/bin (official installer from astral.sh)"
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
-  command -v uv &>/dev/null || die "uv-Installation fehlgeschlagen. Alternativ: brew install uv"
+  command -v uv &>/dev/null || die "uv installation failed. Alternative: brew install uv"
   ok "uv $(uv --version | awk '{print $2}')"
-  info "PATH-Eintrag fuer neue Shells:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+  info "PATH entry for new shells:  export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
 # ── 4. venv ───────────────────────────────────────────────────────────────────
 echo
 echo "[4/8] Virtualenv (Python $PYTHON_VERSION)"
 if (( CHECK_ONLY == 1 )); then
-  [[ -x "$VENV_PY" ]] && ok "$($VENV_PY -V)" || warn "venv fehlt: $VENV_DIR"
+  [[ -x "$VENV_PY" ]] && ok "$($VENV_PY -V)" || warn "venv missing: $VENV_DIR"
 else
   mkdir -p "$MLX_HOME" "$MLX_MODELS"
   if [[ -x "$VENV_PY" ]]; then
-    ok "vorhanden: $($VENV_PY -V)"
+    ok "present: $($VENV_PY -V)"
   else
     uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
-    ok "angelegt: $($VENV_PY -V)"
+    ok "created: $($VENV_PY -V)"
   fi
 fi
 
 # ── 5. Pakete ─────────────────────────────────────────────────────────────────
 echo
-echo "[5/8] mlx-vlm & Abhaengigkeiten"
+echo "[5/8] mlx-vlm & dependencies"
 if (( CHECK_ONLY == 1 )); then
-  [[ -x "$VENV_PY" ]] && "$VENV_PY" - <<'PY' || warn "venv fehlt"
+  [[ -x "$VENV_PY" ]] && "$VENV_PY" - <<'PY' || warn "venv missing"
 import importlib.metadata as m
 for p in ("mlx", "mlx-lm", "mlx-vlm", "transformers", "numpy", "huggingface-hub", "pillow"):
     try:
         print(f"  · {p:18s} {m.version(p)}")
     except Exception:
-        print(f"  ⚠️  {p:18s} FEHLT")
+        print(f"  ⚠️  {p:18s} MISSING")
 PY
 else
   if (( PINNED == 1 )); then
-    info "gepinnter Stand (--latest fuer neueste Versionen)"
+    info "pinned state (--latest for the newest versions)"
     VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" "${PINS[@]}"
   else
-    info "neueste Versionen"
+    info "newest versions"
     VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" -U mlx mlx-lm mlx-vlm transformers pillow
   fi
   ok "mlx-vlm $("$VENV_PY" -c 'import importlib.metadata as m;print(m.version("mlx-vlm"))')"
@@ -191,29 +192,29 @@ fi
 
 # ── 6. Metal-Check ────────────────────────────────────────────────────────────
 echo
-echo "[6/8] Metal / MLX-Selbsttest"
+echo "[6/8] Metal / MLX self-test"
 if [[ -x "$VENV_PY" ]]; then
   "$VENV_PY" - <<'PY'
 import mlx.core as mx
 
 GiB = 1 << 30
 a = mx.ones((512, 512), dtype=mx.float16)
-mx.eval(a @ a)                       # zwingt eine echte Metal-Kernel-Ausfuehrung
+mx.eval(a @ a)                       # forces a real Metal kernel execution
 info = mx.device_info()
 ws = info["max_recommended_working_set_size"] / GiB
 ram = info["memory_size"] / GiB
-print(f"  ✓ {info['device_name']} ({info['architecture']}), Matmul auf {mx.default_device()} ok")
-print(f"  · RAM {ram:.0f} GiB, Metal-Working-Set {ws:.1f} GiB")
-# 15,2 GiB Gewichte + 1,5 GiB Reserve; darunter bleibt fuer KV praktisch nichts.
+print(f"  ✓ {info['device_name']} ({info['architecture']}), matmul on {mx.default_device()} ok")
+print(f"  · RAM {ram:.0f} GiB, Metal working set {ws:.1f} GiB")
+# 15.2 GiB of weights + 1.5 GiB reserve; below that practically nothing is left for KV.
 if ws < 18:
-    print("  ⚠️  Working-Set < 18 GiB — Modell + Reserve passen nicht. wired_limit anheben!")
+    print("  ⚠️  Working set < 18 GiB -- model + reserve do not fit. Raise wired_limit!")
 elif ws < 24 and ram >= 30:
-    print("  ⚠️  Working-Set ist der macOS-Default (2/3 RAM). Mit")
+    print("  ⚠️  Working set is the macOS default (2/3 of RAM). With")
     print("      sudo sysctl -w iogpu.wired_limit_mb=26624")
-    print("      verdoppelt sich das Kontext-Budget. Details: README.md")
+    print("      the context budget doubles. Details: README.md")
 PY
 else
-  warn "uebersprungen (kein venv)"
+  warn "skipped (no venv)"
 fi
 
 # ── 7. Patches ────────────────────────────────────────────────────────────────
@@ -226,57 +227,57 @@ if [[ -x "$BUNDLE_DIR/patches/apply-patches.sh" && -x "$VENV_PY" ]]; then
     MLX_VENV_PY="$VENV_PY" "$BUNDLE_DIR/patches/apply-patches.sh"
   fi
 else
-  warn "patches/apply-patches.sh nicht ausfuehrbar oder venv fehlt"
+  warn "patches/apply-patches.sh not executable or venv missing"
 fi
 
 # ── 8. Modelle ────────────────────────────────────────────────────────────────
 echo
-echo "[8/8] Modellgewichte"
+echo "[8/8] Model weights"
 have_model() { [[ -f "$1/config.json" ]] }
 if (( SKIP_MODEL == 1 )); then
-  info "uebersprungen (--skip-model)"
+  info "skipped (--skip-model)"
 elif (( CHECK_ONLY == 1 )); then
-  have_model "$MODEL_DIR" && ok "Modell: $(du -shL "$MODEL_DIR" | cut -f1)" || warn "Modell fehlt: $MODEL_DIR"
-  have_model "$DRAFT_DIR" && ok "Drafter: $(du -shL "$DRAFT_DIR" | cut -f1)" || warn "Drafter fehlt: $DRAFT_DIR"
+  have_model "$MODEL_DIR" && ok "model: $(du -shL "$MODEL_DIR" | cut -f1)" || warn "model missing: $MODEL_DIR"
+  have_model "$DRAFT_DIR" && ok "drafter: $(du -shL "$DRAFT_DIR" | cut -f1)" || warn "drafter missing: $DRAFT_DIR"
 else
   if have_model "$MODEL_DIR"; then
-    ok "Modell vorhanden ($(du -shL "$MODEL_DIR" | cut -f1))"
+    ok "model present ($(du -shL "$MODEL_DIR" | cut -f1))"
   else
-    info "lade $MODEL_REPO (~15 GiB, resume-faehig, Ctrl-C jederzeit gefahrlos)"
+    info "downloading $MODEL_REPO (~15 GiB, resumable, Ctrl-C safe at any time)"
     "$BUNDLE_DIR/download-mlx-model.sh" "$MODEL_REPO" "$MODEL_DIR"
   fi
   if have_model "$DRAFT_DIR"; then
-    ok "MTP-Drafter vorhanden ($(du -shL "$DRAFT_DIR" | cut -f1))"
+    ok "MTP drafter present ($(du -shL "$DRAFT_DIR" | cut -f1))"
   else
-    info "lade $DRAFT_REPO (~0,25 GiB) — bringt +58..132 % Decode"
+    info "downloading $DRAFT_REPO (~0.25 GiB) -- worth +58..132% decode"
     "$BUNDLE_DIR/download-mlx-model.sh" "$DRAFT_REPO" "$DRAFT_DIR"
   fi
-  # Alias-Symlink: bei mlx-vlm IST der Request-Modellname der Ladepfad.
+  # Alias symlink: with mlx-vlm the request model name IS the load path.
   ln -sfn "$MODEL_DIR" "$MLX_MODELS/$MODEL_ALIAS"
-  ok "Alias-Symlink: $MLX_MODELS/$MODEL_ALIAS → $MODEL_DIR"
+  ok "alias symlink: $MLX_MODELS/$MODEL_ALIAS -> $MODEL_DIR"
 fi
 
-# ── Verzeichnisse ─────────────────────────────────────────────────────────────
+# ── Directories ───────────────────────────────────────────────────────────────
 if (( CHECK_ONLY == 0 )); then
   mkdir -p "${STATE_DIR:-$HOME/.mlx-qwen38}/logs" "${STATE_DIR:-$HOME/.mlx-qwen38}/apc"
 fi
 
 echo
 echo "──────────────────────────────────────────────────────────────"
-echo "  Fertig. Naechste Schritte:"
+echo "  Done. Next steps:"
 echo
-echo "  1) Wired-Limit anheben (WICHTIGSTER Schritt, braucht sudo):"
+echo "  1) Raise the wired limit (MOST IMPORTANT step, needs sudo):"
 echo "       sudo $BUNDLE_DIR/set-iogpu-wired-limit.sh          # ${RAM_GB} GB -> $WIRED_SUGGEST"
-echo "     Persistent (ueberlebt Neustarts — sysctl selbst tut das NICHT):"
+echo "     Persistent (survives reboots -- sysctl itself does NOT):"
 echo "       sudo $BUNDLE_DIR/install-wired-limit-daemon.sh"
-echo "     Der Daemon rechnet den Wert bei jedem Boot aus hw.memsize — kein"
-echo "     RAM-spezifischer Wert liegt irgendwo fest. Ein Aufruf statt vier"
-echo "     sudo-Zeilen: die brachen beim Kopieren um und liefen halb durch."
+echo "     The daemon computes the value from hw.memsize at every boot -- no"
+echo "     RAM-specific value is hardcoded anywhere. One call instead of four"
+echo "     sudo lines: those broke when pasted and half-completed."
 echo
-echo "  2) Server starten:"
+echo "  2) Start the server:"
 echo "       $BUNDLE_DIR/start-mlx_qwen3.8.sh"
-echo "     Das Start-Skript druckt das errechnete Kontext-Budget dieser Maschine."
+echo "     The start script prints this machine's computed context budget."
 echo
-echo "  3) Den Client auf das Budget einstellen (context_length,"
-echo "     max_tokens=8192) — Werte und Begruendung in README.md."
+echo "  3) Configure the client to the budget (context_length,"
+echo "     max_tokens=8192) -- values and rationale in README.md."
 echo "──────────────────────────────────────────────────────────────"
