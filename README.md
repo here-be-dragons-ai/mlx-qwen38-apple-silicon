@@ -991,7 +991,7 @@ against corrupt DFlash bonus tokens).
 > `0030` covers both.
 
 As soon as one of them is merged upstream, `apply-patches.sh` reports
-"KONFLIKT" — that is the signal to delete the file.
+"CONFLICT" — that is the signal to delete the file.
 
 In detail:
 
