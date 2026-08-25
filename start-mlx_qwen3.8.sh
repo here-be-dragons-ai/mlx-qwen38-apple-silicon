@@ -1,137 +1,132 @@
 #!/usr/bin/env zsh
 # ─────────────────────────────────────────────────────────────────────────────
-# mlx-vlm Server Start-Skript  –  Qwen3.8 27B (DENSE, MLX 4bit)
-# ZIELHARDWARE:  Apple Silicon ab 32 GB Unified Memory
+# mlx-vlm server start script  -  Qwen3.8 27B (DENSE, MLX 4bit)
+# TARGET HARDWARE:  Apple Silicon, 32 GB unified memory and up
 #
-# Die speicherrelevanten Parameter kommen aus PROFILE (s.u.):
-#     lean      32 GB ohne sudo   (Working-Set 21,3 GiB)   Peak ~18,8 GiB
-#     balanced  32 GB mit sysctl  (Working-Set 26 GiB)     Peak ~25,0 GiB
-#     roomy     48 GB             (Working-Set 44 GiB)     Peak ~30 GiB (ger.)
-#     auto      (Default) waehlt anhand des Working-Sets
+# The memory-relevant parameters come from PROFILE (see below):
+#     lean      32 GB without sudo  (working set 21.3 GiB)  peak ~18.8 GiB
+#     balanced  32 GB with sysctl   (working set 26 GiB)    peak ~25.0 GiB
+#     roomy     48 GB               (working set 40 GiB)    peak ~33 GiB (est.)
+#     auto      (default) picks based on the working set
 #
-# Die MESSWERTE in diesem Skript stammen alle von der 48-GB-Maschine (M5 Pro,
-# mlx-vlm 0.6.13/0.6.15), auf der das "roomy"-Profil ueber Wochen lief. Fuer 32 GB
-# uebernommen sind die hardwareunabhaengigen Erkenntnisse (MTP-SpecDec lohnt,
-# APC lohnt, KV-Fensterung halluziniert); die SPEICHER-Parameter sind gerechnet.
+# All MEASURED VALUES in this script come from the 48 GB machine (M5 Pro,
+# mlx-vlm 0.6.13/0.6.15) on which the "roomy" profile ran for weeks. What is
+# carried over to 32 GB are the hardware-independent findings (MTP spec-dec is
+# worth it, APC is worth it, KV windowing hallucinates); the MEMORY parameters
+# are computed.
 #
-# ── PASST DAS MODELL AUF 32 GB? JA — aber der Kontext ist das Nadeloehr. ─────
+# ── DOES THE MODEL FIT IN 32 GB? YES -- but context is the bottleneck. ───────
 #
-#   Gewichte        14,95 GiB (3 Shards, 4bit affine, group_size 64)
-#   MTP-Drafter      0,23 GiB (mlx-community/Qwen3.8-27B-MTP-4bit)
+#   weights         14.95 GiB (3 shards, 4bit affine, group_size 64)
+#   MTP drafter      0.23 GiB (mlx-community/Qwen3.8-27B-MTP-4bit)
 #   ──────────────────────────
-#   fix belegt      ~15,2 GiB   <- passt auch in den macOS-Default (s.u.)
+#   fixed          ~15.2 GiB   <- fits even in the macOS default (see below)
 #
-#   Dazu kommt PRO SEQUENZ UND PRO APC-SNAPSHOT:
-#     KV-Cache      64 KiB/Token  (16 Full-Attn-Layer x 4 KV-Heads x 512 x 2 B)
-#                                  mit KV_BITS=8: 32 KiB, mit KV_BITS=4: 16 KiB
-#     GDN-State    ~152 MiB fix   (48 Linear-Layer x 48 v-Heads x 128 x 128 x 4 B,
-#                                  mamba_ssm_dtype=float32; laengenunabhaengig)
+#   On top of that, PER SEQUENCE AND PER APC SNAPSHOT:
+#     KV cache      64 KiB/token  (16 full-attn layers x 4 KV heads x 512 x 2 B)
+#                                  with KV_BITS=8: 32 KiB, KV_BITS=4: 16 KiB
+#     GDN state    ~152 MiB fixed  (48 linear layers x 48 v-heads x 128 x 128 x 4 B,
+#                                  mamba_ssm_dtype=float32; length-independent)
 #
-#   Metals max_recommended_working_set_size ist auf Macs <= 36 GB per Default
-#   2/3 des RAM  →  32 GB = 21,33 GiB. Davon bleiben nach den Gewichten nur
-#   ~4,6 GiB fuer KV + Snapshots + Aktivierungen. Deshalb:
+#   Metal's max_recommended_working_set_size is 2/3 of RAM by default on Macs
+#   <= 36 GB  ->  32 GB = 21.33 GiB. After the weights, only ~4.6 GiB of that is
+#   left for KV + snapshots + activations. Hence:
 #
-#     OHNE sysctl (21,3 GiB Budget) :  ~23k Token Kontext  → Client-ctx 24576
-#     OHNE sysctl, dafuer KV_BITS=8 :  ~46k Token Kontext  → Client-ctx 32768
-#     MIT  sysctl 26624 MB (26 GiB) :  ~48k Token Kontext  → Client-ctx 49152
-#     MIT  sysctl + KV_BITS=8       :  ~97k Token Kontext  → Client-ctx 65536
+#     WITHOUT sysctl (21.3 GiB budget):  ~23k tokens context  -> client ctx 24576
+#     WITHOUT sysctl, but KV_BITS=8   :  ~46k tokens context  -> client ctx 32768
+#     WITH    sysctl 26624 MB (26 GiB):  ~48k tokens context  -> client ctx 49152
+#     WITH    sysctl + KV_BITS=8      :  ~97k tokens context  -> client ctx 65536
 #
-#   Das Skript RECHNET dieses Budget beim Start aus den echten Werten der
-#   laufenden Maschine aus und druckt es (Abschnitt "Speicherbudget") — die
-#   Zahlen oben sind nur die Erwartung fuer eine nackte 32-GB-Maschine.
+#   The script COMPUTES this budget at start from the real values of the running
+#   machine and prints it (the "memory budget" block) -- the numbers above are
+#   only the expectation for a bare 32 GB machine.
 #
-#   Wired-Limit setzen (nicht persistent, braucht sudo):
+#   Setting the wired limit (not persistent, needs sudo):
 #       sudo sysctl -w iogpu.wired_limit_mb=26624
-#   Persistent: com.local.iogpu-wired-limit.plist aus diesem Verzeichnis, s. README.
-#   NICHT hoeher als 26624 auf 32 GB — darunter braucht macOS selbst ~5-6 GB;
-#   wer die Grenze zu hoch setzt, tauscht Metal-OOM gegen Kernel-Panic/Beachball.
+#   Persistent: install-wired-limit-daemon.sh from this directory, see README.
+#   NOT higher than 26624 on 32 GB -- macOS itself needs ~5-6 GB below that;
+#   setting the limit too high trades a Metal OOM for a kernel panic/beachball.
 #
-# ── ERWARTETE GESCHWINDIGKEIT (GESCHAETZT, nicht auf M5-Basis gemessen) ──────
-#   Das Modell ist DENSE: jeder Decode-Schritt liest ~15 GiB → reine
-#   Bandbreitenfrage. M5 Basis hat ~153 GB/s, der gemessene M5 Pro deutlich
-#   mehr. Skaliert von den 48-GB-Messwerten (17,5-18,4 t/s Decode):
-#       Decode roh            ~8-10 t/s
-#       Decode mit MTP-SpecDec ~13-20 t/s bei Tool-Calls/JSON
-#                              (Acceptance dort gemessen 90-93 %, bei Prosa 42 %)
-#       Prefill               ~180-250 t/s (M5 Pro: 420-470 t/s, GPU-Cores/2)
-#   Folge fuer den Agent-Betrieb: ein KALTER 30k-Prefill dauert ~2-3 Minuten.
-#   Genau deshalb sind APC + SSD-Tier hier noch wichtiger als auf der 48-GB-Kiste
-#   (dort gemessen: 89 630 ms → 350 ms bei 36k Token, Faktor 256).
+# ── EXPECTED SPEED (ESTIMATED, not measured on an M5 base) ──────────────────
+#   The model is DENSE: every decode step reads ~15 GiB -> purely a bandwidth
+#   question. The M5 base has ~153 GB/s, the measured M5 Pro considerably more.
+#   Scaled from the 48 GB measurements (17.5-18.4 t/s decode):
+#       decode raw             ~8-10 t/s
+#       decode with MTP spec-dec ~13-20 t/s on tool calls/JSON
+#                              (acceptance measured 90-93% there, 42% on prose)
+#       prefill                ~180-250 t/s (M5 Pro: 420-470 t/s, GPU cores/2)
+#   Consequence for agent operation: a COLD 30k prefill takes ~2-3 minutes.
+#   Which is exactly why APC + the SSD tier matter even more here than on the
+#   48 GB box (measured there: 89,630 ms -> 350 ms at 36k tokens, factor 256).
 #
-# Voraussetzung: install-prereqs.sh gelaufen, Port 8888 frei.
+# Prerequisite: install-prereqs.sh has run, port 8888 is free.
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
-# ── Pfade (alle per Env ueberschreibbar; kein hartkodierter Benutzername) ─────
+# ── Paths (all overridable via env; no hardcoded user name) ───────────────────
 VENV_PY="${MLX_VENV_PY:-$HOME/src/mlx/.venv/bin/python}"
 MODELS_ROOT="${MLX_MODELS:-$HOME/src/mlx/models}"
 MODEL_DIR="${MODEL_DIR:-$MODELS_ROOT/Qwen3.8-27B-MLX-4bit}"
-# Laufzeitdaten: Log und SSD-Prefix-Cache. Wer sie woanders haben will, setzt
-# STATE_DIR — oder LOG_FILE / APC_DISK einzeln.
+# Runtime data: log and SSD prefix cache. To put them elsewhere, set STATE_DIR --
+# or LOG_FILE / APC_DISK individually.
 STATE_DIR="${STATE_DIR:-$HOME/.mlx-qwen38}"
 LOG_FILE="${LOG_FILE:-$STATE_DIR/logs/server.log}"
-# NICHT $HOST benutzen: zsh belegt diesen Parameter selbst mit dem Hostnamen,
-# ein "${HOST:-127.0.0.1}" wuerde den Server auf die LAN-Adresse binden.
+# Do NOT use $HOST: zsh occupies that parameter itself with the host name, so a
+# "${HOST:-127.0.0.1}" would bind the server to the LAN address.
 BIND_HOST="${BIND_HOST:-127.0.0.1}"
 PORT="${PORT:-8888}"
 
-# ── Modell-Alias ──────────────────────────────────────────────────────────────
-# mlx-vlm hat KEIN --alias: der "model"-String aus dem Request ist der LADEPFAD.
-# Weicht er vom Preload-Pfad ab, wirft der Server das geladene Modell weg und
-# startet ein snapshot_download() gegen HuggingFace (→ 401, obwohl lokal da).
-# Loesung: Symlink mit genau dem Alias-Namen neben das Modell, Server mit dem
-# RELATIVEN Namen vorladen (cd auf MODELS_ROOT am Ende des Skripts).
+# ── Model alias ───────────────────────────────────────────────────────────────
+# mlx-vlm has NO --alias: the "model" string from the request is the LOAD PATH.
+# If it differs from the preload path, the server discards the loaded model and
+# starts a snapshot_download() against HuggingFace (-> 401, even though it is
+# local). Solution: a symlink with exactly the alias name next to the model, and
+# preload the server with the RELATIVE name (cd to MODELS_ROOT at the end).
 MODEL_ALIAS="${MODEL_ALIAS:-Qwen3.8-27B-local}"
 
-# ── Profile ───────────────────────────────────────────────────────────────────
-# Ein Profil setzt nur DEFAULTS — jede einzeln gesetzte Env-Variable gewinnt
-# weiterhin, z. B.  PROFILE=lean APC_ENTRIES=2 ./start-mlx_qwen3.8.sh
+# ── Profiles ──────────────────────────────────────────────────────────────────
+# A profile only sets DEFAULTS -- every individually set env variable still
+# wins, e.g.  PROFILE=lean APC_ENTRIES=2 ./start-mlx_qwen3.8.sh
 #
-#   lean      Minimaler RAM. Peak ~18,8 GiB bei 29k-Spitzenprompt → passt unter
-#             das macOS-Default-Working-Set von 21,33 GiB, also OHNE sudo.
-#             Gerechnete Ersparnis gegenueber balanced (43k-Prompt):
-#               APC_ENTRIES 2→1 (3→2 Kopien)  -2,8 GiB   billigster Hebel: der
-#                  SSD-Tier bleibt, ein verdraengter Snapshot ist in 350 ms
-#                  zurueck statt in 90 s Vollprefill
-#               KV_BITS=8 (64→32 KiB/Token)   -4,2 GiB   Durchsatzkosten auf dem
-#                  MLX-Pfad NICHT gemessen — bei llama.cpp kostete KV-Quant an
-#                  vergleichbarer Stelle bis 8x Prefill. Vor Dauerbetrieb A/B.
-#               PREFILL_STEP 1024→512         ~-0,2 GiB  transienter Peak
+#   lean      Minimal RAM. Peak ~18.8 GiB at a 29k peak prompt -> fits under the
+#             macOS default working set of 21.33 GiB, i.e. WITHOUT sudo.
+#             Computed saving against balanced (43k prompt):
+#               APC_ENTRIES 2->1 (3->2 copies)  -2.8 GiB   cheapest lever: the
+#                  SSD tier remains, an evicted snapshot is back in 350 ms
+#                  instead of a 90 s full prefill
+#               KV_BITS=8 (64->32 KiB/token)    -4.2 GiB   throughput cost on the
+#                  MLX path NOT measured -- on llama.cpp, KV quant at a
+#                  comparable place cost up to 8x prefill. A/B before production.
+#               PREFILL_STEP 1024->512          ~-0.2 GiB  transient peak
 #
-#   balanced  32 GB mit angehobenem Wired-Limit (26624 MB). Peak ~25 GiB bei
-#             43k-Spitzenprompt, KV unquantisiert — kein ungemessener Trade-off.
-#             (Alias: "default", historischer Name.)
+#   balanced  32 GB with a raised wired limit (26624 MB). Peak ~25 GiB at a 43k
+#             peak prompt, KV unquantized -- no unmeasured trade-off.
+#             (Alias: "default", the historical name.)
 #
-#   roomy     48 GB. Das urspruengliche, ueber Wochen gefahrene M5-Pro-Setup:
-#             PREFILL_STEP 2048, VISION_CACHE 20, APC_DISK_MAX_GB 60.
-#             → braucht iogpu.wired_limit_mb=40960. NICHT 45056: das sind
-#               44 GiB auf 48 GiB, macOS bleiben ~2 GiB, und genau daran ist
-#               die Maschine am 2026-08-21 in eine Kernel-Panik gelaufen.
-#             APC_ENTRIES war hier bis 2026-08-20 auf 4 und ist jetzt 2: ein
-#             Snapshot ist so gross wie der Prompt (64 KiB/Token), bei 104k
-#             Token also 6,5 GiB — VIER davon sind 26 GiB und sprengen das
-#             Budget, sobald der Kontext wirklich ausgereizt wird. Mit 2 statt
-#             4 Eintraegen (3 statt 5 Kopien) steigt das Kontext-Budget bei
-#             44 GiB Working-Set von ~85k auf ~142k Token, der gerechnete Peak
-#             bei einem 90k-Prompt faellt von ~41 auf ~30 GiB. Preis: zwei
-#             statt vier Konversationen warm — der SSD-Tier holt eine
-#             verdraengte in ~350 ms zurueck statt in ~90 s Vollprefill.
+#   roomy     48 GB. The original M5 Pro setup, run for weeks:
+#             PREFILL_STEP 2048, VISION_CACHE 20, APC_DISK_MAX_GB 80.
+#             -> needs iogpu.wired_limit_mb=40960. NOT 45056: that is 44 GiB out
+#               of 48 GiB, leaving macOS ~2 GiB, and that is exactly what drove
+#               the machine into a kernel panic on 2026-08-21.
+#             APC_ENTRIES was 4 here until 2026-08-20, then 1, and is 3 since
+#             2026-08-24 (see the block above the profile). A snapshot is as
+#             large as the prompt (64 KiB/token), so 6.5 GiB at 104k tokens --
+#             FOUR of those are 26 GiB and blow the budget as soon as the context
+#             is really used. The current 3 rests on all clients running
+#             context_length 65536; see "WHY 3" below.
 #
-# Zu jedem Profil gehoert clientseitig ein passendes context_length — der Banner
-# druckt es, und weiter unten warnt das Skript, wenn die config.yaml darueber
-# liegt.
+# Each profile has a matching client-side context_length -- the banner prints it,
+# and further down the script warns when the config.yaml exceeds it.
 PROFILE="${PROFILE:-auto}"
-
-# auto: waehlt anhand des Metal-Working-Sets. Der wird hier ueber sysctl
-# geschaetzt statt ueber mx.device_info(), weil die Profil-Defaults gebraucht
-# werden, BEVOR das venv-Python laeuft (Modell-Load dauert). Regel:
-# iogpu.wired_limit_mb gewinnt, wenn gesetzt; sonst der macOS-Default (2/3 des
-# RAM bei <= 36 GB, sonst 3/4). Die exakte Zahl aus Metal steht spaeter im
-# Banner — weichen beide ab, gilt die aus dem Banner.
-# Der Working-Set wird IMMER berechnet, nicht nur bei PROFILE=auto: roomy
-# entscheidet unten anhand von _WIRED_MB, wieviele APC-Snapshots ins Budget
-# passen.
+# auto: picks based on the Metal working set. It is estimated via sysctl here
+# rather than mx.device_info(), because the profile defaults are needed BEFORE
+# the venv Python runs (loading the model takes a while). Rule:
+# iogpu.wired_limit_mb wins when set; otherwise the macOS default (2/3 of RAM at
+# <= 36 GB, else 3/4). The exact number from Metal appears in the banner later --
+# when the two differ, the banner is authoritative.
+# The working set is ALWAYS computed, not only at PROFILE=auto: roomy decides
+# below, based on _WIRED_MB, how many APC snapshots fit the budget.
 _RAM_MB=$(( $(sysctl -n hw.memsize) / 1048576 ))
 _WIRED_MB=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
 if [[ "${_WIRED_MB:-0}" -gt 0 ]]; then
@@ -147,241 +142,240 @@ if [[ "$PROFILE" == "auto" ]]; then
   elif [[ "$_WS_MB" -ge 24576 ]]; then PROFILE=balanced   # >= 24 GiB
   else                                 PROFILE=lean
   fi
-  _AUTO_NOTE=" (auto, Working-Set ~$(( _WS_MB / 1024 )) GiB)"
+  _AUTO_NOTE=" (auto, working set ~$(( _WS_MB / 1024 )) GiB)"
 else
   _AUTO_NOTE=""
 fi
 
 case "$PROFILE" in
-  # VISION_CACHE hier 1 und NICHT 0: VisionFeatureCache.put() prueft
-  # `len(cache) >= max_size` und ruft dann popitem() — bei max_size=0 also auf
-  # ein leeres OrderedDict, was den ersten Bild-Request mit KeyError killt.
-  # 1 ist das echte Minimum (vision_cache.py:60ff).
+  # VISION_CACHE is 1 here and NOT 0: VisionFeatureCache.put() checks
+  # `len(cache) >= max_size` and then calls popitem() -- at max_size=0 that is on
+  # an empty OrderedDict, which kills the first image request with a KeyError.
+  # 1 is the real minimum (vision_cache.py:60ff).
   lean)
     _APC_ENTRIES=1; _KV_BITS="8"; _PREFILL=512;  _VISION=1;  _APC_MAXGB=40; _APC_MINFREE=4.0; _CTX_HINT=32768 ;;
   balanced|default)
     PROFILE=balanced
     _APC_ENTRIES=2; _KV_BITS="";  _PREFILL=1024; _VISION=4;  _APC_MAXGB=40; _APC_MINFREE=4.0; _CTX_HINT=49152 ;;
-  # _CTX_HINT bleibt 98304, obwohl das Budget mit APC_ENTRIES=2 rechnerisch fuer
-  # 131072 reicht (3 Kopien, 44 GiB Working-Set → ~142k Token): die 142k galten
-  # nur MIT gesetztem wired_limit, und zwar mit den historischen 45056. Steht
-  # das Limit auf dem macOS-Default (48 GB → 37,4 GiB Working-Set), sind es
-  # ~107k, und 131072 waere wieder ueberbucht. 98304 traegt in beiden Faellen.
-  # Alle diese Zahlen sind UNFUSED gerechnet — mit aktivem Patch 0013 faellt der
-  # Prefill-Transient weg und die Budgets liegen deutlich hoeher (auf 37,4 GiB
-  # meldet das Banner ~161k). Massgeblich ist die Banner-Zeile, nicht dieser
-  # Kommentar. Wer 131072 fahren will,
-  # setzt erst das wired_limit UND APC_ENTRIES=2 (mit dem neuen Default 3 sind
-  # es nur ~109k) und prueft die Budgetzeile im Banner.
-  # APC_ENTRIES 3 STATT 2, ABER NUR MIT GESETZTEM WIRED-LIMIT.
-  # Gemessen am 2026-08-20 aus dem Produktivlog: 168 von 549 Prefills liefen
-  # kalt (30,6 %), 45 davon ueber 8k Token = 2415 s reine Prefill-Zeit. Die
-  # teuren Faelle sind KEINE neuen Konversationen — im Fenster 10:03-10:22 lief
-  # kein Serverneustart, trotzdem fielen drei Requests auf cached_tokens=0
-  # (50,4 s / 56,8 s / 70,7 s) zwischen lauter warmen Turns derselben Groesse.
-  # Das ist Verdraengung: mehr als zwei gleichzeitig aktive Konversationen auf
-  # zwei Snapshot-Plaetzen. Ein dritter Platz kostet eine KV-Kopie.
-  # Die Rechnung entscheidet, ob er passt (64 KiB/Token, +152 MiB GDN-State):
-  #   ohne wired_limit (48 GB → 36 GiB WS): 4 Kopien →  77k Token < 98304  NEIN
-  #   mit  wired_limit 40960 (40 GiB WS)  : 4 Kopien → ~97k Token           JA
-  # Deshalb haengt der Default am tatsaechlich gesetzten Limit statt an einer
-  # Annahme. Ohne Limit bleibt es bei 2 — sonst tauscht man kalte Prefills
-  # gegen "[METAL] Insufficient Memory", was der schlechtere Handel ist.
-  # Die Schwelle stand bis 2026-08-21 auf 45056. Das sind 44 GiB auf einer
-  # 48-GiB-Maschine, macOS bleiben ~2 GiB — an dem Wert ist die Maschine an
-  # jenem Tag in eine Kernel-Panik gelaufen (watchdog timeout, s. README).
-  # 40960 laesst macOS 8 GiB. Falls die Rechnung doch nicht aufgeht, kappt die
-  # Ueberbuchungs-Sperre weiter unten die Snapshot-Zahl.
+  # ── HISTORY OF THE roomy NUMBERS ───────────────────────────────────────────
+  # Kept because it explains why the current values are what they are. The
+  # figures below are UNFUSED and predate the mlx source build; with patch 0013
+  # active the prefill transient disappears and the budgets are considerably
+  # higher. The banner line is authoritative, not this comment.
   #
-  # PREFILL_STEP haengt ebenfalls am Wired-Limit, und zwar aus einem anderen
-  # Grund als APC_ENTRIES: head_dim ist 256, und mlx' Default-Dispatch laesst
-  # fused Full-Attention (bis 0.32.1) nur fuer 64/80/128 zu. Die 16
-  # Full-Attn-Layer materialisieren deshalb je einen Score-Tensor
-  # n_heads x qL x kL x 2 B — bei Chunk 2048 und 38k Kontext sind das 2,8 GiB
-  # PRO LAYER, und durch die verzoegerte Auswertung leben mehrere gleichzeitig.
-  # GEMESSEN auf 37,4 GiB Working-Set, kalter Prefill, Tier vorher geleert:
-  #   Chunk 2048               bis ~30k, danach [METAL] Insufficient Memory
-  #   Chunk 2048 + KV_BITS=8   bis ~30k  — KV halbieren bringt NICHTS, die
-  #                                        Grenze ist der Score-Tensor
-  #   Chunk  512               bis ~38k  ✓
-  # Ohne Limit also 512. Mit Limit bleibt 2048 — dort ist Luft, und groessere
-  # Chunks sind beim Prefill etwas effizienter.
-  # DAS GILT NUR UNFUSED. Seit dem mlx-Quellbau (0.32.2.dev, 2026-08-21) ist
-  # Patch 0013 scharf, der Score-Tensor faellt weg, und die 512 werden weiter
-  # unten auf 1024 angehoben — der NAX-Pfad aus PR #3842 verlangt qL >= 1024.
-  # Die Zeilen hier bleiben stehen, weil sie ohne Quellbau wieder gelten.
-  # ── APC_ENTRIES: 2, und der "Faktor 7" ist erledigt ────────────────────────
-  # Bis 2026-08-21 stand hier 3 ("sobald das Limit gesetzt ist"), danach
-  # konservativ 1. Begruendung fuer die 1 war der Speicher-Sampler vom
-  # 2026-08-21 (Working-Set 40 GiB, APC_ENTRIES=3, KV_BITS=8):
-  #   nach Modell+Drafter, idle   active = 15,96 GiB
-  #   nach 1 Request a 13.112 Tok active = 27,35 GiB   <- +11,4 statt 1,6 GiB
-  # Dieser "Faktor 7" IST AUFGEKLAERT und war kein Snapshot-Problem: 9,46 GiB
-  # davon sind der fixe Sockel aus _fused_quantized_linears() (Patch 0015,
-  # README "Der fixe Sockel"). 11,4 − 9,46 = 1,94 GiB gegen gerechnete 1,2–1,6 —
-  # das deckt sich. Der Sockel ist seit Patch 0015 abgeschaltet, `active` nach
-  # dem ersten Request liegt bei 16,70 statt 25,42 GiB, und einen Kriechgang pro
-  # Request gibt es nicht (Gegentest mit konstanter Laenge, Commit 72ba66c).
-  # Die Rechnung luegt also nicht mehr, und die 1 kostet messbar Prefill.
+  # _CTX_HINT was 98304 for a long time, with the argument that 131072 would only
+  # fit WITH wired_limit set (and with the historical 45056). At the macOS
+  # default (48 GB -> 37.4 GiB working set) it is ~107k, so 131072 would be
+  # overbooked, while 98304 carried in both cases.
+  # That argument is obsolete since 2026-08-24: _CTX_HINT is not a server limit,
+  # it is the input to the overbooking guard, and at 98304 that guard capped
+  # APC_ENTRIES to 1 no matter what was configured. See "WHY 3" below.
   #
-  # WAS DIE 1 KOSTET, aus server.log (810 Prefills, 118 Serverlaeufe):
-  #   warm 503 (62,1 %, 9,71 M Token wiederverwendet) · kalt 307 (37,9 %)
-  #   kalt <8k    184   602 s   (irrelevant)
-  #   kalt 8–20k   40  1128 s
-  #   kalt >20k    83  5331 s
-  #   ------------------------------------------  kalt >=8k = 107,7 min
-  # Diese 107,7 min zerfallen in ZWEI verschiedene Fehler, und nur der erste
-  # haengt an APC_ENTRIES:
-  #   72,7 min (81 Prefills) folgen im selben Serverlauf auf einen frueheren
-  #            grossen Request — das ist Verdraengung auf einem Snapshot-Platz
-  #            (in_flight=2 steht 5x im Log). Obergrenze: ein Teil davon sind
-  #            echte neue Konversationen, die kein Platz retten wuerde.
-  #   34,9 min (42 Prefills) sind der erste grosse Request ihres Laufs. Die
-  #            haette der DISK-Tier fangen muessen — genau den hat der
-  #            Namespace-Muell + die falsche Deckel-Rechnung kaputtgeraeumt
-  #            (19 Evictions im Log, s. APC-GC weiter unten). Anderer Fix.
+  # From 2026-08-20 to 2026-08-21, APC_ENTRIES was additionally coupled to the
+  # wired limit -- three snapshots instead of two as soon as the limit was set.
+  # That coupling is REVERTED. It rested on the budget calculation that the
+  # memory sampler disproved, and it had an unpleasant side effect: raising the
+  # limit gained 2.5 GiB of ceiling but doubled the snapshot count at the same
+  # time, a net regression.
+  # What the coupling was based on stays valid as a measurement, and it is the
+  # reason a third slot exists at all: on 2026-08-20 the production log showed
+  # 168 of 549 prefills running cold (30.6%), 45 of them above 8k tokens = 2415 s
+  # of pure prefill time. The expensive cases are NOT new conversations -- in the
+  # window 10:03-10:22 there was no server restart, yet three requests fell to
+  # cached_tokens=0 (50.4 s / 56.8 s / 70.7 s) between warm turns of the same
+  # size. That is eviction: more simultaneously active conversations than
+  # snapshot slots.
   #
-  # WARUM 3, UND WARUM _CTX_HINT DAFUER AUF 65536 MUSS.
-  # Hier stand am 2026-08-24 zuerst 2, gerechnet gegen _CTX_HINT=98304. Diese
-  # Rechnung war nicht falsch — sie beantwortete die falsche Frage. Denn:
+  # PREFILL_STEP also hangs on the wired limit, for a different reason than
+  # APC_ENTRIES: head_dim is 256, and mlx's default dispatch permits fused full
+  # attention (up to 0.32.1) only for 64/80/128. The 16 full-attn layers
+  # therefore each materialise a score tensor of n_heads x qL x kL x 2 B -- at
+  # chunk 2048 and 38k context that is 2.8 GiB PER LAYER, and delayed evaluation
+  # keeps several of them alive at once.
+  # MEASURED on a 37.4 GiB working set, cold prefill, tier cleared beforehand:
+  #   chunk 2048               up to ~30k, then [METAL] Insufficient Memory
+  #   chunk 2048 + KV_BITS=8   up to ~30k  -- halving KV changes NOTHING, the
+  #                                          limit is the score tensor
+  #   chunk  512               up to ~38k  ok
+  # So 512 without the limit. With the limit it stays 2048 -- there is room
+  # there, and larger chunks are somewhat more efficient during prefill.
+  # THIS APPLIES ONLY UNFUSED. Since the mlx source build (0.32.2.dev,
+  # 2026-08-21) patch 0013 is live, the score tensor disappears, and the 512 is
+  # raised to 1024 further down -- the NAX path from PR #3842 requires
+  # qL >= 1024. These lines stay because they apply again without a source build.
+  # ── APC_ENTRIES: 3, and the "factor 7" is resolved ─────────────────────────
+  # This said 3 until 2026-08-21 ("as soon as the limit is set"), then a
+  # conservative 1. The justification for the 1 was the memory sampler of
+  # 2026-08-21 (40 GiB working set, APC_ENTRIES=3, KV_BITS=8):
+  #   after model+drafter, idle    active = 15.96 GiB
+  #   after 1 request of 13,112 tk active = 27.35 GiB   <- +11.4 instead of 1.6
+  # That "factor 7" IS EXPLAINED and was not a snapshot problem: 9.46 GiB of it
+  # is the fixed floor from _fused_quantized_linears() (patch 0015, README "The
+  # fixed floor"). 11.4 - 9.46 = 1.94 GiB against a computed 1.2-1.6 -- that
+  # matches. The floor has been switched off since patch 0015, `active` after the
+  # first request is 16.70 instead of 25.42 GiB, and there is no creep per
+  # request (counter-test at constant length, commit 72ba66c).
+  # So the calculation no longer lies, and the 1 costs measurable prefill.
   #
-  #   mlx-vlm hat KEIN -c-Flag. Der Serverkontext kommt aus der config.json
-  #   (262144); der effektive Deckel ist ALLEIN das contextWindow des Clients
-  #   (s. Block "Client-Abgleich" unten). _CTX_HINT ist eine Empfehlung ans
-  #   Banner und der Eingabewert der Ueberbuchungs-Sperre — kein Serverlimit.
+  # WHAT THE 1 COSTS, from server.log (810 prefills, 118 server runs):
+  #   warm 503 (62.1%, 9.71 M tokens reused) · cold 307 (37.9%)
+  #   cold <8k    184   602 s   (irrelevant)
+  #   cold 8-20k   40  1128 s
+  #   cold >20k    83  5331 s
+  #   ------------------------------------------  cold >=8k = 107.7 min
+  # Those 107.7 min split into TWO different faults, and only the first hangs on
+  # APC_ENTRIES:
+  #   72.7 min (81 prefills) follow an earlier large request within the same
+  #            server run -- that is eviction on too few snapshot slots
+  #            (in_flight=2 appears 5x in the log). Upper bound: some of them are
+  #            genuinely new conversations that no slot would save.
+  #   34.9 min (42 prefills) are the first large request of their run. Those the
+  #            DISK tier should have caught -- and that is exactly what the
+  #            namespace garbage plus the wrong cap arithmetic destroyed
+  #            (19 evictions in the log, see APC GC further down). Different fix.
   #
-  # Alle drei pi-Instanzen (~/.pi/agent, ~/.pi/ea, ~/.pi/code) stehen auf
-  # contextWindow 65536. _CTX_HINT=98304 beschrieb also einen Client, den es
-  # nicht gibt, und verplante Speicher fuer Prompts, die niemand schickt.
+  # WHY 3, AND WHY _CTX_HINT HAS TO BE 65536 FOR IT.
+  # On 2026-08-24 this first said 2, computed against _CTX_HINT=98304. That
+  # calculation was not wrong -- it answered the wrong question. Because:
   #
-  # DIE FOLGE WAR STILL UND TEUER. Die Ueberbuchungs-Sperre weiter unten
-  # reduziert entries, solange ctx_hint > budget * 0,8. Nachgerechnet mit dem
-  # Budget-Block dieses Skripts (Working-Set 40,0 GiB, Gewichte 16,0 GiB,
-  # Patch 0013 aktiv), Feld entries_used:
-  #   _CTX_HINT   gesetzt   entries_used   Kopien   Budget
-  #     98304        2          1 (!)         2     182133
-  #     98304        3          1 (!)         2     182133
-  #     65536        2          2             3     120654
-  #     65536        3          3             4      89914
-  # Mit 98304 landet JEDE Einstellung bei 1 — die 2 vom Vormittag hat also nie
-  # gegriffen, und der Gewinn, um den es dabei ging (72,7 min kalte Prefills,
-  # s.o.), ist nie eingetreten. Das Skript warnt zwar, die Zeile geht im
-  # Startbanner unter.
+  #   mlx-vlm has NO -c flag. The server context comes from config.json
+  #   (262144); the effective ceiling is ONLY the client's contextWindow (see the
+  #   "client reconciliation" block below). _CTX_HINT is a recommendation for the
+  #   banner and the input to the overbooking guard -- not a server limit.
   #
-  # Mit _CTX_HINT=65536 traegt 3: 4 Kopien x (4,0 GiB + 152 MiB GDN) = 16,6 GiB
-  # + 16,70 GiB Basis = 33,3 von 38,0 GiB nutzbar, 4,7 GiB Luft. Das gibt jeder
-  # der drei Instanzen einen eigenen warmen Snapshot-Platz.
+  # All three pi instances (~/.pi/agent, ~/.pi/ea, ~/.pi/code) run contextWindow
+  # 65536. _CTX_HINT=98304 therefore described a client that does not exist, and
+  # reserved memory for prompts nobody sends.
   #
-  # DIE 3 HAENGT AN DEN CLIENTS. Wer eine Instanz auf 98304 hebt, muss
-  # APC_ENTRIES mit zurueckziehen — sonst kappt die Sperre still auf 1 und ALLE
-  # drei verlieren ihren warmen Platz. Massgeblich bleiben die mem-Zeilen im
-  # Log, nicht diese Rechnung.
+  # THE CONSEQUENCE WAS SILENT AND EXPENSIVE. The overbooking guard further down
+  # reduces entries while ctx_hint > budget * 0.8. Computed with this script's
+  # own budget block (40.0 GiB working set, 16.0 GiB weights, patch 0013 active),
+  # field entries_used:
+  #   _CTX_HINT     set    entries_used   copies   budget
+  #     98304        2          1 (!)        2     182133
+  #     98304        3          1 (!)        2     182133
+  #     65536        2          2            3     120654
+  #     65536        3          3            4      89914
+  # At 98304 EVERY setting ends up at 1 -- so the 2 set earlier that day never
+  # took effect, and the gain it was about (72.7 min of cold prefill, see above)
+  # never materialised. The script does warn, but the line is easy to miss in the
+  # start banner.
   #
-  # Nebenbefund derselben Messung: KV_BITS=8 greift den Verbraucher NICHT an.
-  # apc_adapters.py:515 ruft beim Snapshot-Store dequantize_for_apc() — der
-  # lebende Cache schrumpft auf 32 KiB/Token, die Snapshots bleiben f16 bei 64.
-  # Gekostet hat es 22,9 -> 18,7 tok/s Decode (Mittel aus 6 bzw. 8 Requests).
-  # Deshalb bleibt _KV_BITS hier leer.
+  # With _CTX_HINT=65536 the 3 holds: 4 copies x (4.0 GiB + 152 MiB GDN) =
+  # 16.6 GiB + 16.70 GiB base = 33.3 of 38.0 GiB usable, 4.7 GiB spare. That
+  # gives each of the three instances its own warm snapshot slot.
+  #
+  # THE 3 DEPENDS ON THE CLIENTS. Raising one instance to 98304 requires pulling
+  # APC_ENTRIES back with it -- otherwise the guard silently caps to 1 and ALL
+  # three lose their warm slot. The mem lines in the log stay authoritative, not
+  # this calculation.
+  #
+  # Side finding from the same measurement: KV_BITS=8 does NOT attack the
+  # consumer. apc_adapters.py:515 calls dequantize_for_apc() on snapshot store --
+  # the live cache shrinks to 32 KiB/token, the snapshots stay f16 at 64. It cost
+  # 22.9 -> 18.7 tok/s decode (mean of 6 and 8 requests respectively).
+  # That is why _KV_BITS stays empty here.
   roomy)
     _APC_ENTRIES=3
     if [[ "${_WIRED_MB:-0}" -ge 40960 ]]; then _PREFILL=2048; else _PREFILL=512; fi
     _KV_BITS="";  _VISION=20; _APC_MAXGB=80; _APC_MINFREE=2.0; _CTX_HINT=65536 ;;
   *)
-    echo "ERROR: unbekanntes PROFILE='$PROFILE' (gueltig: auto | lean | balanced | roomy)" >&2; exit 1 ;;
+    echo "ERROR: unknown PROFILE='$PROFILE' (valid: auto | lean | balanced | roomy)" >&2; exit 1 ;;
 esac
 
-# ── Das Wired-Limit fehlt: laut sagen ─────────────────────────────────────────
-# Der Rueckfall oben ist STILL. sysctl ist nicht persistent, und ohne den
-# LaunchDaemon steht nach jedem Reboot wieder der macOS-Default (48 GB -> 36864).
-# Dann faellt _PREFILL auf 512, und weil der NAX-Pfad aus PR #3842 qL >= 1024
-# verlangt, greift er nicht mehr — ohne dass irgendwo etwas auffaellt. Genau so
-# verliert man den Gewinn aus Patch 0013 zwischen zwei Neustarts.
+# ── The wired limit is missing: say so out loud ───────────────────────────────
+# The fallback above is SILENT. sysctl is not persistent, and without the
+# LaunchDaemon every reboot restores the macOS default (48 GB -> 36864). _PREFILL
+# then falls to 512, and because the NAX path from PR #3842 requires qL >= 1024
+# it no longer engages -- without anything standing out anywhere. That is exactly
+# how the gain from patch 0013 gets lost between two restarts.
 _WIRED_WANT=$(( _RAM_MB > 32768 ? _RAM_MB - 8192 : _RAM_MB - 6144 ))
 if [[ "$PROFILE" == "roomy" && "${_WIRED_MB:-0}" -lt 40960 ]]; then
-  echo "  ⚠️  iogpu.wired_limit_mb = ${_WIRED_MB:-<nicht gesetzt>} (< 40960)." >&2
-  echo "      Profil roomy laeuft damit im Sparmodus: PREFILL_STEP ${_PREFILL}" >&2
-  echo "      statt 2048, und der NAX-Pfad (qL >= 1024) greift nicht." >&2
-  echo "      Sofort:     sudo ./set-iogpu-wired-limit.sh        # -> ${_WIRED_WANT}" >&2
-  echo "      Persistent: s. com.local.iogpu-wired-limit.plist (sysctl allein" >&2
-  echo "                  ueberlebt keinen Reboot)." >&2
+  echo "  ⚠️  iogpu.wired_limit_mb = ${_WIRED_MB:-<not set>} (< 40960)." >&2
+  echo "      Profile roomy therefore runs in reduced mode: PREFILL_STEP ${_PREFILL}" >&2
+  echo "      instead of 2048, and the NAX path (qL >= 1024) does not engage." >&2
+  echo "      Now:        sudo ./set-iogpu-wired-limit.sh        # -> ${_WIRED_WANT}" >&2
+  echo "      Persistent: sudo ./install-wired-limit-daemon.sh (sysctl alone" >&2
+  echo "                  does not survive a reboot)." >&2
 fi
 
-# ── Speculative Decoding (MTP) ────────────────────────────────────────────────
-# DEFAULT AN. Auf der 48-GB-Maschine am 2026-08-17 durchgemessen:
-#   Durchsatz : Decode 16,9-18,3 → 26,9-41,5 t/s (+58..+132 %)
-#   Acceptance: 42 % Prosa, 90 % JSON, 93 % Tool-Call
-#   Qualitaet : 7/7 Antworten BIT-IDENTISCH zu ohne Drafter (temperature 0)
-#   APC       : ueberlebt (Turn 2 cached 3178 von 3217) — das cached_tokens=0-
-#               Problem aus mlx-vlm 0.6.12 existiert in 0.6.13 nicht mehr.
-# Fuer 32 GB besonders attraktiv: der Drafter kostet nur 0,23 GiB, der Gewinn
-# ist reiner Bandbreiten-Gewinn — und Bandbreite ist auf dem M5 Basis knapp.
+# ── Speculative decoding (MTP) ────────────────────────────────────────────────
+# ON BY DEFAULT. Measured through on the 48 GB machine on 2026-08-17:
+#   throughput: decode 16.9-18.3 -> 26.9-41.5 t/s (+58..+132%)
+#   acceptance: 42% prose, 90% JSON, 93% tool call
+#   quality   : 7/7 answers BIT-IDENTICAL to the run without a drafter (temp 0)
+#   APC       : survives (turn 2 cached 3178 of 3217) -- the cached_tokens=0
+#               problem from mlx-vlm 0.6.12 no longer exists in 0.6.13.
+# Especially attractive on 32 GB: the drafter costs only 0.23 GiB and the gain is
+# pure bandwidth -- and bandwidth is scarce on the M5 base.
 # Rollback: ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh
 ENABLE_SPEC_DECODE="${ENABLE_SPEC_DECODE:-1}"
 # DRAFT_KIND=mtp|dflash
-#   mtp     MTP-Kopf, 0,23 GiB. Frueherer Default, weiter gepflegt:
-#           +58..132 % Decode, Acceptance 90 % JSON / 93 % Tool-Call,
-#           Ausgabe 7/7 bit-identisch.
-#   dflash  DEFAULT seit 2026-08-20. DFlash 2 (z-lab), 1,01 GiB in 4bit.
-#           Gemessen gegen MTP bei identischen Prompts (Decode aus predicted_ms):
-#             JSON  37,8 -> 44,2 t/s   Code 35,8 -> 42,6   Langkontext 36,0 -> 40,8
-#             Prosa 29,8 -> 29,9 t/s   (dort liegt MTP bei der Acceptance vorn)
-#           Der Gewinn steckt also in STRUKTURIERTER Ausgabe — Tool-Calls, JSON,
-#           Code — und damit genau in der Agentenlast. Die Acceptance-RATE ist
-#           bei beiden gleich (Median 80 % vs 81 %); DFlash 2 draftet pro Runde
-#           mehr Token (block_size 4 statt 3) und gewinnt darueber.
-#           Block-Diffusion-Drafter mit
-#           Pfad-Selektor. Braucht den lokalen Patch 0020 — mlx-vlm selbst
-#           implementiert nur DFlash v1.
-#           ACHTUNG BLOCKGROESSE: der Checkpoint ist auf block_size 8 ausgelegt,
-#           z-lab empfiehlt fuer quantisierte MLX-Modelle aber <= 5, und die
-#           eigene Kernelmessung zeigt bei M=5 eine Dispatch-Klippe
-#           (M=1 5,7 ms, M=4 6,3 ms, M=5 7,4 ms). Default hier deshalb 4.
+#   mtp     MTP head, 0.23 GiB. Former default, still maintained:
+#           +58..132% decode, acceptance 90% JSON / 93% tool call,
+#           output 7/7 bit-identical.
+#   dflash  DEFAULT since 2026-08-20. DFlash 2 (z-lab), 1.01 GiB in 4bit.
+#           Measured against MTP on identical prompts (decode from predicted_ms):
+#             JSON  37.8 -> 44.2 t/s   code 35.8 -> 42.6   long ctx 36.0 -> 40.8
+#             prose 29.8 -> 29.9 t/s   (MTP is ahead on acceptance there)
+#           So the gain sits in STRUCTURED output -- tool calls, JSON, code --
+#           and therefore exactly in the agent workload. The acceptance RATE is
+#           the same for both (median 80% vs 81%); DFlash 2 drafts more tokens
+#           per round (block_size 4 instead of 3) and wins through that.
+#           A block-diffusion drafter with a path selector. Needs local patch
+#           0040 (the upstream PR #1959; it replaced the earlier own patch 0020)
+#           -- mlx-vlm itself implements only DFlash v1.
+#           CAREFUL WITH BLOCK SIZE: the checkpoint is designed for block_size 8,
+#           but z-lab recommends <= 5 for quantized MLX models, and our own
+#           kernel measurement shows a dispatch cliff at M=5
+#           (M=1 5.7 ms, M=4 6.3 ms, M=5 7.4 ms). Hence a default of 4 here.
 DRAFT_KIND="${DRAFT_KIND:-dflash}"
 case "$DRAFT_KIND" in
   mtp)    _DRAFT_DEFAULT="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit";      _BLOCK_DEFAULT="" ;;
   dflash) _DRAFT_DEFAULT="$MODELS_ROOT/Qwen3.8-27B-DFlash2-4bit";  _BLOCK_DEFAULT="4" ;;
-  *) echo "ERROR: unbekanntes DRAFT_KIND='$DRAFT_KIND' (gueltig: mtp | dflash)" >&2; exit 1 ;;
+  *) echo "ERROR: unknown DRAFT_KIND='$DRAFT_KIND' (valid: mtp | dflash)" >&2; exit 1 ;;
 esac
 DRAFT_MODEL="${DRAFT_MODEL:-$_DRAFT_DEFAULT}"
 DRAFT_BLOCK_SIZE="${DRAFT_BLOCK_SIZE-$_BLOCK_DEFAULT}"
 
-# ── Automatic Prefix Caching ──────────────────────────────────────────────────
-# Wiederverwendet den KV-Cache, wenn der neue Prompt den alten als Prefix
-# enthaelt (= jeder Folge-Turn). Seit mlx-vlm 0.6.13 upstream korrekt.
+# ── Automatic prefix caching ──────────────────────────────────────────────────
+# Reuses the KV cache when the new prompt contains the old one as a prefix
+# (= every follow-up turn). Correct upstream since mlx-vlm 0.6.13.
 ENABLE_APC="${ENABLE_APC:-1}"
-# 2 IN ALLEN PROFILEN (Qwen3.6 stand auf 8): ein Snapshot ist so gross wie der
-# Prompt, und dieses Modell braucht 64 KiB/Token. Jeder weitere Eintrag ist
-# direkt weniger Kontext — s. Budgetrechnung im Banner. Auch auf 48 GB kostet
-# der Sprung von 2 auf 4 rund ein Drittel des Budgets (142k → 85k Token), und
-# der Verlust bei einem Cache-Miss ist dank SSD-Tier klein (~350 ms Restore).
-# Zusammen mit APC_SINGLE=1 (unten) heisst 2 == zwei Konversationen warm.
+# PER PROFILE (1 / 2 / 3), where Qwen3.6 used to sit at 8: a snapshot is as large
+# as the prompt, and this model needs 64 KiB/token. Every additional entry is
+# directly less context -- see the budget calculation in the banner. Even on
+# 48 GB, going from 2 to 4 cost roughly a third of the budget (142k -> 85k
+# tokens), and the loss on a cache miss is small thanks to the SSD tier
+# (~350 ms restore).
+# Together with APC_SINGLE=1 (below), N means N conversations kept warm.
 APC_ENTRIES="${APC_ENTRIES:-$_APC_ENTRIES}"
-# SSD-Tier: ueberlebt Serverneustarts, gemessen Faktor 256 auf einen kalten
-# 36k-Prefill. Auf dieser Maschine noch wertvoller, weil der Prefill langsamer
-# ist. Preis: ~2,3 GB Schreiblast pro 36k-Konversation → Deckel unten.
+# SSD tier: survives server restarts, measured factor 256 on a cold 36k prefill.
+# Even more valuable on this machine because the prefill is slower. Price:
+# ~2.3 GB of write load per 36k conversation -> cap below.
 APC_DISK="${APC_DISK:-$STATE_DIR/apc}"
 APC_DISK_MAX_GB="${APC_DISK_MAX_GB:-$_APC_MAXGB}"
-# Der Deckel ist nur eine Obergrenze — er muss auch auf die Platte passen.
-# Gemessen am 2026-08-20: der Tier stand mit 58 GB exakt am 60-GB-Deckel und
-# raeumte bei praktisch jedem Store ("APC disk: evicted 6 shard(s); now 56341.8
-# MB / 64424.5 MB cap"). Damit ist die Rueckfallebene fuer verdraengte
-# RAM-Snapshots loechrig, und genau dann kostet ein Miss die vollen 50-70 s.
-# roomy geht deshalb auf 80 GB — aber nur soweit das Volume es traegt.
+# The cap is only an upper bound -- it also has to fit on the disk.
+# Measured on 2026-08-20: the tier sat at 58 GB, exactly at the 60 GB cap, and
+# evicted on practically every store ("APC disk: evicted 6 shard(s); now 56341.8
+# MB / 64424.5 MB cap"). That makes the fallback layer for evicted RAM snapshots
+# leaky, and precisely then a miss costs the full 50-70 s.
+# roomy therefore goes to 80 GB -- but only as far as the volume carries it.
 _APC_RESERVE_GB=25
 
-# ── Toter Namespace: GC ───────────────────────────────────────────────────────
-# apc.py:221 (apc_disk_namespace) fingerprintet den Verzeichnisnamen aus
-# Modellpfad, Adapter UND KV-Quantisierung. Jede Aenderung an KV_BITS legt also
-# einen NEUEN Namespace an — und mlx-vlm raeumt den alten NIE: der Store setzt
-# `self.dir = root/<namespace>` (apc.py:892) und _rebuild_index() globt nur
-# darin (apc.py:1113). Die Eviction sieht fremde Namespaces nicht.
-# GEFUNDEN am 2026-08-24: 10 GB in ...-0c1f0816 (Stand 21.8., der
-# KV_BITS=8-Hash aus der Sampler-Messung) neben 53 GB im aktiven ...-e063a74c,
-# auf einem Volume mit 91 % Fuellstand. Der Tier raeumt sich also am 80-GB-
-# Deckel des AKTIVEN Namespace kaputt, waehrend 10 GB tot daneben liegen.
-# Als aktiv gilt der Namespace mit der juengsten mtime; er wird nie geraeumt.
-# Ein laufender Server schreibt permanent, sein Verzeichnis ist damit immer das
-# juengste — deshalb ist die Regel auch gegen eine zweite Instanz robust.
+# ── Dead namespace: GC ────────────────────────────────────────────────────────
+# apc.py:221 (apc_disk_namespace) fingerprints the directory name from the model
+# path, the adapter AND the KV quantisation. Every change to KV_BITS therefore
+# creates a NEW namespace -- and mlx-vlm never reclaims the old one: the store
+# sets `self.dir = root/<namespace>` (apc.py:892) and _rebuild_index() only globs
+# inside it (apc.py:1113). Eviction cannot see foreign namespaces.
+# FOUND on 2026-08-24: 10 GB in ...-0c1f0816 (dated 21 Aug, the KV_BITS=8 hash
+# from the sampler measurement) next to 53 GB in the active ...-e063a74c, on a
+# volume that was 91% full. So the tier thrashes against the 80 GB cap of the
+# ACTIVE namespace while 10 GB sits dead beside it.
+# The namespace with the newest mtime counts as active; it is never collected.
+# A running server writes constantly, so its directory is always the newest --
+# which makes the rule robust against a second instance as well.
 APC_NS_KEEP_DAYS="${APC_NS_KEEP_DAYS:-3}"
 _ns_active=""
 if [[ -d "$APC_DISK" ]]; then
@@ -397,121 +391,120 @@ if [[ -d "$APC_DISK" ]]; then
     _now=$(date +%s); _freed_mb=0
     for _d in "${_ns_all[@]}"; do
       [[ "$_d" == "$_ns_active" ]] && continue
-      # Defensiv: nur unterhalb von $APC_DISK loeschen.
+      # Defensive: only delete below $APC_DISK.
       [[ "$_d" == "$APC_DISK"/?* ]] || continue
       _mt=$(stat -f %m "$_d" 2>/dev/null || echo 0)
-      # Ganztage, abgeschnitten — im Zweifel behalten statt loeschen.
+      # Whole days, truncated -- when in doubt keep rather than delete.
       _age_d=$(( (_now - _mt) / 86400 ))
-      # In MB, nicht GB: ein 400-MB-Namespace soll nicht als "0 GB" dastehen.
+      # In MB, not GB: a 400 MB namespace should not show up as "0 GB".
       _sz_mb=$(( $(du -sk "$_d" 2>/dev/null | cut -f1) / 1024 ))
       if (( _age_d >= APC_NS_KEEP_DAYS )); then
-        echo "  APC-GC: Namespace ${_d:t} (${_sz_mb} MB, ${_age_d} Tage inaktiv) entfernt" >&2
+        echo "  APC GC: removed namespace ${_d:t} (${_sz_mb} MB, ${_age_d} days inactive)" >&2
         rm -rf -- "$_d" && _freed_mb=$(( _freed_mb + _sz_mb ))
       else
-        echo "  Hinweis: APC-Namespace ${_d:t} (${_sz_mb} MB) ist inaktiv, aber erst" \
-             "${_age_d} Tage alt — bleibt stehen (APC_NS_KEEP_DAYS=${APC_NS_KEEP_DAYS})." >&2
-        echo "           Sofort raeumen: APC_NS_KEEP_DAYS=0 $ZSH_ARGZERO" >&2
+        echo "  Note: APC namespace ${_d:t} (${_sz_mb} MB) is inactive but only" \
+             "${_age_d} days old -- kept (APC_NS_KEEP_DAYS=${APC_NS_KEEP_DAYS})." >&2
+        echo "        Clean now: APC_NS_KEEP_DAYS=0 $ZSH_ARGZERO" >&2
       fi
     done
-    (( _freed_mb > 0 )) && echo "  APC-GC: ${_freed_mb} MB freigegeben." >&2
+    (( _freed_mb > 0 )) && echo "  APC GC: ${_freed_mb} MB freed." >&2
   fi
 fi
 
-# Der Deckel ist eine Obergrenze PRO NAMESPACE — nicht pro Volume. Deshalb darf
-# nur der AKTIVE Namespace als wiederverwendbar gelten: Bytes fremder
-# Namespaces zaehlt `df` schon als belegt, und die Eviction kann sie nicht
-# zurueckholen. Bis 2026-08-24 summierte `du -sk "$APC_DISK"` hier ALLE
-# Namespaces und ueberschaetzte den Spielraum um genau deren Groesse — auf
-# dieser Maschine um 10 GB (63 statt 53), also 125 statt korrekt 115 GB Deckel.
+# The cap is an upper bound PER NAMESPACE -- not per volume. Only the ACTIVE
+# namespace may therefore count as reusable: bytes of foreign namespaces are
+# already counted as occupied by `df`, and eviction cannot reclaim them. Until
+# 2026-08-24 `du -sk "$APC_DISK"` summed ALL namespaces here and overestimated
+# the headroom by exactly their size -- on this machine by 10 GB (63 instead of
+# 53), so a 125 GB cap instead of the correct 115.
 if [[ -n "$_ns_active" && -d "$_ns_active" ]]; then
   _apc_used_gb=$(( $(du -sk "$_ns_active" 2>/dev/null | cut -f1) / 1048576 ))
 else
   _apc_used_gb=0
 fi
-# df NACH dem GC, damit freigegebene Bytes mitzaehlen.
+# df AFTER the GC so that freed bytes are counted.
 _apc_free_gb=$(( $(df -k "${APC_DISK:h}" 2>/dev/null | tail -1 | awk '{print $4}') / 1048576 ))
 _apc_cap_max=$(( _apc_used_gb + _apc_free_gb - _APC_RESERVE_GB ))
 if [[ "$_apc_cap_max" -lt 10 ]]; then _apc_cap_max=10; fi
 if [[ "$APC_DISK_MAX_GB" -gt "$_apc_cap_max" ]]; then
-  echo "  Hinweis: APC_DISK_MAX_GB ${APC_DISK_MAX_GB} → ${_apc_cap_max} GB gekappt" \
-       "(nur ${_apc_free_gb} GB frei, ${_APC_RESERVE_GB} GB Reserve)" >&2
+  echo "  Note: APC_DISK_MAX_GB ${APC_DISK_MAX_GB} -> capped to ${_apc_cap_max} GB" \
+       "(only ${_apc_free_gb} GB free, ${_APC_RESERVE_GB} GB reserve)" >&2
   APC_DISK_MAX_GB=$_apc_cap_max
 fi
-# Der Disk-Tier restauriert nur, wenn noch so viel RAM frei ist. Upstream-Default
-# 2.0 ist fuer 32 GB zu knapp — ein Restore mitten in den Speicherdruck hinein
-# ist genau der Weg in "[METAL] Insufficient Memory".
+# The disk tier only restores while at least this much RAM is still free. The
+# upstream default of 2.0 is too tight for 32 GB -- a restore straight into
+# memory pressure is exactly the road to "[METAL] Insufficient Memory".
 APC_MIN_FREE_RAM_GB="${APC_MIN_FREE_RAM_GB:-$_APC_MINFREE}"
-# Unterdrueckt den redundanten Voll-Snapshot (getroffen wird immer der
-# Checkpoint bei len-16). Halbiert den APC-Speicher. Braucht den lokalen Patch
-# 0010 (patches/apply-patches.sh) — ohne ihn ist die Variable wirkungslos, das
-# Skript warnt dann.
+# Suppresses the redundant full snapshot (the checkpoint at len-16 is always the
+# one that hits). Halves APC memory. Needs local patch 0010
+# (patches/apply-patches.sh) -- without it the variable has no effect and the
+# script warns.
 APC_SINGLE="${APC_SINGLE:-1}"
 
-# ── Prefill / Slots ───────────────────────────────────────────────────────────
-# 1024 STATT 2048 (48-GB-Skript): der Prefill-Chunk bestimmt den transienten
-# Aktivierungs-Peak. Auf der 48-GB-Maschine wurde gemessen, dass der Prefill
-# rechen- und nicht chunklimitiert ist (2048 vs 4096: 94,6 s vs 94,2 s auf
-# denselben Prompt) — die Halbierung kostet also fast nichts und kauft
-# Kopffreiheit. Bei viel Luft im Budget: PREFILL_STEP=2048 ./start-...
-# Merken, ob der Wert vom Aufrufer kam: nur der Profil-Default darf unten
-# angehoben werden, wenn der fused Pfad die Chunk-Groesse entkoppelt.
+# ── Prefill / slots ───────────────────────────────────────────────────────────
+# 1024 INSTEAD OF 2048 (the 48 GB script): the prefill chunk determines the
+# transient activation peak. On the 48 GB machine it was measured that prefill is
+# compute-bound rather than chunk-bound (2048 vs 4096: 94.6 s vs 94.2 s on the
+# same prompt) -- so halving it costs almost nothing and buys headroom. With
+# plenty of budget: PREFILL_STEP=2048 ./start-...
+# Remember whether the value came from the caller: only the profile default may
+# be raised below when the fused path decouples the chunk size.
 _PREFILL_FROM_ENV=0
 [[ -n "${PREFILL_STEP:-}" ]] && _PREFILL_FROM_ENV=1
 PREFILL_STEP="${PREFILL_STEP:-$_PREFILL}"
-# 1 Slot. Auf einem dichten Modell wuerde Batch 2 im Aggregat fast linear
-# skalieren (gemeinsamer Gewichts-Read), aber jede zusaetzliche Sequenz kostet
-# einen kompletten KV-Satz + GDN-State — auf 32 GB nicht drin.
+# 1 slot. On a dense model, batch 2 would scale almost linearly in aggregate
+# (shared weight read), but every additional sequence costs a complete KV set +
+# GDN state -- not affordable on 32 GB.
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
-# 20 → 4: Vision-Features sind gecachte Bild-Embeddings, hier reine Speicherlast.
+# 20 -> 4: vision features are cached image embeddings, pure memory load here.
 VISION_CACHE="${VISION_CACHE:-$_VISION}"
 LOG_PROGRESS="${LOG_PROGRESS:-10}"
-# Sekunden zwischen zwei Speicher-Messungen im Log; 0 schaltet den Sampler ab.
-# Begruendung und Implementierung stehen unten beim exec.
+# Seconds between two memory measurements in the log; 0 disables the sampler.
+# Rationale and implementation are further down, at the exec.
 _MEM_PROBE_INTERVAL="${MEM_PROBE_INTERVAL:-5}"
 
-# ── KV-Quantisierung ──────────────────────────────────────────────────────────
-# DEFAULT AUS, aber der wichtigste Hebel dieser Maschine: KV_BITS=8 halbiert
-# 64 → 32 KiB/Token und verdoppelt damit den moeglichen Kontext.
+# ── KV quantisation ───────────────────────────────────────────────────────────
+# OFF BY DEFAULT, but the most important lever on this machine: KV_BITS=8 halves
+# 64 -> 32 KiB/token and thereby doubles the possible context.
 #     KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh
-# QUANT_KV_START laesst die ersten 8k Token unquantisiert — kurze Turns bleiben
-# damit voll schnell, nur lange zahlen die Dequantisierungskosten.
-# WARUM NICHT DEFAULT AN: Fuer llama.cpp/Qwen3.6 wurde 2026-08-11 gemessen, dass
-# KV-Quantisierung bis zu 8x Prefill und 1,9x Decode KOSTET (Dequant-Kosten
-# wachsen mit der KV-Laenge). Fuer den MLX-Pfad ist das NICHT nachgemessen. Auf
-# einer Maschine mit ~9 t/s Decode waere ein solcher Faktor fatal — also erst
-# messen, dann einschalten:
-#     A/B mit gleichem Prompt, Decode-t/s aus dem Log vergleichen.
-# Wenn der Kontext ohnehin <= 40k bleibt: aus lassen, nichts gewonnen.
-# ${VAR-...} ohne Doppelpunkt: nur wenn KV_BITS UNGESETZT ist, greift das Profil.
-# Leer ist hier ein gueltiger Wert (= f16), deshalb muss
+# QUANT_KV_START leaves the first 8k tokens unquantized -- short turns stay fully
+# fast, only long ones pay the dequantisation cost.
+# WHY NOT ON BY DEFAULT: for llama.cpp/Qwen3.6 it was measured on 2026-08-11 that
+# KV quantisation COSTS up to 8x prefill and 1.9x decode (dequant cost grows with
+# KV length). For the MLX path this has NOT been re-measured. On a machine with
+# ~9 t/s decode such a factor would be fatal -- so measure first, then enable:
+#     A/B with the same prompt, compare decode t/s from the log.
+# If the context stays <= 40k anyway: leave it off, nothing is gained.
+# ${VAR-...} without a colon: the profile applies only when KV_BITS is UNSET.
+# Empty is a valid value here (= f16), which is why
 #   PROFILE=lean KV_BITS= ./start-mlx_qwen3.8.sh
-# die Quantisierung wieder abschalten koennen.
+# must be able to switch quantisation back off.
 KV_BITS="${KV_BITS-$_KV_BITS}"
 KV_SCHEME="${KV_SCHEME:-}"
 QUANT_KV_START="${QUANT_KV_START:-8192}"
 
-# ── NICHT BENUTZEN: --max-kv-size ─────────────────────────────────────────────
-# mlx-vlm kann den KV-Cache hart deckeln (rotierendes Fenster). Das ist auf 32 GB
-# verlockend und trotzdem falsch: die aequivalente Idee (Gleitfenster nur auf den
-# 16 Full-Attn-Layern, GDN-State voll) wurde am 2026-08-17 mit needle_hybrid.py
-# WIDERLEGT — die Nadel ausserhalb des Fensters ging verloren, im 40-%-Fall
-# halluzinierte das Modell sogar eine falsche Zahl (8347 statt 8342). Lieber
-# kleiner Kontext + Kompaktierung im Agenten als ein stiller Qualitaetsverlust.
+# ── DO NOT USE: --max-kv-size ─────────────────────────────────────────────────
+# mlx-vlm can hard-cap the KV cache (rotating window). That is tempting on 32 GB
+# and still wrong: the equivalent idea (a sliding window only on the 16 full-attn
+# layers, GDN state complete) was DISPROVED on 2026-08-17 with needle_hybrid.py --
+# the needle outside the window was lost, and in the 40% case the model even
+# hallucinated a wrong number (8347 instead of 8342). A small context plus
+# compaction in the agent is better than a silent loss of quality.
 
-# ── Pruefungen ────────────────────────────────────────────────────────────────
+# ── Checks ────────────────────────────────────────────────────────────────────
 [[ -x "$VENV_PY" ]] || {
-  echo "ERROR: venv-Python nicht gefunden: $VENV_PY"
-  echo "       Erst einrichten:  ./install-prereqs.sh"
+  echo "ERROR: venv Python not found: $VENV_PY"
+  echo "       Set it up first:  ./install-prereqs.sh"
   exit 1
 }
 if [[ ! -f "$MODEL_DIR/config.json" ]]; then
-  echo "ERROR: Modell nicht gefunden: $MODEL_DIR"
+  echo "ERROR: model not found: $MODEL_DIR"
   echo "       ./download-mlx-model.sh mlx-community/Qwen3.8-27B-4bit $MODEL_DIR"
   exit 1
 fi
 
-# Vollstaendigkeit pruefen: alle in der Index-Datei referenzierten Shards da?
-# (Ein abgebrochener 15-GB-Download faellt sonst erst nach dem Modell-Load auf.)
+# Check completeness: are all shards referenced in the index file present?
+# (Otherwise an aborted 15 GB download only shows up after the model load.)
 if [[ -f "$MODEL_DIR/model.safetensors.index.json" ]]; then
   MISSING=$(python3 -c "
 import json,os
@@ -519,52 +512,52 @@ d=json.load(open('$MODEL_DIR/model.safetensors.index.json'))
 want=sorted(set(d['weight_map'].values()))
 print(' '.join(f for f in want if not os.path.exists(os.path.join('$MODEL_DIR',f))))")
   if [[ -n "$MISSING" ]]; then
-    echo "ERROR: Modell unvollstaendig — fehlende Shards: $MISSING"
+    echo "ERROR: model incomplete -- missing shards: $MISSING"
     echo "       ./download-mlx-model.sh mlx-community/Qwen3.8-27B-4bit $MODEL_DIR"
     exit 1
   fi
 fi
 
 if lsof -iTCP:$PORT -sTCP:LISTEN -n &>/dev/null; then
-  echo "WARNUNG: Port $PORT ist bereits belegt."
-  echo "  → mlx-vlm beenden:     pkill -f mlx_vlm.server"
-  echo "  → llama-server beenden: pkill -f llama-server"
+  echo "WARNING: port $PORT is already in use."
+  echo "  -> stop mlx-vlm:      pkill -f mlx_vlm.server"
+  echo "  -> stop llama-server: pkill -f llama-server"
   exit 1
 fi
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
-# ── Patch-Checks ──────────────────────────────────────────────────────────────
+# ── Patch checks ──────────────────────────────────────────────────────────────
 SITE_PACKAGES=$("$VENV_PY" -c "import mlx_vlm,os;print(os.path.dirname(os.path.dirname(mlx_vlm.__file__)))")
 MLX_VLM_VER=$("$VENV_PY" -c "import importlib.metadata as m;print(m.version('mlx-vlm'))" 2>/dev/null || echo "?")
 MLX_VER=$("$VENV_PY" -c "import importlib.metadata as m;print(m.version('mlx'))" 2>/dev/null || echo "?")
 
-# APC-Faehigkeit: ab 0.6.13 gibt es semantic_extra_hash(). Fehlt sie (Downgrade),
-# trifft der Prefix-Cache nur bei byte-identischen Prompts — kostet aber trotzdem
-# Speicher, und Speicher ist hier die knappe Ressource.
+# APC capability: semantic_extra_hash() exists from 0.6.13. If it is missing
+# (downgrade), the prefix cache only hits on byte-identical prompts -- while
+# still costing memory, and memory is the scarce resource here.
 if [[ "$ENABLE_APC" == "1" ]] && ! grep -q "def semantic_extra_hash" "$SITE_PACKAGES/mlx_vlm/apc.py" 2>/dev/null; then
-  echo "⚠️  WARNUNG: mlx-vlm $MLX_VLM_VER kennt semantic_extra_hash() nicht (< 0.6.13?)." >&2
-  echo "    Prefix-Caching greift dann NUR bei byte-identischen Prompts." >&2
+  echo "⚠️  WARNING: mlx-vlm $MLX_VLM_VER does not know semantic_extra_hash() (< 0.6.13?)." >&2
+  echo "    Prefix caching then hits ONLY on byte-identical prompts." >&2
   echo "    Fix:  uv pip install -U mlx-vlm" >&2
 fi
-# Patch 0010 (Einzel-Snapshot). Ohne ihn ist APC_SINGLE wirkungslos und der
-# Speicherbedarf pro Konversation doppelt so hoch wie unten gerechnet.
+# Patch 0010 (single snapshot). Without it APC_SINGLE has no effect and the
+# memory need per conversation is twice what is computed below.
 APC_SINGLE_OK=0
 grep -q "QWEN38_APC_SINGLE_SNAPSHOT" "$SITE_PACKAGES/mlx_vlm/generate/ar.py" 2>/dev/null && APC_SINGLE_OK=1
 if [[ "$APC_SINGLE" != "0" && "$APC_SINGLE_OK" == "0" ]]; then
-  echo "⚠️  WARNUNG: Patch 0010 fehlt — APC_SINGLE ist wirkungslos, jeder Request" >&2
-  echo "    legt ZWEI Snapshots ab (doppelter APC-Speicher, halber Kontext)." >&2
+  echo "⚠️  WARNING: patch 0010 missing -- APC_SINGLE has no effect, every request" >&2
+  echo "    stores TWO snapshots (double APC memory, half the context)." >&2
   echo "    Fix:  ./patches/apply-patches.sh" >&2
 fi
 
-# Patch 0013 (fused Full-Attention). head_dim ist 256, und ohne den fused Pfad
-# materialisiert JEDER der 16 full_attention-Layer einen Score-Transienten von
-# n_heads x qL x kL x 2 B. Bei 24 Heads, Chunk 512 und 23k Kontext sind das
-# 533 MiB pro Layer — das ist die echte Prefill-Decke, und sie taucht in der
-# KV-Budgetrechnung unten NICHT auf. Der Patch kann nur greifen, wenn mlx
-# force_fused ueberhaupt kennt (>= 0.32.2); darunter ist er absichtlich inert.
-# Deshalb der Laufzeit-Probe statt eines reinen grep: "Patch liegt im venv"
-# und "Pfad ist aktiv" sind hier zwei verschiedene Aussagen.
+# Patch 0013 (fused full attention). head_dim is 256, and without the fused path
+# EVERY one of the 16 full_attention layers materialises a score transient of
+# n_heads x qL x kL x 2 B. At 24 heads, chunk 512 and 23k context that is 533 MiB
+# per layer -- this is the real prefill ceiling, and it does NOT appear in the KV
+# budget calculation below. The patch can only take effect when mlx knows
+# force_fused at all (>= 0.32.2); below that it is deliberately inert.
+# Hence a runtime probe rather than a plain grep: "the patch is in the venv" and
+# "the path is active" are two different statements here.
 FUSED_OK=0
 _FUSED_PROBE=no
 _PATCH0013=0
@@ -582,82 +575,82 @@ except TypeError:
 fi
 
 if [[ "${QWEN38_FORCE_FUSED_SDPA:-1}" == "0" ]]; then
-  FUSED_STATUS="unfused (per QWEN38_FORCE_FUSED_SDPA=0 abgeschaltet)"
+  FUSED_STATUS="unfused (disabled via QWEN38_FORCE_FUSED_SDPA=0)"
 elif [[ "$_PATCH0013" == "0" ]]; then
-  FUSED_STATUS="unfused (Patch 0013 fehlt — ./patches/apply-patches.sh)"
+  FUSED_STATUS="unfused (patch 0013 missing -- ./patches/apply-patches.sh)"
 elif [[ "$_FUSED_PROBE" == "ok" ]]; then
-  FUSED_STATUS="fused (Patch 0013 aktiv)"
+  FUSED_STATUS="fused (patch 0013 active)"
   FUSED_OK=1
 else
-  FUSED_STATUS="unfused (Patch 0013 inert: mlx $MLX_VER kennt force_fused nicht, braucht >= 0.32.2)"
+  FUSED_STATUS="unfused (patch 0013 inert: mlx $MLX_VER has no force_fused, needs >= 0.32.2)"
 fi
 
-# ── Fusionierte Quantized-Linears (Patch 0015) ───────────────────────────────
-# _fused_quantized_linears() haelt eine ZWEITE, zusammenkopierte Fassung der
-# quantisierten Gewichte dauerhaft am Modul fest. Das ist der fixe Sockel, der
-# am 2026-08-21/22 die Sitzungen umgebracht hat: er entsteht beim ERSTEN
-# Generieren, ist von der Kontextlaenge unabhaengig (16 Token loesen ihn genauso
-# aus wie 44.452) und wird nie freigegeben.
-# GEMESSEN auf 40 GiB Working-Set, idle nach 5 Requests:
-#                     mit Fusion   ohne Fusion   Decode (Mittel aus je 5)
-#   mit SpecDecode      26,00 GiB     17,00 GiB   26,1 vs 25,7 tok/s
-#   ohne SpecDecode     17,08 GiB     14,96 GiB   18,4 vs 18,2 tok/s
-# 9 GiB gegen 1,5 %, und die Streuung beider Decode-Reihen ueberlappt
-# vollstaendig. Auf dieser Maschine ist der Speicher mehr wert.
-# Upstream-Verhalten zurueck:  QWEN38_FUSED_LINEARS=1 ./start-mlx_qwen3.8.sh
+# ── Fused quantized linears (patch 0015) ─────────────────────────────────────
+# _fused_quantized_linears() holds a SECOND, concatenated copy of the quantized
+# weights on the module permanently. That is the fixed floor which killed the
+# sessions on 2026-08-21/22: it appears on the FIRST generation, is independent
+# of context length (16 tokens trigger it just as much as 44,452) and is never
+# released.
+# MEASURED on a 40 GiB working set, idle after 5 requests:
+#                       with fusion   without fusion   decode (mean of 5 each)
+#   with spec decode      26.00 GiB       17.00 GiB     26.1 vs 25.7 tok/s
+#   without spec decode   17.08 GiB       14.96 GiB     18.4 vs 18.2 tok/s
+# 9 GiB against 1.5%, and the spread of both decode series overlaps completely.
+# On this machine the memory is worth more.
+# Back to upstream behaviour:  QWEN38_FUSED_LINEARS=1 ./start-mlx_qwen3.8.sh
 export QWEN38_FUSED_LINEARS="${QWEN38_FUSED_LINEARS:-0}"
-QLIN_STATUS="unfusioniert (Patch 0015, spart ~9 GiB)"
+QLIN_STATUS="unfused (patch 0015, saves ~9 GiB)"
 if ! grep -q "QWEN38_FUSED_LINEARS" \
      "$SITE_PACKAGES/mlx_vlm/models/qwen3_5/language.py" 2>/dev/null; then
-  QLIN_STATUS="fusioniert — Patch 0015 FEHLT (~9 GiB Sockel)"
+  QLIN_STATUS="fused -- patch 0015 MISSING (~9 GiB floor)"
   if [[ "$QWEN38_FUSED_LINEARS" == "0" ]]; then
-    echo "⚠️  WARNUNG: Patch 0015 fehlt — QWEN38_FUSED_LINEARS=0 ist wirkungslos." >&2
-    echo "    Der Server belegt ~9 GiB mehr als noetig. Fix: ./patches/apply-patches.sh" >&2
+    echo "⚠️  WARNING: patch 0015 missing -- QWEN38_FUSED_LINEARS=0 has no effect." >&2
+    echo "    The server occupies ~9 GiB more than necessary. Fix: ./patches/apply-patches.sh" >&2
   fi
 elif [[ "$QWEN38_FUSED_LINEARS" != "0" ]]; then
-  QLIN_STATUS="fusioniert (Upstream-Default, ~9 GiB Sockel)"
+  QLIN_STATUS="fused (upstream default, ~9 GiB floor)"
 fi
 
-# Mit fused Full-Attention faellt der Score-Transient weg — genau der Grund, aus
-# dem roomy ohne Wired-Limit auf Chunk 512 heruntergeht. Zusaetzlich verlangt der
-# NAX-Pfad (PR #3842) ausdruecklich qL >= 1024:
+# With fused full attention the score transient disappears -- exactly the reason
+# roomy drops to chunk 512 without a wired limit. On top of that the NAX path
+# (PR #3842) explicitly requires qL >= 1024:
 #   query_sequence_length >= 1024 && query_head_dim == 256 && do_causal
-# Bei 512 greift er also gar nicht erst. Nur den Profil-Default anheben, eine
-# explizite Vorgabe des Aufrufers bleibt unangetastet.
+# So at 512 it does not engage at all. Only raise the profile default; an
+# explicit value from the caller stays untouched.
 _PREFILL_NOTE=""
 if [[ "$FUSED_OK" == "1" && "$_PREFILL_FROM_ENV" == "0" && "$PREFILL_STEP" -lt 1024 ]]; then
-  _PREFILL_NOTE="  (512 → 1024: fused aktiv, NAX braucht qL >= 1024)"
+  _PREFILL_NOTE="  (512 -> 1024: fused active, NAX needs qL >= 1024)"
   PREFILL_STEP=1024
 fi
 
-# KV_BITS=8 war am 2026-08-21 kurzzeitig roomy-Default und ist wieder raus.
-# Die Ueberlegung war: mit fused Attention faellt der Score-Transient weg, also
-# dominieren die 64 KiB/Token, also halbieren. Der erste Teil stimmt, der
-# Schluss nicht — apc_adapters.py:515 ruft beim Snapshot-Store
-# dequantize_for_apc(), die APC-Snapshots liegen also weiter als f16 vor.
-# Quantisiert wird nur der lebende Cache, und der ist nicht der Verbraucher.
-# GEMESSEN: Decode 22,9 -> 18,7 tok/s (Mittel aus 6 bzw. 8 Requests), waehrend
-# active unveraendert bis 37,78 GiB kletterte und derselbe OOM kam.
-# Wer es trotzdem will:  KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh
+# KV_BITS=8 was briefly the roomy default on 2026-08-21 and is out again.
+# The reasoning was: with fused attention the score transient disappears, so the
+# 64 KiB/token dominate, so halve them. The first part is right, the conclusion
+# is not -- apc_adapters.py:515 calls dequantize_for_apc() on snapshot store, so
+# the APC snapshots remain f16. Only the live cache is quantized, and that is not
+# the consumer.
+# MEASURED: decode 22.9 -> 18.7 tok/s (mean of 6 and 8 requests respectively),
+# while active climbed to 37.78 GiB unchanged and the same OOM arrived.
+# For anyone who wants it anyway:  KV_BITS=8 QUANT_KV_START=8192 ./start-...
 
-# ── Drafter pruefen ───────────────────────────────────────────────────────────
-# DFlash 2 haengt an zwei Patches. Fehlt 0040 (= Upstream-PR #1959), wuerde der
-# Server beim Laden des Drafters hart abbrechen (unerwartete Gewichte) —
-# deshalb hier abfangen und auf MTP zurueckfallen, statt den Start zu verlieren.
-# Der Marker candidate_selector trifft sowohl den fruehreren eigenen Patch 0020
-# als auch die Upstream-Fassung, die ihn ersetzt hat.
+# ── Check the drafter ─────────────────────────────────────────────────────────
+# DFlash 2 hangs on two patches. If 0040 (= upstream PR #1959) is missing, the
+# server would abort hard while loading the drafter (unexpected weights) --
+# so catch it here and fall back to MTP rather than losing the start.
+# The candidate_selector marker matches both the earlier own patch 0020 and the
+# upstream version that replaced it.
 if [[ "$DRAFT_KIND" == "dflash" && "$ENABLE_SPEC_DECODE" != "0" ]]; then
   if ! grep -q "candidate_selector" \
        "$SITE_PACKAGES/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py" 2>/dev/null; then
-    echo "⚠️  WARNUNG: Patch 0040 fehlt — DFlash 2 nicht ladbar, falle auf MTP zurueck." >&2
+    echo "⚠️  WARNING: patch 0040 missing -- DFlash 2 not loadable, falling back to MTP." >&2
     echo "    Fix:  ./patches/apply-patches.sh" >&2
     DRAFT_KIND=mtp
     DRAFT_MODEL="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit"
     DRAFT_BLOCK_SIZE=""
   elif ! grep -q "_speculative_batch_path_enabled" \
          "$SITE_PACKAGES/mlx_vlm/server/generation.py" 2>/dev/null; then
-    echo "⚠️  WARNUNG: Patch 0021 fehlt — unter dflash greift dann KEIN Prefix-Cache" >&2
-    echo "    (jeder Turn zahlt den vollen Prefill). Fix:  ./patches/apply-patches.sh" >&2
+    echo "⚠️  WARNING: patch 0021 missing -- under dflash NO prefix cache applies" >&2
+    echo "    (every turn pays the full prefill). Fix:  ./patches/apply-patches.sh" >&2
   fi
 fi
 
@@ -666,7 +659,7 @@ if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   if [[ -f "$DRAFT_MODEL/config.json" ]]; then
     SPEC_STATUS="ON"
   else
-    echo "  WARNUNG: Drafter nicht gefunden ($DRAFT_MODEL) — starte OHNE SpecDec."
+    echo "  WARNING: drafter not found ($DRAFT_MODEL) -- starting WITHOUT spec-dec."
     if [[ "$DRAFT_KIND" == "dflash" ]]; then
       echo "           ./download-mlx-model.sh z-lab/Qwen3.8-27B-DFlash2 ${MODELS_ROOT}/Qwen3.8-27B-DFlash2-bf16"
       echo "           ./convert-dflash2-drafter.py ${MODELS_ROOT}/Qwen3.8-27B-DFlash2-bf16 $DRAFT_MODEL"
@@ -677,22 +670,22 @@ if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   fi
 fi
 
-# ── Alias-Symlink setzen ──────────────────────────────────────────────────────
+# ── Set the alias symlink ─────────────────────────────────────────────────────
 ALIAS_LINK="$MODELS_ROOT/$MODEL_ALIAS"
 if [[ -e "$ALIAS_LINK" && ! -L "$ALIAS_LINK" ]]; then
-  echo "ERROR: $ALIAS_LINK existiert und ist KEIN Symlink — bitte pruefen/entfernen." >&2
+  echo "ERROR: $ALIAS_LINK exists and is NOT a symlink -- please check/remove it." >&2
   exit 1
 fi
 ln -sfn "$MODEL_DIR" "$ALIAS_LINK"
 
-# ── Speicherbudget ausrechnen ─────────────────────────────────────────────────
-# Rechnet mit den ECHTEN Werten dieser Maschine statt mit den Annahmen im Kopf
-# des Skripts: Metal-Working-Set (folgt iogpu.wired_limit_mb), tatsaechliche
-# Dateigroessen, gewaehlte KV-Bits, gewaehlte APC-Eintraege.
+# ── Compute the memory budget ─────────────────────────────────────────────────
+# Computes with the REAL values of this machine rather than the assumptions in
+# the script header: Metal working set (follows iogpu.wired_limit_mb), actual
+# file sizes, the chosen KV bits, the chosen APC entries.
 WEIGHTS_KB=$(du -skL "$MODEL_DIR" | cut -f1)
 DRAFT_KB=0
 [[ "$ENABLE_SPEC_DECODE" != "0" ]] && DRAFT_KB=$(du -skL "$DRAFT_MODEL" | cut -f1)
-# mlx-vlm hat kein -c-Flag: der native Kontext steht in der config.json.
+# mlx-vlm has no -c flag: the native context is in config.json.
 MODEL_CTX=$(python3 -c "
 import json
 d=json.load(open('$MODEL_DIR/config.json'))
@@ -713,16 +706,17 @@ ws = info["max_recommended_working_set_size"]
 ram = info["memory_size"]
 
 weights = (int(os.environ["WEIGHTS_KB"]) + int(os.environ["DRAFT_KB"])) * 1024
-# Aktivierungen, Metal-Heap-Fragmentierung, Tokenizer, Python. Erfahrungswert von
-# der 48-GB-Maschine (RSS-Leerlauf 15,5 GiB bei 15,2 GiB Gewichten, Peak waechst
-# mit dem Prompt) — bewusst grosszuegig, weil Unterschaetzen hier OOM heisst.
+# Activations, Metal heap fragmentation, tokenizer, Python. Empirical value from
+# the 48 GB machine (RSS 15.5 GiB at idle with 15.2 GiB of weights, the peak
+# grows with the prompt) -- deliberately generous, because underestimating here
+# means OOM.
 reserve = int(1.5 * GiB)
 
 kv_bits = os.environ.get("KV_BITS") or ""
 per_tok = 16 * 4 * (256 + 256) * 2                      # 65536 B, f16
 if kv_bits:
     per_tok = int(per_tok * float(kv_bits) / 16.0)
-# GDN/Mamba-State: 48 Linear-Layer x 48 v-Heads x 128 (k) x 128 (v) x 4 B (float32)
+# GDN/Mamba state: 48 linear layers x 48 v-heads x 128 (k) x 128 (v) x 4 B (float32)
 recurrent = 48 * 48 * 128 * 128 * 4
 
 apc_on = os.environ["ENABLE_APC"] == "1"
@@ -730,39 +724,39 @@ entries_req = int(os.environ["APC_ENTRIES"]) if apc_on else 0
 model_ctx = int(os.environ.get("MODEL_CTX") or 0)
 ctx_hint = int(os.environ.get("CTX_HINT") or 0)
 
-# APC_EXACT_CACHE_ENTRIES deckelt die Zahl der Snapshots, nicht die Bytes — der
-# Speicherbedarf ist also entries * Promptlaenge, unabhaengig von Patch 0010.
-# Der Patch aendert nur, WIE VIELE KONVERSATIONEN in diese Eintraege passen
-# (mit: eine pro Eintrag, ohne: eine pro zwei Eintraegen).
-# ── Prefill-Transient ─────────────────────────────────────────────────────────
-# Der bis 2026-08-21 fehlende Posten, und der Grund fuer "[METAL] Insufficient
-# Memory" trotz scheinbar reichlichem Budget. Gilt nur noch OHNE Quellbau —
-# mit aktivem Patch 0013 ist der Posten null (FUSED_OK-Zweig unten).
+# APC_EXACT_CACHE_ENTRIES caps the number of snapshots, not the bytes -- so the
+# memory need is entries * prompt length, independent of patch 0010. The patch
+# only changes HOW MANY CONVERSATIONS fit into those entries (with it: one per
+# entry, without: one per two entries).
+# ── Prefill transient ─────────────────────────────────────────────────────────
+# The item that was missing until 2026-08-21, and the reason for "[METAL]
+# Insufficient Memory" despite an apparently ample budget. Applies only WITHOUT
+# the source build -- with patch 0013 active the item is zero (FUSED_OK branch
+# below).
 #
-# head_dim ist 256. mlx' Default-Dispatch laesst fused Full-Attention nur fuer
-# 64/80/128 zu (bis 0.32.1), die 16 Full-Attn-Layer laufen also auf dem unfused
-# Graph und materialisieren je Layer einen Score-Tensor von
-# n_heads x qL x kL x 2 B. Bei PREFILL_STEP 2048 und 38k Kontext sind das
-# 2,8 GiB — PRO LAYER. Durch die verzoegerte Auswertung sind mehrere davon
-# gleichzeitig lebendig.
+# head_dim is 256. mlx's default dispatch permits fused full attention only for
+# 64/80/128 (up to 0.32.1), so the 16 full-attn layers run on the unfused graph
+# and each materialise a score tensor of n_heads x qL x kL x 2 B. At
+# PREFILL_STEP 2048 and 38k context that is 2.8 GiB -- PER LAYER. Delayed
+# evaluation keeps several of them alive at once.
 #
-# INFLIGHT = 16, die Zahl der Full-Attention-Layer: unter verzoegerter
-# Auswertung kann im schlechtesten Fall jeder von ihnen seinen Score-Tensor
-# gleichzeitig halten.
-# GEGENGEPRUEFT auf 37,4 GiB Working-Set (kalter Prefill, Tier vorher geleert):
-#   Chunk  512  gerechnet ~40k   gemessen bis ~38k durch, darueber OOM
-#   Chunk 2048  gerechnet ~12k   gemessen bis ~30k durch
-# Bei grossen Chunks ist die Rechnung also zu vorsichtig — das ist die richtige
-# Fehlerrichtung. Unterschaetzen heisst hier Absturz mitten im Betrieb, und der
-# kommt nicht als sauberer Fehler, sondern als
+# INFLIGHT = 16, the number of full-attention layers: under delayed evaluation
+# each of them may hold its score tensor at the same time in the worst case.
+# CROSS-CHECKED on a 37.4 GiB working set (cold prefill, tier cleared first):
+#   chunk  512  computed ~40k   measured through to ~38k, OOM above that
+#   chunk 2048  computed ~12k   measured through to ~30k
+# So at large chunks the calculation is too cautious -- which is the right
+# direction to err. Underestimating here means a crash mid-operation, and it does
+# not arrive as a clean error but as
 # "[METAL] Command buffer execution failed: Insufficient Memory".
-# Faellt weg, sobald mlx 0.32.2 + Patch 0013 den fused Pfad liefern — genau das
-# ist seit dem Source-Build vom 2026-08-21 der Fall, deshalb der FUSED_OK-Zweig.
-# GEMESSEN mit mlx 0.32.2.dev+a082cb91, Produktionsform qL=512 / kL=22747,
-# 24 Heads / 4 KV-Heads / head_dim 256:
-#   force_fused=False : Peak 662 MiB   (Differenz 539 MiB = der Score-Tensor)
-#   force_fused=True  : Peak 123 MiB
-# Mit fused Pfad ist der Posten damit nicht "kleiner", sondern weg.
+# The item disappears as soon as mlx 0.32.2 + patch 0013 provide the fused path --
+# which is the case since the source build of 2026-08-21, hence the FUSED_OK
+# branch.
+# MEASURED with mlx 0.32.2.dev+a082cb91, production shape qL=512 / kL=22747,
+# 24 heads / 4 KV heads / head_dim 256:
+#   force_fused=False : peak 662 MiB   (difference 539 MiB = the score tensor)
+#   force_fused=True  : peak 123 MiB
+# With the fused path the item is therefore not "smaller" but gone.
 INFLIGHT = 16
 n_heads = 24
 prefill_step = int(os.environ.get("PREFILL_STEP") or 2048)
@@ -772,26 +766,29 @@ else:
     transient_per_tok = INFLIGHT * n_heads * prefill_step * 2
 
 def budget(entries):
-    cop = 1 + entries                                    # 1 live + Snapshots
+    cop = 1 + entries                                    # 1 live + snapshots
     av = ws - weights - reserve - cop * recurrent
-    # Der Transient waechst mit der Kontextlaenge, nicht mit der Kopienzahl.
+    # The transient grows with the context length, not with the number of copies.
     tok = int(av / (cop * per_tok + transient_per_tok)) if av > 0 else 0
     if model_ctx:
         tok = min(tok, model_ctx)
     return cop, av, tok
 
-# ── Ueberbuchung verhindern ───────────────────────────────────────────────────
-# Ein Profil ist fuer einen bestimmten Working-Set gedacht (roomy fuer 44 GiB
-# mit gesetztem wired_limit). Steht das Limit nicht, waehlt PROFILE=auto
-# trotzdem roomy — und dann passt die Snapshot-Zahl nicht mehr zum Speicher.
-# Symptom ist kein sauberer Fehler, sondern
-# "[METAL] Command buffer execution failed: Insufficient Memory" mitten im
-# Betrieb, oft erst nach mehreren Requests.
-# Deshalb hier: die empfohlene Kontextlaenge muss mit MARGIN Luft ins Budget
-# passen; sonst werden die Snapshots schrittweise reduziert. Gemessen auf einer
-# 37,4-GiB-Maschine: mit 1,5 GiB Reserve starb jeder vierte Request, mit
-# 7,5 GiB lief er durch.
-MARGIN = 0.20                                            # 20 % Luft aufs Budget
+# ── Prevent overbooking ───────────────────────────────────────────────────────
+# A profile targets a particular working set (roomy for 40 GiB with wired_limit
+# set). If the limit is not set, PROFILE=auto still picks roomy -- and then the
+# snapshot count no longer matches the memory.
+# The symptom is not a clean error but "[METAL] Command buffer execution failed:
+# Insufficient Memory" mid-operation, often only after several requests.
+# Hence: the recommended context length has to fit the budget with MARGIN to
+# spare; otherwise the snapshots are reduced step by step. Measured on a 37.4 GiB
+# machine: with 1.5 GiB of reserve every fourth request died, with 7.5 GiB it ran
+# through.
+#
+# CAREFUL, THIS GUARD IS SILENT BY DESIGN and its input is _CTX_HINT, not the
+# real client context. If _CTX_HINT is set too high, entries_used collapses to 1
+# regardless of what APC_ENTRIES says -- see "WHY 3" in the profile block.
+MARGIN = 0.20                                            # 20% headroom on the budget
 entries_used = entries_req
 copies, avail, tokens = budget(entries_used)
 if apc_on and ctx_hint:
@@ -812,25 +809,26 @@ COPIES="${REST%%|*}";  REST="${REST#*|}"
 KV_KIB="${REST%%|*}";  REST="${REST#*|}"
 ENTRIES_USED="${REST%%|*}"; DEV_NAME="${REST#*|}"
 
-# Hat die Budgetrechnung die Snapshot-Zahl gekappt, gilt der gekappte Wert.
+# If the budget calculation capped the snapshot count, the capped value applies.
 if [[ "$ENABLE_APC" == "1" && "$ENTRIES_USED" != "$APC_ENTRIES" ]]; then
-  echo "⚠️  APC_ENTRIES $APC_ENTRIES → $ENTRIES_USED gekappt: Profil '$PROFILE' ist fuer mehr" >&2
-  echo "    Working-Set gedacht, als diese Maschine hat (${WS_GIB} GiB). Mit $APC_ENTRIES Snapshots" >&2
-  echo "    haette context_length $_CTX_HINT keine Reserve — das endet im Betrieb in" >&2
-  echo "    '[METAL] Insufficient Memory', nicht in einer sauberen Fehlermeldung." >&2
-  echo "    Mehr Working-Set: sudo sysctl -w iogpu.wired_limit_mb=40960 (s. README)." >&2
-  echo "    NICHT 45056 auf 48 GB, solange Browser/IDE mitlaufen — das laesst" >&2
-  echo "    macOS ~2 GiB und endet in einer Kernel-Panik statt in Metal-OOM." >&2
-  echo "    Ueberstimmen: APC_ENTRIES=$APC_ENTRIES ./start-mlx_qwen3.8.sh" >&2
+  echo "⚠️  APC_ENTRIES $APC_ENTRIES -> capped to $ENTRIES_USED: profile '$PROFILE' targets more" >&2
+  echo "    working set than this machine has (${WS_GIB} GiB). With $APC_ENTRIES snapshots," >&2
+  echo "    context_length $_CTX_HINT would have no reserve -- that ends in" >&2
+  echo "    '[METAL] Insufficient Memory' during operation, not in a clean error." >&2
+  echo "    More working set: sudo ./set-iogpu-wired-limit.sh (see README)." >&2
+  echo "    NOT 45056 on 48 GB while a browser/IDE is running -- that leaves" >&2
+  echo "    macOS ~2 GiB and ends in a kernel panic instead of a Metal OOM." >&2
+  echo "    NOTE: the input to this guard is _CTX_HINT, not the real client context." >&2
+  echo "    Override: APC_ENTRIES=$APC_ENTRIES ./start-mlx_qwen3.8.sh" >&2
   APC_ENTRIES="$ENTRIES_USED"
 fi
 
-# Score-Transient der unfused Full-Attention. Muss VOR dem Banner stehen und
-# gehoert dort neben das KV-Budget: er waechst mit qL x kL, taucht in der
-# KV-Rechnung nirgends auf, und ist ohne Patch 0013 die Groesse, die den
-# Prefill zuerst gegen die Wand faehrt. Heads/Layer kommen aus der config.json,
-# damit die Zahl auch nach einem Modellwechsel stimmt.
-SCORE_GIB="—"
+# Score transient of unfused full attention. Has to sit BEFORE the banner and
+# belongs next to the KV budget there: it grows with qL x kL, appears nowhere in
+# the KV calculation, and without patch 0013 it is the quantity that drives the
+# prefill into the wall first. Heads/layers come from config.json so the number
+# stays correct after a model change.
+SCORE_GIB="-"
 if [[ "$FUSED_OK" == "0" ]]; then
   SCORE_GIB=$("$VENV_PY" -c '
 import json, sys
@@ -848,69 +846,69 @@ fi
 echo "──────────────────────────────────────────────────────────────"
 echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  mlx-vlm $MLX_VLM_VER / mlx $MLX_VER  |  Qwen3.8 27B (DENSE, MLX 4bit)  |  $DEV_NAME"
-echo "  Profil   :  $PROFILE$_AUTO_NOTE  —  empf. context_length $_CTX_HINT"
-echo "  Modell   :  $MODEL_DIR"
-echo "  API-Name :  $MODEL_ALIAS  (Symlink; MUSS zum Request-Modellnamen passen)"
+echo "  Profile  :  $PROFILE$_AUTO_NOTE  -  recommended context_length $_CTX_HINT"
+echo "  Model    :  $MODEL_DIR"
+echo "  API name :  $MODEL_ALIAS  (symlink; MUST match the request model name)"
 echo "  Port     :  $BIND_HOST:$PORT"
-echo "  SpecDec  :  $SPEC_STATUS  (Drafter: $DRAFT_KIND, $(du -shL "$DRAFT_MODEL" 2>/dev/null | cut -f1)${DRAFT_BLOCK_SIZE:+, block_size $DRAFT_BLOCK_SIZE})"
+echo "  SpecDec  :  $SPEC_STATUS  (drafter: $DRAFT_KIND, $(du -shL "$DRAFT_MODEL" 2>/dev/null | cut -f1)${DRAFT_BLOCK_SIZE:+, block_size $DRAFT_BLOCK_SIZE})"
 if [[ "$ENABLE_APC" == "1" ]]; then
-  echo "  APC      :  ON ($APC_ENTRIES Snapshots, Single=$([[ "$APC_SINGLE" != "0" && "$APC_SINGLE_OK" == "1" ]] && echo ja || echo NEIN)${APC_DISK:+, SSD: $APC_DISK})"
+  echo "  APC      :  ON ($APC_ENTRIES snapshots, single=$([[ "$APC_SINGLE" != "0" && "$APC_SINGLE_OK" == "1" ]] && echo yes || echo NO)${APC_DISK:+, SSD: $APC_DISK})"
 else
   echo "  APC      :  OFF"
 fi
-echo "  KV-Cache :  ${KV_BITS:-f16 unquantisiert} → ${KV_KIB} KiB/Token"
-echo "  Mem-Probe:  $([[ "$_MEM_PROBE_INTERVAL" == "0" ]] && echo "OFF" || echo "alle ${_MEM_PROBE_INTERVAL}s ins Log (MEM_PROBE_INTERVAL=0 schaltet ab)")"
-echo "  Prefill  :  Chunk $PREFILL_STEP   Slots: $MAX_NUM_SEQS   Vision-Cache: $VISION_CACHE$_PREFILL_NOTE"
-echo "  Full-Attn:  $FUSED_STATUS"
-echo "  Q-Linears:  $QLIN_STATUS"
+echo "  KV cache :  ${KV_BITS:-f16 unquantized} -> ${KV_KIB} KiB/token"
+echo "  Mem probe:  $([[ "$_MEM_PROBE_INTERVAL" == "0" ]] && echo "OFF" || echo "every ${_MEM_PROBE_INTERVAL}s to the log (MEM_PROBE_INTERVAL=0 disables)")"
+echo "  Prefill  :  chunk $PREFILL_STEP   slots: $MAX_NUM_SEQS   vision cache: $VISION_CACHE$_PREFILL_NOTE"
+echo "  Full-attn:  $FUSED_STATUS"
+echo "  Q-linears:  $QLIN_STATUS"
 echo "  Log      :  $LOG_FILE"
-echo "  ──────────── Speicherbudget (gerechnet, keine Messung) ──────"
+echo "  ──────────── memory budget (computed, not measured) ─────────"
 echo "  RAM              : ${RAM_GIB} GiB"
-echo "  Metal-Working-Set: ${WS_GIB} GiB   (folgt iogpu.wired_limit_mb)"
-echo "  Gewichte         : ${W_GIB} GiB   (+1,5 GiB Reserve fuer Aktivierungen)"
-echo "  frei fuer KV     : ${AVAIL_GIB} GiB  auf ${COPIES} Kopien (1 live + APC)"
-echo "  →  KONTEXT-BUDGET: ~${MAX_TOKENS_FIT} Token  — OBERGRENZE, keine Zusage"
-echo "     Die Rechnung setzt (1+APC_ENTRIES) KV-Kopien an und unterschaetzt den"
-echo "     realen Bedarf. Gemessen 2026-08-21: ein Request ueber 13k Token kostete"
-echo "     +11,4 GiB statt der gerechneten 1,6, und active faellt zwischen den"
-echo "     Requests nicht zurueck. Massgeblich sind die mem-Zeilen im Log."
+echo "  Metal working set: ${WS_GIB} GiB   (follows iogpu.wired_limit_mb)"
+echo "  weights          : ${W_GIB} GiB   (+1.5 GiB reserve for activations)"
+echo "  free for KV      : ${AVAIL_GIB} GiB  across ${COPIES} copies (1 live + APC)"
+echo "  ->  CONTEXT BUDGET: ~${MAX_TOKENS_FIT} tokens  -- UPPER BOUND, not a promise"
+echo "     The calculation assumes (1+APC_ENTRIES) KV copies and underestimates"
+echo "     the real need. Measured 2026-08-21: a request over 13k tokens cost"
+echo "     +11.4 GiB instead of the computed 1.6, and active does not fall back"
+echo "     between requests. The mem lines in the log are authoritative."
 if [[ "$FUSED_OK" == "0" ]]; then
-echo "  Score-Transient  : ${SCORE_GIB} GiB  bei Chunk $PREFILL_STEP @ ${_CTX_HINT} Token"
-echo "                     (unfused; kommt ZUSAETZLICH zum KV-Budget oben)"
+echo "  score transient  : ${SCORE_GIB} GiB  at chunk $PREFILL_STEP @ ${_CTX_HINT} tokens"
+echo "                     (unfused; comes ON TOP of the KV budget above)"
 fi
 echo "──────────────────────────────────────────────────────────────"
 
-# Harte Warnung, wenn das Working-Set auf dem 32-GB-Default steht.
+# Hard warning when the working set sits at the 32 GB default.
 if (( $(printf '%.0f' "$WS_GIB") < 24 )) && (( $(printf '%.0f' "$RAM_GIB") >= 30 )); then
-  echo "ℹ️  Working-Set ist ${WS_GIB} GiB — das ist der macOS-Default (2/3 RAM)."
-  echo "    Mit  sudo sysctl -w iogpu.wired_limit_mb=26624  werden daraus 26 GiB"
-  echo "    und aus ~${MAX_TOKENS_FIT} Token rund das Doppelte. Persistent: siehe README."
+  echo "ℹ️  Working set is ${WS_GIB} GiB -- that is the macOS default (2/3 of RAM)."
+  echo "    With  sudo sysctl -w iogpu.wired_limit_mb=26624  that becomes 26 GiB"
+  echo "    and roughly doubles the ~${MAX_TOKENS_FIT} tokens. Persistent: see README."
 fi
 if [[ "$FUSED_OK" == "0" ]]; then
-  echo "⚠️  Full-Attention laeuft unfused: $FUSED_STATUS"
-  echo "    Der Prefill kippt dann in '[METAL] Insufficient Memory', lange bevor"
-  echo "    das KONTEXT-BUDGET oben erreicht ist — der Score-Transient zaehlt mit."
-  echo "    PREFILL_STEP NICHT erhoehen: der Transient waechst linear mit dem Chunk,"
-  echo "    1024 verdoppelt ihn gegenueber 512. Erst mlx >= 0.32.2, dann der Chunk."
+  echo "⚠️  Full attention is running unfused: $FUSED_STATUS"
+  echo "    The prefill then tips into '[METAL] Insufficient Memory' long before"
+  echo "    the CONTEXT BUDGET above is reached -- the score transient counts too."
+  echo "    Do NOT raise PREFILL_STEP: the transient grows linearly with the chunk,"
+  echo "    1024 doubles it against 512. First mlx >= 0.32.2, then the chunk."
 fi
 if [[ -z "$KV_BITS" && "$MAX_TOKENS_FIT" -lt 40000 ]]; then
-  echo "ℹ️  Unter 40k Token Budget. Verdoppeln ohne sudo:"
-  echo "      KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh   (vorher A/B messen)"
+  echo "ℹ️  Below a 40k token budget. Double it without sudo:"
+  echo "      KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh   (measure A/B first)"
 fi
 } | tee -a "$LOG_FILE"
 
-# ── Client-Abgleich (optional, rein lesend) ───────────────────────────────────
-# mlx-vlm hat KEIN -c-Flag; der Kontext kommt aus der config.json (262144). Der
-# effektive Deckel ist also allein das context_length des Clients. Steht das
-# ueber dem Budget oben, laeuft der Server irgendwann in
+# ── Client reconciliation (optional, read-only) ───────────────────────────────
+# mlx-vlm has NO -c flag; the context comes from config.json (262144). The
+# effective ceiling is therefore the client's context_length alone. If that sits
+# above the budget, the server eventually runs into
 # "[METAL] Insufficient Memory".
 #
-# Wer eine Client-Konfiguration im YAML-Format mit einem model:-Block fuehrt
-# (model.context_length, model.default), kann sie hier gegenpruefen lassen:
+# Anyone keeping a client configuration in YAML with a model: block
+# (model.context_length, model.default) can have it cross-checked here:
 #
-#   CLIENT_CONFIG=~/pfad/zu/config.yaml ./start-mlx_qwen3.8.sh
+#   CLIENT_CONFIG=~/path/to/config.yaml ./start-mlx_qwen3.8.sh
 #
-# Ohne die Variable ist der Block inert. Er aendert nichts, er warnt nur.
+# Without the variable the block is inert. It changes nothing, it only warns.
 CLIENT_CONFIG="${CLIENT_CONFIG:-}"
 if [[ -n "$CLIENT_CONFIG" && -f "$CLIENT_CONFIG" ]]; then
   CONFIG_CTX=$(awk '
@@ -919,9 +917,9 @@ if [[ -n "$CLIENT_CONFIG" && -f "$CLIENT_CONFIG" ]]; then
     in_model && /context_length:/ { gsub(/[^0-9]/,"",$0); print; exit }
   ' "$CLIENT_CONFIG")
   if [[ -n "$CONFIG_CTX" && "$CONFIG_CTX" -gt "$MAX_TOKENS_FIT" ]]; then
-    echo "⚠️  WARNUNG: ${CLIENT_CONFIG:t} model.context_length=$CONFIG_CTX > Budget $MAX_TOKENS_FIT." >&2
-    echo "    Der Client wird Prompts bauen, die hier nicht mehr in den Speicher passen." >&2
-    echo "    Entweder context_length senken oder KV_BITS=8 / wired_limit anheben." >&2
+    echo "⚠️  WARNING: ${CLIENT_CONFIG:t} model.context_length=$CONFIG_CTX > budget $MAX_TOKENS_FIT." >&2
+    echo "    The client will build prompts that no longer fit in memory here." >&2
+    echo "    Either lower context_length or raise KV_BITS=8 / wired_limit." >&2
   fi
   CONFIG_MODEL=$(awk '
     /^model:/ { in_model=1; next }
@@ -929,41 +927,41 @@ if [[ -n "$CLIENT_CONFIG" && -f "$CLIENT_CONFIG" ]]; then
     in_model && /default:/ { sub(/^[^:]*:[[:space:]]*/,""); gsub(/["\x27]/,""); print; exit }
   ' "$CLIENT_CONFIG")
   if [[ -n "$CONFIG_MODEL" && "$CONFIG_MODEL" != "$MODEL_ALIAS" ]]; then
-    echo "⚠️  WARNUNG: ${CLIENT_CONFIG:t} model.default='$CONFIG_MODEL' != Alias '$MODEL_ALIAS'." >&2
-    echo "    Bei mlx-vlm IST der Request-Modellname der Ladepfad — Abweichung fuehrt" >&2
-    echo "    zu Reload + HF-Download (401). Angleichen oder:" >&2
+    echo "⚠️  WARNING: ${CLIENT_CONFIG:t} model.default='$CONFIG_MODEL' != alias '$MODEL_ALIAS'." >&2
+    echo "    With mlx-vlm the request model name IS the load path -- a mismatch leads" >&2
+    echo "    to a reload + HF download (401). Align them, or:" >&2
     echo "      MODEL_ALIAS='$CONFIG_MODEL' ./start-mlx_qwen3.8.sh" >&2
   fi
 fi
 
 # ── Thinking ──────────────────────────────────────────────────────────────────
-# Serverseitig AUS (mlx-vlm schickt enable_thinking immer ans Template, Default
-# false). Gesteuert wird pro Request vom Client.
+# OFF on the server side (mlx-vlm always sends enable_thinking to the template,
+# default false). It is controlled per request by the client.
 #
-# DAS TEMPLATE kennt nur xhigh|medium|low und wirft bei allem anderen eine
-# Exception -> HTTP 500. Ohne Angabe defaultet es auf 'xhigh'. Kurioserweise
-# setzt NUR xhigh und low eine Anweisung; 'medium' setzt gar keine und faellt
-# damit auf das Default-Verhalten des Modells zurueck.
+# THE TEMPLATE knows only xhigh|medium|low and throws an exception on anything
+# else -> HTTP 500. With nothing specified it defaults to 'xhigh'. Curiously only
+# xhigh and low set an instruction; 'medium' sets none at all and therefore falls
+# back to the model's default behaviour.
 #
-# MLX-VLM FAENGT VORHER AB. request_normalization.py:21:
+# MLX-VLM INTERCEPTS EARLIER. request_normalization.py:21:
 #   _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
-# Diese Werte erreichen das Template nie, sie werden nach enable_thinking=false
-# uebersetzt — und das Template macht daraus einen VORAB GESCHLOSSENEN Block
-# ('<think>\n\n</think>'), das Modell denkt also gar nicht erst.
-# Die frueher hier stehende Behauptung, auch "none" werfe 500, ist WIDERLEGT:
-# nur unbekannte Werte wie "minimal" schlagen durch.
+# These values never reach the template, they are translated into
+# enable_thinking=false -- and the template turns that into a PRE-CLOSED block
+# ('<think>\n\n</think>'), so the model does not think at all.
+# The claim that used to stand here, that "none" also throws a 500, is DISPROVED:
+# only unknown values such as "minimal" get through.
 #
-# GEMESSEN am 2026-08-23, gleicher Prompt, temperature 0:
-#   reasoning_effort=none / off      76 Tok   3,2 s   (denkt nicht)
-#   enable_thinking=false            76 Tok   3,2 s   (identisch)
-#   reasoning_effort=low            234 Tok   7,8 s
-# Fuer Werkzeugaufrufe und kurze Turns ist 'none' der guenstigste Weg; wo das
-# Modell wirklich nachdenken soll, bleibt 'low'. Das entscheidet der Client
-# pro Request, hier ist nichts einzustellen.
+# MEASURED on 2026-08-23, same prompt, temperature 0:
+#   reasoning_effort=none / off      76 tk   3.2 s   (does not think)
+#   enable_thinking=false            76 tk   3.2 s   (identical)
+#   reasoning_effort=low            234 tk   7.8 s
+# For tool calls and short turns 'none' is the cheapest route; where the model
+# really should think, 'low' remains. The client decides that per request, there
+# is nothing to configure here.
 #
-# --thinking-budget waere die harte Token-Grenze INNERHALB des Denkblocks,
-# ist aber mit Speculative Decoding gesperrt (generation.py:1257) — sie zu
-# nutzen hiesse, den Drafter aufzugeben.
+# --thinking-budget would be the hard token limit INSIDE the thinking block, but
+# it is blocked together with speculative decoding (generation.py:1257) -- using
+# it would mean giving up the drafter.
 
 args=(
   --host                  "$BIND_HOST"
@@ -977,15 +975,15 @@ args=(
 
 if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   args+=( --draft-model "$DRAFT_MODEL" --draft-kind "$DRAFT_KIND" )
-  # Ohne das laufen Nicht-MTP-Drafter in einer eigenen Generierungsschleife, die
-  # den APC-Manager nie verdrahtet: cached_tokens=0 in JEDEM Turn. Braucht
-  # Patch 0021. Gemessen: cached 0 -> 5748/5788, Decode unveraendert.
-  # Seit 2026-08-21 ueberschreibbar, damit der Pfad messbar ist. Er stand im
-  # Verdacht, den fixen Speichersockel von ~9,4 GiB zu verursachen — GEMESSEN
-  # IST ER ES NICHT: mit BATCH=0 bleibt der Sockel unveraendert bei +9,46 GiB.
-  # Der Sockel haengt an --draft-block-size >= 2 (1 -> +0,16 GiB, 2 -> +9,31).
-  # BATCH=0 kostet unter dflash den Prefix-Cache, ist also nichts fuer den
-  # Produktivbetrieb — der Schalter existiert nur fuer Diagnoselaeufe.
+  # Without this, non-MTP drafters run in their own generation loop that never
+  # wires up the APC manager: cached_tokens=0 on EVERY turn. Needs patch 0021.
+  # Measured: cached 0 -> 5748/5788, decode unchanged.
+  # Overridable since 2026-08-21 so the path can be measured. It was suspected of
+  # causing the fixed ~9.4 GiB memory floor -- MEASURED, IT IS NOT: with BATCH=0
+  # the floor stays unchanged at +9.46 GiB. The floor hangs on
+  # --draft-block-size >= 2 (1 -> +0.16 GiB, 2 -> +9.31).
+  # BATCH=0 costs the prefix cache under dflash, so it is nothing for production
+  # use -- the switch exists only for diagnostic runs.
   [[ "$DRAFT_KIND" != "mtp" ]] && export MLX_VLM_SPECULATIVE_BATCH="${MLX_VLM_SPECULATIVE_BATCH:-1}"
   [[ -n "$DRAFT_BLOCK_SIZE" ]] && args+=( --draft-block-size "$DRAFT_BLOCK_SIZE" )
 fi
@@ -1008,23 +1006,29 @@ if [[ "$ENABLE_APC" == "1" ]]; then
 fi
 [[ "$APC_SINGLE" != "0" ]] && export QWEN38_APC_SINGLE_SNAPSHOT=1
 
-# CWD = models-Root, damit der relative Alias-Name aufgeloest wird
-# (get_model_path() macht Path(name).exists() gegen das Arbeitsverzeichnis).
+# CWD = models root so the relative alias name resolves
+# (get_model_path() does Path(name).exists() against the working directory).
 cd "$MODELS_ROOT"
 
-# ── Speicher-Sampler ──────────────────────────────────────────────────────────
-# Warum ueberhaupt: mlx steckt jede Allokation in ein Residency-Set
-# (mlx/backend/metal/allocator.cpp), macht sie also wired. Der Puffer-Cache wird
-# bei gc_limit_ = 0,95 x Working-Set freigegeben, LEBENDER Speicher aber nie —
-# fuer den gibt es unterhalb des Working-Sets keine Bremse. Ueberschreitet die
-# Summe die Metal-Decke, scheitert der naechste Command Buffer mit
-# "[METAL] Insufficient Memory", und zwar an einer beliebigen Stelle: am
-# 2026-08-21 einmal in der Attention (ar.py:1907), einmal im APC-Klon
-# (apc.py:321). Der Stacktrace zeigt deshalb den Ort, nicht die Ursache.
-# Von aussen ist das nicht messbar: RSS enthaelt die Metal-Buffer nicht (2,3 GiB
-# RSS bei 16 GiB Gewichten). Also von innen, per Thread, ohne mlx_vlm anzufassen
-# — ein Patch in site-packages waere nach jedem mlx-vlm-Update wieder weg.
-# Abschalten: MEM_PROBE_INTERVAL=0 (Wert wird oben bei LOG_PROGRESS gesetzt)
+# ── Memory sampler ────────────────────────────────────────────────────────────
+# Why at all: mlx puts every allocation into a residency set
+# (mlx/backend/metal/allocator.cpp), i.e. makes it wired. The buffer cache is
+# released at gc_limit_ = 0.95 x working set, but LIVE memory never is -- below
+# the working set there is no brake on it. Once the sum exceeds the Metal
+# ceiling, the next command buffer fails with "[METAL] Insufficient Memory", and
+# at an arbitrary place: on 2026-08-21 once in attention (ar.py:1907), once in
+# the APC clone (apc.py:321). The stack trace therefore shows the location, not
+# the cause.
+# From outside this is not measurable: RSS does not include the Metal buffers
+# (2.3 GiB RSS with 16 GiB of weights). So from the inside, via a thread, without
+# touching mlx_vlm -- a patch in site-packages would be gone after every mlx-vlm
+# update.
+# Disable: MEM_PROBE_INTERVAL=0 (the value is set above, near LOG_PROGRESS)
+#
+# NOTE FOR ANYONE REWORDING THE LINE BELOW: watchdog-mlx_qwen3.8.sh parses it.
+# It matches "(NN%" up to the closing parenthesis and deliberately ignores the
+# wording, so rephrasing is safe -- but the percentage must stay inside
+# parentheses, otherwise the watchdog silently stops restarting anything.
 _MEM_BOOT=$(cat <<'PY'
 import os, sys, threading, time, logging, runpy
 
@@ -1043,8 +1047,8 @@ def _working_set():
 
 def _sample(interval, ws):
     log = logging.getLogger("memprobe")
-    # Erst schlafen: mlx_vlm konfiguriert das root-Logging beim Start, vorher
-    # landet die Zeile im Nirwana statt im server.log.
+    # Sleep first: mlx_vlm configures root logging at startup; before that the
+    # line goes nowhere instead of into server.log.
     time.sleep(interval)
     while True:
         try:
@@ -1054,14 +1058,14 @@ def _sample(interval, ws):
             pct = (total / ws * 100.0) if ws else 0.0
             msg = (
                 "mem active=%.2f cache=%.2f sum=%.2f GiB "
-                "(%.0f%% von %.2f GiB Working-Set) peak=%.2f GiB"
+                "(%.0f%% of %.2f GiB working set) peak=%.2f GiB"
             )
             argv = (
                 active / _GIB, cache / _GIB, total / _GIB,
                 pct, ws / _GIB, mx.get_peak_memory() / _GIB,
             )
-            # Ab 85 % ist der naechste groessere Prefill der wahrscheinliche
-            # Ausloeser — das soll im Log herausstechen, nicht in INFO untergehen.
+            # From 85% on, the next larger prefill is the likely trigger -- that
+            # should stand out in the log rather than drown in INFO.
             log.warning(msg, *argv) if pct >= 85.0 else log.info(msg, *argv)
         except Exception:
             pass
