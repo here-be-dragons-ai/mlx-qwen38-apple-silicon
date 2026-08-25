@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""DFlash-2-Drafter von bf16 nach MLX-quantisiert konvertieren.
+"""Convert a DFlash-2 drafter from bf16 to MLX-quantized.
 
-Der offizielle Drafter (z-lab/Qwen3.8-27B-DFlash2) liegt nur in bf16 vor und
-belegt 3,58 GiB. Neben 15 GiB Modellgewichten ist das auf 32-GB-Maschinen zu
-viel; 4bit bringt ihn auf ~1,0 GiB.
+The official drafter (z-lab/Qwen3.8-27B-DFlash2) ships only in bf16 and occupies
+3.58 GiB. Next to 15 GiB of model weights that is too much on 32 GB machines;
+4bit brings it down to ~1.0 GiB.
 
-Verwendung:
-    ./convert-dflash2-drafter.py <quelle-bf16> <ziel> [--bits 4] [--keep-codebooks]
+Usage:
+    ./convert-dflash2-drafter.py <source-bf16> <dest> [--bits 4] [--keep-codebooks]
 
-    --bits 8            haelt mehr Qualitaet (~1,9 GiB), falls die Acceptance
-                        bei 4bit einbricht
-    --keep-codebooks    laesst die beiden Selector-Codebooks
-                        (2 x 248320 x 256) in bf16. Sie sind die
-                        Nachschlagetabellen der Pfadwahl und reagieren
-                        empfindlicher auf Quantisierung als die Projektionen.
-                        Kostet ~254 MiB, ist die erste Stellschraube bei
-                        schlechter Acceptance.
+    --bits 8            retains more quality (~1.9 GiB), in case acceptance
+                        collapses at 4bit
+    --keep-codebooks    leaves the two selector codebooks (2 x 248320 x 256) in
+                        bf16. They are the lookup tables of the path selection
+                        and react more sensitively to quantisation than the
+                        projections do. Costs ~254 MiB and is the first knob to
+                        turn when acceptance is poor.
 
-Voraussetzung: der DFlash-2-Patch ist angewendet (patches/apply-patches.sh),
-sonst kennt mlx-vlm die v2-Module nicht.
+Prerequisite: the DFlash-2 patch is applied (patches/apply-patches.sh),
+otherwise mlx-vlm does not know the v2 modules.
 """
 
 import argparse
@@ -52,7 +51,7 @@ def main() -> None:
     config = DFlashConfig.from_dict(cfg_dict)
     if config.selector_rank == 0:
         raise SystemExit(
-            "Quelle ist kein DFlash-2-Checkpoint (selector_rank fehlt in dflash_config)."
+            "Source is not a DFlash-2 checkpoint (selector_rank missing from dflash_config)."
         )
 
     model = DFlashDraftModel(config)
@@ -68,8 +67,8 @@ def main() -> None:
             return False
         if not hasattr(module, "to_quantized"):
             return False
-        # Gleiche Regel wie mlx-vlm beim Laden (utils.py): nicht durch 64
-        # teilbare Gewichte bleiben unquantisiert, sonst passt der Kernel nicht.
+        # Same rule as mlx-vlm on load (utils.py): weights not divisible by 64
+        # stay unquantized, otherwise the kernel does not fit.
         return not (hasattr(module, "weight") and module.weight.size % args.group_size)
 
     nn.quantize(
@@ -82,9 +81,10 @@ def main() -> None:
     args.dest.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(args.dest / "model.safetensors"), out, metadata={"format": "mlx"})
 
-    # Die Quantisierungsangabe MUSS in die config.json: mlx-vlm quantisiert das
-    # frisch gebaute Modell beim Laden anhand dieses Blocks nach und prueft dann
-    # je Modul, ob im Checkpoint wirklich .scales liegen (utils.py:load_model).
+    # The quantisation block MUST go into config.json: on load, mlx-vlm
+    # re-quantizes the freshly built model from this block and then checks per
+    # module whether .scales are really present in the checkpoint
+    # (utils.py:load_model).
     quant = {"group_size": args.group_size, "bits": args.bits}
     if args.keep_codebooks:
         for name in CODEBOOKS:
@@ -98,11 +98,11 @@ def main() -> None:
             shutil.copy2(src, args.dest / extra)
 
     gib = 1 << 30
-    print(f"  Quelle    : {args.source}  ({before / gib:.2f} GiB Parameter)")
-    print(f"  Ziel      : {args.dest}  ({after / gib:.2f} GiB)")
+    print(f"  Source    : {args.source}  ({before / gib:.2f} GiB of parameters)")
+    print(f"  Dest      : {args.dest}  ({after / gib:.2f} GiB)")
     print(f"  Quant     : {args.bits} bit, group_size {args.group_size}"
-          f"{', Codebooks bf16' if args.keep_codebooks else ''}")
-    print(f"  Tensoren  : {len(out)}")
+          f"{', codebooks bf16' if args.keep_codebooks else ''}")
+    print(f"  Tensors   : {len(out)}")
 
 
 if __name__ == "__main__":
