@@ -1,53 +1,53 @@
-# Qwen3.8-27B (MLX 4bit) auf Apple Silicon
+# Qwen3.8-27B (MLX 4bit) on Apple Silicon
 
-Setup- und Start-Skripte, um **Qwen3.8-27B** als lokalen, OpenAI-kompatiblen
-Server (`mlx-vlm`) auf einem Apple-Silicon-Mac zu betreiben — inklusive der
-Speicher-Dimensionierung, die über „läuft brauchbar" und „stirbt an
-`[METAL] Insufficient Memory`" entscheidet.
+Setup and start scripts for running **Qwen3.8-27B** as a local, OpenAI-compatible
+server (`mlx-vlm`) on an Apple Silicon Mac — including the memory sizing that
+decides between "runs usefully" and "dies with
+`[METAL] Insufficient Memory`".
 
-Die Gewichte (14,95 GiB) sind dabei **nicht** das Problem. Das Nadelöhr ist der
-KV-Cache mit **64 KiB pro Token**, der pro Kopie anfällt (laufende Sequenz +
-jeder Prefix-Cache-Snapshot). Er bestimmt, wieviel Kontext übrig bleibt — und
-damit, ob das Ding als Agent-Backend taugt.
+The weights (14.95 GiB) are **not** the problem. The bottleneck is the KV cache
+at **64 KiB per token**, which is paid per copy (running sequence + every
+prefix-cache snapshot). It determines how much context is left — and therefore
+whether this thing is usable as an agent backend.
 
-Drei Profile decken die üblichen Maschinen ab; `PROFILE=auto` (Default) wählt
-selbst:
+Three profiles cover the usual machines; `PROFILE=auto` (default) picks one:
 
-| Profil | Zielmaschine | Peak-RAM | `context_length` |
+| profile | target machine | peak RAM | `context_length` |
 |---|---|---|---|
-| `lean` | 32 GB **ohne** `sudo` | ~18,8 GiB | 32768 |
-| `balanced` | 32 GB mit `wired_limit 26624` | ~25,0 GiB | 49152 |
-| `roomy` | 48 GB mit `wired_limit 40960` | ~33 GiB | 65536 |
+| `lean` | 32 GB **without** `sudo` | ~18.8 GiB | 32768 |
+| `balanced` | 32 GB with `wired_limit 26624` | ~25.0 GiB | 49152 |
+| `roomy` | 48 GB with `wired_limit 40960` | ~33 GiB | 65536 |
 
-Getestet auf macOS 26. `roomy` ist das ursprüngliche, über Wochen produktiv
-gefahrene M5-Pro-Setup; die 32-GB-Profile sind daraus gerechnet. Das
-Start-Skript ermittelt das Speicherbudget zur Laufzeit aus den echten Werten
-der Maschine und warnt, wenn die Client-Konfiguration darüber liegt.
+Tested on macOS 26. `roomy` is the original M5 Pro setup, run in production for
+weeks; the 32 GB profiles are derived from it. The start script determines the
+memory budget at runtime from the machine's real values and warns when the
+client configuration exceeds it.
 
-> **`roomy` stand bis 2026-08-21 auf `wired_limit 45056`.** Das sind 44 GiB
-> Metal-Working-Set auf einer 48-GiB-Maschine — macOS bleiben ~2 GiB, und das
-> reicht nicht. Am 2026-08-21 um 12:30 hat die Testmaschine deshalb eine
-> **Kernel-Panik** geworfen (`watchdog timeout: no checkins from watchdogd in
-> 93 seconds`): 45,8 GiB von 48 GiB standen als *wired*, der auslagerbare Pool
-> war unter 1 MB, und der Pageout-Scanner bekam nur 252 von 3086 angeforderten
-> Seiten zurück. Die Falle dabei: `memoryPressure` meldete `false`, weil macOS'
-> Pressure-Metrik den Compressor bewertet und **nicht** Wired — es gibt bei
-> GPU-Wired keinen Jetsam, der vorher eingreift. Das Limit ist der einzige
-> Schutz, deshalb jetzt 40960 (40 GiB, lässt macOS 8 GiB).
+> **`roomy` was set to `wired_limit 45056` until 2026-08-21.** That is 44 GiB of
+> Metal working set on a 48 GiB machine — macOS is left with ~2 GiB, and that is
+> not enough. On 2026-08-21 at 12:30 the test machine therefore threw a **kernel
+> panic** (`watchdog timeout: no checkins from watchdogd in 93 seconds`):
+> 45.8 GiB of 48 GiB were *wired*, the pageable pool was below 1 MB, and the
+> pageout scanner got back only 252 of 3,086 requested pages. The trap:
+> `memoryPressure` reported `false`, because macOS' pressure metric evaluates the
+> compressor and **not** wired memory — there is no jetsam that steps in first
+> for GPU wired memory. The limit is the only protection, hence 40960 now
+> (40 GiB, leaving macOS 8 GiB).
 
 ---
 
-## Voraussetzungen
+## Requirements
 
 | | |
 |---|---|
-| Hardware | Apple Silicon (arm64), ≥ 32 GB Unified Memory |
-| macOS | aktuell, mit Xcode Command Line Tools (`xcode-select --install`) |
-| Xcode | **nur für den mlx-Quellbau** (s. u.): Xcode.app + Metal-Toolchain. Ohne ihn läuft alles, nur `head_dim 256` bleibt unfused |
-| Platte | ~20 GB für Modell + Drafter, dazu bis zu 40 GB für den SSD-Prefix-Cache |
-| Netz | einmalig ~15 GB Download von HuggingFace |
+| Hardware | Apple Silicon (arm64), ≥ 32 GB unified memory |
+| macOS | current, with Xcode Command Line Tools (`xcode-select --install`) |
+| Xcode | **only for the mlx source build** (see below): Xcode.app + Metal toolchain. Everything runs without it, only `head_dim 256` stays unfused |
+| Disk | ~20 GB for model + drafter, plus up to 40 GB for the SSD prefix cache |
+| Network | one-off ~15 GB download from HuggingFace |
 
-Alles Weitere (uv, venv, Python 3.12, mlx-vlm) installiert `install-prereqs.sh`.
+Everything else (uv, venv, Python 3.12, mlx-vlm) is installed by
+`install-prereqs.sh`.
 
 ---
 
@@ -57,228 +57,227 @@ Alles Weitere (uv, venv, Python 3.12, mlx-vlm) installiert `install-prereqs.sh`.
 git clone https://github.com/here-be-dragons-ai/mlx-qwen38-apple-silicon.git
 cd mlx-qwen38-apple-silicon
 
-# 1. Software + Modellgewichte (idempotent, Downloads sind resume-fähig)
+# 1. Software + model weights (idempotent, downloads are resumable)
 ./install-prereqs.sh
 
-# 2. GPU-Wired-Limit anheben — der wichtigste Schritt (s.u.)
-sudo sysctl -w iogpu.wired_limit_mb=26624    # 32 GB;  48 GB → 40960
+# 2. Raise the GPU wired limit — the most important step (see below)
+sudo sysctl -w iogpu.wired_limit_mb=26624    # 32 GB;  48 GB -> 40960
 
-# 3. Server starten (127.0.0.1:8888)
+# 3. Start the server (127.0.0.1:8888)
 ./start-mlx_qwen3.8.sh
 ```
 
-Schritt 2 ist auf 32 GB der Unterschied zwischen ~23k und ~48k nutzbarem
-Kontext. Ohne ihn läuft das Setup trotzdem — `PROFILE=auto` erkennt das und
-schaltet auf `lean`.
+On 32 GB, step 2 is the difference between ~23k and ~48k usable context. The
+setup runs without it — `PROFILE=auto` detects that and switches to `lean`.
 
-`install-prereqs.sh` legt an bzw. prüft: Xcode CLT → [uv](https://astral.sh/uv)
-→ venv unter `~/src/mlx/.venv` (Python 3.12) → mlx-vlm + Abhängigkeiten →
-Metal-Selbsttest → Patches → Modell + MTP-Drafter → `~/.mlx-qwen38/{logs,apc}`.
+`install-prereqs.sh` creates or verifies: Xcode CLT → [uv](https://astral.sh/uv)
+→ venv under `~/src/mlx/.venv` (Python 3.12) → mlx-vlm + dependencies → Metal
+self-test → patches → model + MTP drafter → `~/.mlx-qwen38/{logs,apc}`.
 
-| Option | Wirkung |
+| option | effect |
 |---|---|
-| `--check` | nur prüfen, nichts verändern |
-| `--skip-model` | Software ja, 15-GB-Download nein |
-| `--latest` | neueste statt der gepinnten Versionen |
+| `--check` | verify only, change nothing |
+| `--skip-model` | software yes, 15 GB download no |
+| `--latest` | newest instead of the pinned versions |
 
-Pfade sind über Env steuerbar: `MLX_HOME` (Default `~/src/mlx`), `MLX_MODELS`,
+Paths are controllable via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`,
 `PYTHON_VERSION`.
 
-**Gepinnter, verifizierter Stand:** `mlx 0.32.2.dev` **aus dem Quellbau**
-(s. u.; `install-prereqs.sh` pinnt weiterhin `mlx 0.32.1` von PyPI), `mlx-lm 0.31.3`,
+**Pinned, verified state:** `mlx 0.32.2.dev` **from the source build** (see
+below; `install-prereqs.sh` still pins `mlx 0.32.1` from PyPI), `mlx-lm 0.31.3`,
 **`mlx-vlm 0.6.15`**, `transformers 5.15.0`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
-`mlx-vlm >= 0.6.13` ist Pflicht — erst dort ist Prefix-Caching upstream korrekt
-(`semantic_extra_hash()`); davor trifft der Cache nur bei byte-identischen
-Prompts. Ab `0.6.14` ist zusätzlich der Kurzprompt-Fix (PR #1901) enthalten,
-der vorher als lokaler Patch nötig war.
+`mlx-vlm >= 0.6.13` is mandatory — only there is prefix caching correct upstream
+(`semantic_extra_hash()`); before that the cache only hits on byte-identical
+prompts. From `0.6.14` onwards it also contains the short-prompt fix (PR #1901),
+which previously required a local patch.
 
-`mlx 0.32.1` ist ein reiner Kompatibilitätsschritt und **kostet nichts**.
-Gemessen auf dieser Maschine (12 Läufe je Version, `temperature 0`, feste
-Prompts, Decode-Rate aus dem Server-Log):
+`mlx 0.32.1` is a pure compatibility step and **costs nothing**. Measured on
+this machine (12 runs per version, `temperature 0`, fixed prompts, decode rate
+from the server log):
 
-| | Median | Mittel | min–max |
+| | median | mean | min–max |
 |---|---|---|---|
-| `mlx 0.32.0` | 43,2 t/s | 43,9 t/s | 42,8–45,4 |
-| `mlx 0.32.1` | 43,3 t/s | 43,3 t/s | 40,7–47,2 |
+| `mlx 0.32.0` | 43.2 t/s | 43.9 t/s | 42.8–45.4 |
+| `mlx 0.32.1` | 43.3 t/s | 43.3 t/s | 40.7–47.2 |
 
-Gleiche Token-Zahl in beiden Läufen, und die Ausgabe eines 400-Token-Prompts ist
-zwischen 0.32.0 und 0.32.1 **bit-identisch** (1696 Zeichen). Wichtig ist an
-0.32.1 etwas anderes: mlx-vlm 0.6.15 enthält bereits
-[#1949](https://github.com/Blaizzy/mlx-vlm/pull/1949) („Fix issues + tests with
-mlx 0.32.1", gemerged 34 Minuten *vor* dem 0.6.15-Release) — unter anderem
-`mx.clear_streams()` beim Thread-Ende und contiguous Views bei der
-KV-Dequantisierung. Der Stand passt also zusammen.
+Same token count in both runs, and the output of a 400-token prompt is
+**bit-identical** between 0.32.0 and 0.32.1 (1,696 characters). What matters
+about 0.32.1 is something else: mlx-vlm 0.6.15 already contains
+[#1949](https://github.com/Blaizzy/mlx-vlm/pull/1949) ("Fix issues + tests with
+mlx 0.32.1", merged 34 minutes *before* the 0.6.15 release) — among other things
+`mx.clear_streams()` on thread exit and contiguous views during KV
+dequantization. So the versions fit together.
 
-### mlx 0.32.2 — seit 2026-08-21 aus dem Quellbau
+### mlx 0.32.2 — built from source since 2026-08-21
 
-Für Qwen3.8 hängt daran der einzige echte Kernel-Gewinn: `head_dim 256` bekommt
-wieder einen fused Full-Attention-Pfad
+For Qwen3.8 the only real kernel win hangs on this: `head_dim 256` gets a fused
+full-attention path again
 ([#4185](https://github.com/ml-explore/mlx/pull/4185), plus
-[#3842](https://github.com/ml-explore/mlx/pull/3842) für NAX/M5). Beide sind
-**nach** dem `0.32.1`-Tag gemerged, und **auf PyPI gibt es 0.32.2 bis heute
-nicht** (auch nicht als `mlx-metal`/`mlx-cpu`). Deshalb wird mlx hier gebaut:
+[#3842](https://github.com/ml-explore/mlx/pull/3842) for NAX/M5). Both were
+merged **after** the `0.32.1` tag, and **0.32.2 does not exist on PyPI to this
+day** (not as `mlx-metal`/`mlx-cpu` either). That is why mlx is built here:
 
 ```sh
-# Voraussetzung: Xcode.app + Metal-Toolchain. Die Command Line Tools reichen
-# NICHT — ohne sie: xcrun: unable to find utility "metal"
+# Prerequisite: Xcode.app + Metal toolchain. The Command Line Tools are NOT
+# enough — without them: xcrun: unable to find utility "metal"
 sudo xcodebuild -license accept
 xcodebuild -downloadComponent MetalToolchain      # ~690 MB
-xcrun -sdk macosx metal --version                 # muss durchlaufen
+xcrun -sdk macosx metal --version                 # must succeed
 
 git clone https://github.com/ml-explore/mlx.git ~/src/mlx-core
 cd ~/src/mlx-core
 CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=14 \
   uv build --wheel --python ~/src/mlx/.venv/bin/python
 
-# mlx und mlx-metal teilen sich das mlx/-Verzeichnis; der Quellbau ist
-# monolithisch, also BEIDE vorher weg
+# mlx and mlx-metal share the mlx/ directory; the source build is monolithic,
+# so remove BOTH first
 uv pip uninstall --python ~/src/mlx/.venv/bin/python mlx mlx-metal
 uv pip install   --python ~/src/mlx/.venv/bin/python dist/mlx-0.32.2.dev*.whl
 ```
 
-> **`--python` ist Pflicht.** Ohne baut `uv` gegen sein Default-Python und legt
-> ein `cp313`-Wheel ab; das venv läuft auf 3.12, und das Wheel passt dann nicht.
+> **`--python` is mandatory.** Without it `uv` builds against its default Python
+> and drops a `cp313` wheel; the venv runs 3.12, and the wheel then does not fit.
 >
-> **`uv pip install -U mlx` fällt auf 0.32.1 zurück** und schaltet Patch `0013`
-> wieder ab. Das Start-Banner zeigt es (`Full-Attn: unfused …`), aber erst nach
-> dem nächsten Neustart.
+> **`uv pip install -U mlx` falls back to 0.32.1** and disables patch `0013`
+> again. The start banner shows it (`Full-Attn: unfused …`), but only after the
+> next restart.
 
-Patch `0013` ist damit scharf (`_FORCE_FUSED == True`). Gemessen mit
-`0.32.2.dev20260821+a082cb91`, Produktionsform `qL=512` / `kL=22747`, 24 Heads /
-4 KV-Heads / `head_dim 256`:
+Patch `0013` is therefore live (`_FORCE_FUSED == True`). Measured with
+`0.32.2.dev20260821+a082cb91`, production shape `qL=512` / `kL=22747`, 24 heads /
+4 KV heads / `head_dim 256`:
 
-| | Peak |
+| | peak |
 |---|---|
 | `force_fused=False` | 662 MiB |
 | `force_fused=True` | **123 MiB** |
 
-Die Differenz von 539 MiB ist der Score-Transient (theoretisch 533 MiB). Der
-Blowup hängt an der **asymmetrischen Form `qL << kL`**, nicht an der Maskenart —
-ein Benchmark mit `qL = kL` zeigt ihn *nicht*. Praktische Folge auf 37,4 GiB
-Working-Set: der Prefill starb vorher bei 22.747 Token in `[METAL] Insufficient
-Memory`, danach liefen **37.822 Token in 91,8 s** durch.
+The difference of 539 MiB is the score transient (533 MiB in theory). The blowup
+depends on the **asymmetric shape `qL << kL`**, not on the mask type — a
+benchmark with `qL = kL` does *not* show it. Practical consequence on a 37.4 GiB
+working set: the prefill previously died at 22,747 tokens with `[METAL]
+Insufficient Memory`; afterwards **37,822 tokens went through in 91.8 s**.
 
-### Wired-Limit persistent machen
+### Making the wired limit persistent
 
-`sysctl -w` überlebt keinen Neustart. Dauerhaft:
+`sysctl -w` does not survive a reboot. Permanently:
 
 ```sh
 sudo ./install-wired-limit-daemon.sh
 ```
 
-Das war bis 2026-08-24 eine Kette aus vier `sudo`-Zeilen mit
-Fortsetzungszeichen — und die **zerbricht beim Kopieren**: bricht die Zeile an
-der falschen Stelle um, führt zsh das Zielverzeichnis als Kommando aus
-(`permission denied: /usr/local/libexec/`), `launchctl` läuft ohne `sudo`
-weiter (`Warning: Expecting a LaunchAgents path …`) und quittiert mit
-`Load failed: 5: Input/output error`. Ergebnis: Verzeichnis da, Skript und
-plist nicht. Der `Load failed: 5` hatte dabei **zwei** Ursachen gleichzeitig —
-fehlendes root *und* ein `ProgramArguments`, das auf eine noch nicht
-installierte Datei zeigte. Das Installationsskript setzt beides in der
-richtigen Reihenfolge und ist idempotent (`--uninstall` entfernt wieder).
+Until 2026-08-24 this was a chain of four `sudo` lines with continuation
+characters — and that **breaks when pasted**: if the line wraps in the wrong
+place, zsh executes the target directory as a command
+(`permission denied: /usr/local/libexec/`), `launchctl` continues without `sudo`
+(`Warning: Expecting a LaunchAgents path …`) and quits with
+`Load failed: 5: Input/output error`. Result: directory present, script and
+plist not. That `Load failed: 5` had **two** causes at once — missing root *and*
+a `ProgramArguments` pointing at a file that had not been installed yet. The
+installation script does both in the right order and is idempotent
+(`--uninstall` removes it again).
 
-Prüfen: `sysctl iogpu.wired_limit_mb`, Vorschau ohne Setzen:
+Verify with `sysctl iogpu.wired_limit_mb`; preview without setting:
 `sudo /usr/local/libexec/set-iogpu-wired-limit.sh --dry-run`.
-Der Daemon greift durch `RunAtLoad` sofort — der Wert muss also direkt nach der
-Installation stehen, nicht erst nach dem Reboot.
+`RunAtLoad` makes the daemon take effect immediately — so the value must be
+there right after installation, not only after a reboot.
 
-**Der Wert steht nicht mehr in der plist.** Bis 2026-08-24 setzte sie hart
-`26624` — den 32-GB-Wert. So installiert nahm sie einer 48-GB-Maschine 14 GiB
-Working-Set, und `install-prereqs.sh` schlug daneben `45056` vor: zwei
-verschiedene falsche Werte in einer Anleitung, davon einer der
-Kernel-Panik-Wert. Jetzt rechnet `set-iogpu-wired-limit.sh` beim Boot aus
-`hw.memsize` — RAM minus 6 GiB (≤ 32 GB) bzw. 8 GiB (darüber):
+**The value is no longer in the plist.** Until 2026-08-24 it hardcoded `26624` —
+the 32 GB value. Installed that way it took 14 GiB of working set away from a
+48 GB machine, while `install-prereqs.sh` suggested `45056` next to it: two
+different wrong values in one set of instructions, one of them the kernel-panic
+value. Now `set-iogpu-wired-limit.sh` computes it at boot from `hw.memsize` —
+RAM minus 6 GiB (≤ 32 GB) or 8 GiB (above):
 
-| RAM | `wired_limit_mb` | Reserve |
+| RAM | `wired_limit_mb` | reserve |
 |---|---|---|
 | 32 GB | 26624 | 6 GiB |
 | 48 GB | **40960** | 8 GiB |
 | 64 GB | 57344 | 8 GiB |
 
-Das Skript **clampt nach oben, auch bei manuell übergebenen Werten** — `45056`
-auf 48 GB wird zu `40960`. Es verweigert außerdem Werte *unter* dem
-macOS-Default, die den Working-Set senken würden. Abweichender Wert: eine Zahl
-in `/etc/iogpu-wired-limit.conf`.
+The script **clamps upwards, including for values passed by hand** — `45056` on
+48 GB becomes `40960`. It also refuses values *below* the macOS default, which
+would lower the working set. Different value: a number in
+`/etc/iogpu-wired-limit.conf`.
 
-> **Der Folgefehler war still.** Ohne gesetztes Limit fällt `roomy` auf
-> `PREFILL_STEP=512`, und weil der NAX-Pfad aus PR #3842 `qL >= 1024` verlangt,
-> greift er nicht mehr — der Gewinn aus Patch 0013 ist zwischen zwei Neustarts
-> weg, ohne Warnung. Das Start-Skript meldet diesen Fall jetzt explizit.
+> **The follow-on error was silent.** Without the limit set, `roomy` falls back
+> to `PREFILL_STEP=512`, and because the NAX path from PR #3842 requires
+> `qL >= 1024`, it no longer engages — the gain from patch 0013 is gone between
+> two restarts, without a warning. The start script now reports this case
+> explicitly.
 
 ---
 
-## Betrieb
+## Operation
 
 ```sh
 ./start-mlx_qwen3.8.sh                        # PROFILE=auto
-PROFILE=lean ./start-mlx_qwen3.8.sh           # minimaler RAM, läuft ohne sudo
-PROFILE=roomy ./start-mlx_qwen3.8.sh          # 48-GB-Setup
-PORT=8899 ./start-mlx_qwen3.8.sh              # Laborinstanz
-ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh   # ohne Drafter
+PROFILE=lean ./start-mlx_qwen3.8.sh           # minimal RAM, runs without sudo
+PROFILE=roomy ./start-mlx_qwen3.8.sh          # 48 GB setup
+PORT=8899 ./start-mlx_qwen3.8.sh              # lab instance
+ENABLE_SPEC_DECODE=0 ./start-mlx_qwen3.8.sh   # without drafter
 ```
 
-### Profile
+### Profiles
 
 | | `lean` | `balanced` | `roomy` |
 |---|---|---|---|
-| Zielmaschine | 32 GB ohne sudo | 32 GB, `wired_limit 26624` | 48 GB, `wired_limit 40960` |
-| `APC_ENTRIES` | 1 | 2 | 3 (s. Messung unten) |
-| `KV_BITS` | 8 (ab 8k Token) | — (f16) | — (f16) |
-| `PREFILL_STEP` | 512 | 1024 | 2048 (ohne `wired_limit` 512) |
+| target machine | 32 GB without sudo | 32 GB, `wired_limit 26624` | 48 GB, `wired_limit 40960` |
+| `APC_ENTRIES` | 1 | 2 | 3 (see measurement below) |
+| `KV_BITS` | 8 (from 8k tokens) | — (f16) | — (f16) |
+| `PREFILL_STEP` | 512 | 1024 | 2048 (512 without `wired_limit`) |
 | `VISION_CACHE` | 1 | 4 | 20 |
-| `APC_DISK_MAX_GB` | 40 | 40 | 80 (plattenabhängig gekappt) |
-| **Peak-RAM** | **~18,8 GiB** @ 29k | ~25,0 GiB @ 43k | ~30 GiB @ 90k (ger.) |
-| `context_length` | 32768 | 49152 | 65536 (s. „Warum 3") |
+| `APC_DISK_MAX_GB` | 40 | 40 | 80 (capped by disk) |
+| **peak RAM** | **~18.8 GiB** @ 29k | ~25.0 GiB @ 43k | ~30 GiB @ 90k (est.) |
+| `context_length` | 32768 | 49152 | 65536 (see "Why 3") |
 
-> **Bei aktivem fused Pfad** (mlx-Quellbau, s. o.) zieht das Skript
-> `PREFILL_STEP` automatisch auf mindestens **1024** — der NAX-Kernel aus #3842
-> verlangt ausdrücklich `query_sequence_length >= 1024` und greift bei 512 gar
-> nicht. Der Score-Transient, aus dem die 512 überhaupt entstanden sind, fällt
-> dann weg. Eine explizite Vorgabe `PREFILL_STEP=…` bleibt unangetastet.
+> **With the fused path active** (mlx source build, see above) the script raises
+> `PREFILL_STEP` to at least **1024** — the NAX kernel from #3842 explicitly
+> requires `query_sequence_length >= 1024` and does not engage at 512. The score
+> transient, which is why 512 existed in the first place, then disappears. An
+> explicit `PREFILL_STEP=…` is left untouched.
 
-**`PROFILE=auto`** (Default) entscheidet anhand des Metal-Working-Sets:
-≥ 30 GiB → `roomy`, ≥ 24 GiB → `balanced`, sonst `lean`. Der Working-Set wird
-dafür aus `iogpu.wired_limit_mb` bzw. dem macOS-Default (2/3 des RAM bei
-≤ 36 GB, sonst 3/4) geschätzt — die exakte Zahl aus Metal steht danach im
-Banner. `default` bleibt als Alias für `balanced` erhalten.
+**`PROFILE=auto`** (default) decides from the Metal working set:
+≥ 30 GiB → `roomy`, ≥ 24 GiB → `balanced`, otherwise `lean`. The working set is
+estimated from `iogpu.wired_limit_mb` or the macOS default (2/3 of RAM at
+≤ 36 GB, otherwise 3/4) — the exact number from Metal appears in the banner
+afterwards. `default` is kept as an alias for `balanced`.
 
-Ein Profil setzt nur *Defaults* — einzelne Env-Variablen gewinnen weiterhin,
-z. B. `PROFILE=roomy APC_ENTRIES=2 …` oder `PROFILE=lean KV_BITS=` (zurück auf
-f16).
+A profile only sets *defaults* — individual env variables still win, e.g.
+`PROFILE=roomy APC_ENTRIES=2 …` or `PROFILE=lean KV_BITS=` (back to f16).
 
-> **`roomy` stand bis 2026-08-20 auf `APC_ENTRIES=4`.** Die Budgetrechnung ist
-> ein Worst Case — alle Snapshots gleichzeitig auf voller Promptlänge — und mit
-> vier Einträgen (5 Kopien) waren das bei 44 GiB Working-Set nur ~85k Token,
-> also weniger als die empfohlenen 98304. Dass das produktiv trotzdem mit
-> 131072 trug, lag daran, dass die Snapshots real nie alle gleichzeitig am
-> Anschlag stehen: Glück, keine Garantie. Mit `APC_ENTRIES=3` (4 Kopien) sind
-> es ~142k Token, das Profil deckt seine eigene Empfehlung jetzt ab.
+> **`roomy` was set to `APC_ENTRIES=4` until 2026-08-20.** The budget
+> calculation is a worst case — all snapshots at full prompt length
+> simultaneously — and with four entries (5 copies) that was only ~85k tokens at
+> a 44 GiB working set, less than the recommended 98304. That it nevertheless
+> carried 131072 in production was because the snapshots never all sit at the
+> limit at the same time: luck, not a guarantee. With `APC_ENTRIES=3` (4 copies)
+> it is ~142k tokens, so the profile now covers its own recommendation.
 >
-> **Aber nur mit gesetztem `wired_limit`.** Ohne `sudo sysctl -w
-> iogpu.wired_limit_mb=40960` gibt macOS auf 48 GB nur 37,4 GiB Working-Set,
-> und daraus werden ~107k Token — 98304 trägt, 131072 nicht. Die maßgebliche
-> Zahl steht bei jedem Start in der Zeile `→ KONTEXT-BUDGET` im Banner.
+> **But only with `wired_limit` set.** Without `sudo sysctl -w
+> iogpu.wired_limit_mb=40960`, macOS gives only 37.4 GiB of working set on
+> 48 GB, and that yields ~107k tokens — 98304 carries, 131072 does not. The
+> authoritative number appears on every start in the `→ KONTEXT-BUDGET` line of
+> the banner.
 >
-> **Die 44-GiB-Zahlen hier sind historisch.** Sie stammen von `wired_limit
-> 45056` vor der Kernel-Panik vom 2026-08-21 und aus der Zeit vor dem fused
-> Pfad. Mit aktivem Patch `0013` fällt der Prefill-Transient aus der
-> Budgetrechnung heraus, und die Budgets liegen deutlich höher — auf 37,4 GiB
-> Working-Set meldet das Banner ~161k Token. Verlass dich auf das Banner, nicht
-> auf diese Tabellen.
+> **The 44 GiB numbers here are historical.** They come from `wired_limit 45056`
+> before the kernel panic of 2026-08-21 and from the time before the fused path.
+> With patch `0013` active the prefill transient drops out of the budget
+> calculation and the budgets are considerably higher — on a 37.4 GiB working
+> set the banner reports ~161k tokens. Trust the banner, not these tables.
 >
-> **Von 2026-08-20 bis 2026-08-21 hing auch `APC_ENTRIES` am `wired_limit`** —
-> drei Snapshots statt zwei, sobald das Limit stand. Das ist **zurückgenommen**.
-> Die Kopplung stützte sich auf genau die Budgetrechnung, die der
-> Speicher-Sampler am 2026-08-21 widerlegt hat (s. „Was der Sampler misst").
-> Sie hatte einen unangenehmen Nebeneffekt: `sudo sysctl -w
-> iogpu.wired_limit_mb=40960` hob zwar die Decke um 2,5 GiB, verdoppelte aber
-> gleichzeitig die Snapshot-Zahl — netto ein Rückschritt. `roomy` steht seit
-> 2026-08-24 fest auf `APC_ENTRIES=3` — die Messung, die für die 1 sprach, ist
-> mit Patch 0015 aufgeklärt (s. „Was der Sampler misst"), und die 3 trägt, seit
-> `_CTX_HINT` auf 65536 steht (s. „Warum 3").
+> **From 2026-08-20 to 2026-08-21 `APC_ENTRIES` also hung on `wired_limit`** —
+> three snapshots instead of two as soon as the limit was set. That is
+> **reverted**. The coupling rested on exactly the budget calculation that the
+> memory sampler disproved on 2026-08-21 (see "What the sampler measures"). It
+> had an unpleasant side effect: `sudo sysctl -w iogpu.wired_limit_mb=40960`
+> raised the ceiling by 2.5 GiB but doubled the snapshot count at the same time —
+> a net regression. `roomy` has been fixed at `APC_ENTRIES=3` since 2026-08-24 —
+> the measurement that argued for 1 is explained by patch 0015 (see "What the
+> sampler measures"), and the 3 holds now that `_CTX_HINT` is 65536 (see
+> "Why 3").
 
-Beim Start druckt das Skript das errechnete Speicherbudget dieser Maschine:
+On start the script prints the computed memory budget of this machine:
 
 ```
   ──────────── Speicherbudget (gerechnet, keine Messung) ──────
@@ -289,298 +288,294 @@ Beim Start druckt das Skript das errechnete Speicherbudget dieser Maschine:
   →  KONTEXT-BUDGET: ~48486 Token pro Konversation
 ```
 
-Wichtigste Env-Schalter (alle mit Begründung im Skriptkopf dokumentiert):
+Most important env switches (all documented with rationale in the script
+header):
 
-| Variable | Default | Wirkung |
+| variable | default | effect |
 |---|---|---|
-| `PROFILE` | `auto` | `lean` / `balanced` / `roomy` (Tabelle oben) |
-| `KV_BITS` | profilabhängig | `8` halbiert 64 → 32 KiB/Token, verdoppelt den Kontext |
-| `APC_ENTRIES` | profilabhängig | Prefix-Cache-Snapshots = warm gehaltene Konversationen |
-| `ENABLE_SPEC_DECODE` | `1` | MTP-Drafter, +58…132 % Decode |
-| `PREFILL_STEP` | profilabhängig | Prefill-Chunk = transienter Aktivierungs-Peak |
-| `BIND_HOST` / `PORT` | `127.0.0.1` / `8888` | Bind-Adresse |
-| `MODEL_ALIAS` | `Qwen3.8-27B-local` | **muss** zum Modellnamen im Request passen |
+| `PROFILE` | `auto` | `lean` / `balanced` / `roomy` (table above) |
+| `KV_BITS` | per profile | `8` halves 64 → 32 KiB/token, doubles the context |
+| `APC_ENTRIES` | per profile | prefix-cache snapshots = conversations kept warm |
+| `ENABLE_SPEC_DECODE` | `1` | MTP drafter, +58…132% decode |
+| `PREFILL_STEP` | per profile | prefill chunk = transient activation peak |
+| `BIND_HOST` / `PORT` | `127.0.0.1` / `8888` | bind address |
+| `MODEL_ALIAS` | `Qwen3.8-27B-local` | **must** match the model name in the request |
 
-> Bei `mlx-vlm` **ist** der `model`-String aus dem Request der Ladepfad — es gibt
-> kein `--alias` wie bei llama.cpp. Weicht der Name ab, wirft der Server das
-> geladene Modell weg und startet einen HuggingFace-Download (→ 401, obwohl das
-> Modell lokal liegt). Das Skript legt dafür einen Symlink an und warnt bei
-> Abweichung.
+> With `mlx-vlm` the `model` string from the request **is** the load path — there
+> is no `--alias` like in llama.cpp. If the name differs, the server discards the
+> loaded model and starts a HuggingFace download (→ 401, even though the model is
+> local). The script creates a symlink for this and warns on mismatch.
 
 ---
 
-## Was der Sampler misst
+## What the sampler measures
 
-Seit 2026-08-21 schreibt das Start-Skript alle 5 s eine Speicherzeile ins
-`server.log` (`MEM_PROBE_INTERVAL=0` schaltet ab, ab 85 % wird daraus ein
-`WARNING`):
+Since 2026-08-21 the start script writes a memory line to `server.log` every 5 s
+(`MEM_PROBE_INTERVAL=0` disables it; from 85% it becomes a `WARNING`):
 
 ```
 2026-08-21 14:23:13 - WARNING - mem active=37.78 cache=0.13 sum=37.91 GiB (95% von 40.00 GiB Working-Set) peak=39.49 GiB
 ```
 
-Der Sampler hängt sich **nicht** in `mlx-vlm` ein — das Skript startet
-`mlx_vlm.server` über einen `runpy`-Bootstrap mit einem Daemon-Thread davor. Ein
-Patch in `site-packages` wäre nach jedem `mlx-vlm`-Update wieder weg. Von außen
-ist die Zahl nicht messbar: RSS enthält die Metal-Buffer nicht (gemessen 2,3 GiB
-RSS bei 16 GiB Gewichten).
+The sampler does **not** hook into `mlx-vlm` — the script starts
+`mlx_vlm.server` through a `runpy` bootstrap with a daemon thread in front. A
+patch in `site-packages` would be gone after every `mlx-vlm` update. From
+outside, the number is not measurable: RSS does not include the Metal buffers
+(measured 2.3 GiB RSS with 16 GiB of weights).
 
-**Was er gefunden hat.** Zwei Posten, die in keiner Rechnung standen.
+**What it found.** Two items that appeared in no calculation.
 
-**Der fixe Sockel: ~9 GiB, behoben.** `active` sprang beim ersten Generieren von
-15,96 auf 25,42 GiB — unabhängig von der Kontextlänge (ein 16-Token-Request löst
-ihn genauso aus wie 44.452 Token) und wurde nie freigegeben. Eine Sonde um
-`mx.eval` zeigte die Quelle:
+**The fixed floor: ~9 GiB, resolved.** `active` jumped from 15.96 to 25.42 GiB
+on the first generation — independent of context length (a 16-token request
+triggers it just as much as 44,452 tokens) and never released. A probe around
+`mx.eval` showed the source:
 
 ```
-8,71 GiB kumuliert  n=128  language.py:1098  _target_verify_quantized_linears
+8.71 GiB cumulative  n=128  language.py:1098  _target_verify_quantized_linears
 ```
 
-`_fused_quantized_linears()` kopiert QKV- und MLP-Gewichte je Layer zu einem
-fusionierten Tensor zusammen und hängt ihn dauerhaft ans Modul — eine zweite
-Fassung der quantisierten Gewichte. Kein Leck, eine Optimierung, die niemand
-wieder abräumt. Patch `0015` macht sie abschaltbar, das Start-Skript schaltet
-sie ab. Ergebnis: `active` nach dem ersten Request **16,70 statt 25,42 GiB**.
+`_fused_quantized_linears()` concatenates the QKV and MLP weights of each layer
+into a fused tensor and attaches it to the module permanently — a second copy of
+the quantized weights. Not a leak: an optimisation nobody tears down again.
+Patch `0015` makes it switchable, and the start script switches it off. Result:
+`active` after the first request is **16.70 instead of 25.42 GiB**.
 
-**Ein „Kriechgang pro Request" existiert nicht.** Er war zwischenzeitlich mit
-~0,6 GiB je Request angesetzt — das war ein Messfehler. In den betroffenen
-Reihen wuchs mit jedem Request auch die **Kontextlänge**, und was wie
-Retention aussah, war schlicht der wachsende KV-Cache der laufenden
-Konversation. Der Gegentest mit **konstanter** Länge (8 × 13.460 Token,
-APC aus) zeigt den Idle-Wert ab dem zweiten Request unbewegt:
+**A "creep per request" does not exist.** It was estimated at ~0.6 GiB per
+request for a while — that was a measurement error. In the affected series the
+**context length** grew with every request, and what looked like retention was
+simply the growing KV cache of the running conversation. The counter-test at
+**constant** length (8 × 13,460 tokens, APC off) shows the idle value unmoved
+from the second request onwards:
 
-| Request | idle davor | Peak | Δ idle |
+| request | idle before | peak | Δ idle |
 |---|---|---|---|
-| 1 | 15,96 GiB | 18,73 GiB | — |
-| 2 | 18,14 GiB | 21,20 GiB | +2,18 |
-| 3 | 17,85 GiB | 21,07 GiB | −0,29 |
-| 4 | 18,14 GiB | 21,26 GiB | +0,29 |
-| 5–8 | **18,14 GiB** | 21,1–21,5 GiB | **0,000** |
+| 1 | 15.96 GiB | 18.73 GiB | — |
+| 2 | 18.14 GiB | 21.20 GiB | +2.18 |
+| 3 | 17.85 GiB | 21.07 GiB | −0.29 |
+| 4 | 18.14 GiB | 21.26 GiB | +0.29 |
+| 5–8 | **18.14 GiB** | 21.1–21.5 GiB | **0.000** |
 
-Der einmalige Sprung ist der KV-Cache *einer* Konversation (13.460 × 64 KiB =
-0,82 GiB) plus dem Restsockel von ~1,3 GiB. Danach: nichts. Der Speicher folgt
-der Kontextlänge, wie die Rechnung es vorsieht — es gibt kein Leck.
+The one-off jump is the KV cache of *one* conversation (13,460 × 64 KiB =
+0.82 GiB) plus the remaining ~1.3 GiB floor. After that: nothing. Memory follows
+context length exactly as the calculation predicts — there is no leak.
 
-**Was danach möglich ist.** Einzelne kalte Requests nach Patch 0015, Working-Set
-40 GiB:
+**What became possible afterwards.** Single cold requests after patch 0015,
+40 GiB working set:
 
-| Prompt | Ergebnis |
+| prompt | result |
 |---|---|
-| 85.730 Token | ✅ 264 s, Peak 89 % |
-| 128.570 Token | ✅ 464 s, Peak 95 % |
-| ~171.000 Token | ❌ — aber am **600-s-Timeout**, nicht an Speicher |
+| 85,730 tokens | ✅ 264 s, peak 89% |
+| 128,570 tokens | ✅ 464 s, peak 95% |
+| ~171,000 tokens | ❌ — but at the **600 s timeout**, not on memory |
 
-Vor Patch 0015 starb dieselbe Maschine in der Agent-Kette bei ~23k Token.
+Before patch 0015 the same machine died in the agent chain at ~23k tokens.
 
-**Warum der Sampler bleibt.** Die Speicherrechnung unten ist eine Obergrenze,
-keine Zusage. Erster Lauf mit Sampler, `roomy`, Working-Set 40 GiB,
-`APC_ENTRIES=3`, noch **ohne** Patch 0015:
+**Why the sampler stays.** The memory calculation below is an upper bound, not a
+promise. First run with the sampler, `roomy`, 40 GiB working set,
+`APC_ENTRIES=3`, still **without** patch 0015:
 
-| Zeitpunkt | `active` |
+| point in time | `active` |
 |---|---|
-| nach Modell + Drafter, idle | **15,96 GiB** ← Baseline, deckt sich mit der Tabelle |
-| nach 1 Request à 13.112 Token | 27,35 GiB ← **+11,4 GiB** |
-| nach 4 Requests | 35,54 GiB |
-| bei 23.091 Token | 37,78 GiB → 95 %, der nächste Prefill starb im OOM |
+| after model + drafter, idle | **15.96 GiB** ← baseline, matches the table |
+| after 1 request of 13,112 tokens | 27.35 GiB ← **+11.4 GiB** |
+| after 4 requests | 35.54 GiB |
+| at 23,091 tokens | 37.78 GiB → 95%, the next prefill died in OOM |
 
-Die Rechnung setzt für diesen 13k-Request 1,6 GiB an (4 Kopien × 32 KiB/Token).
-Real sind es 11,4 — **Faktor 7** — und `active` fällt zwischen den Requests
-nicht zurück. `cache` liegt dabei durchgehend nahe null, der Puffer-Cache ist
-also nicht die Ursache: mlx gibt ihn bei `gc_limit_ = 0,95 × Working-Set`
-korrekt frei (`mlx/backend/metal/allocator.cpp`). Es ist **lebender** Speicher,
-und für den gibt es unterhalb des Working-Sets keine Bremse.
+The calculation budgets 1.6 GiB for that 13k request (4 copies × 32 KiB/token).
+In reality it is 11.4 — **factor 7** — and `active` does not fall back between
+requests. `cache` stays near zero throughout, so the buffer cache is not the
+cause: mlx releases it correctly at `gc_limit_ = 0.95 × working set`
+(`mlx/backend/metal/allocator.cpp`). This is **live** memory, and below the
+working set there is no brake on it.
 
-**Aufgelöst — es war der Sockel, nicht der Cache.** Diese Messung lief *ohne*
-Patch 0015. Von den 11,4 GiB sind **9,46 GiB** der fixe Sockel aus
-`_fused_quantized_linears()` (s. „Der fixe Sockel" oben): 11,4 − 9,46 =
-**1,94 GiB** gegen angesetzte 1,2–1,6 — das deckt sich, der „Faktor 7" ist weg.
-Dass `active` zwischen den Requests nicht zurückfiel, war dieselbe Ursache; der
-vermutete „Kriechgang pro Request" war zusätzlich ein Messfehler (wachsende
-Kontextlänge, Gegentest mit konstanter Länge oben).
+**Resolved — it was the floor, not the cache.** This measurement ran *without*
+patch 0015. Of the 11.4 GiB, **9.46 GiB** is the fixed floor from
+`_fused_quantized_linears()` (see "The fixed floor" above): 11.4 − 9.46 =
+**1.94 GiB** against a budgeted 1.2–1.6 — that matches, and the "factor 7" is
+gone. That `active` did not fall back between requests had the same cause; the
+suspected "creep per request" was additionally a measurement error (growing
+context length, counter-test at constant length above).
 
-Damit ist die Begründung für `APC_ENTRIES=1` entfallen. `roomy` steht seit
-2026-08-24 auf **3** (zunächst 2, s. „Warum 3" unten). Was die 1 gekostet hat, aus `server.log`
-(810 Prefills, 118 Serverläufe, 37,9 % kalt):
+That removes the justification for `APC_ENTRIES=1`. `roomy` has been at **3**
+since 2026-08-24 (initially 2, see "Why 3" below). What the 1 cost, from
+`server.log` (810 prefills, 118 server runs, 37.9% cold):
 
-| | Anzahl | Prefill-Zeit |
+| | count | prefill time |
 |---|---|---|
-| warm | 503 | 9,71 M Token wiederverwendet |
-| kalt < 8k | 184 | 602 s (irrelevant) |
-| kalt 8–20k | 40 | 1128 s |
-| kalt > 20k | 83 | 5331 s |
-| **kalt ≥ 8k** | **123** | **107,7 min** |
+| warm | 503 | 9.71 M tokens reused |
+| cold < 8k | 184 | 602 s (irrelevant) |
+| cold 8–20k | 40 | 1128 s |
+| cold > 20k | 83 | 5331 s |
+| **cold ≥ 8k** | **123** | **107.7 min** |
 
-Diese 107,7 min sind **zwei** Fehler, nicht einer:
+Those 107.7 min are **two** faults, not one:
 
-* **72,7 min** (81 Prefills) folgen im selben Serverlauf auf einen früheren
-  großen Request — Verdrängung auf einem Snapshot-Platz (`in_flight=2` steht
-  5× im Log). Das ist die Obergrenze: ein Teil davon sind echte neue
-  Konversationen, die kein zusätzlicher Platz retten würde. Fix: `APC_ENTRIES`.
-* **34,9 min** (42 Prefills) sind der *erste* große Request ihres Laufs — die
-  hätte der Disk-Tier fangen müssen. Fix: Namespace-GC + korrigierte
-  Deckel-Rechnung (s. unten), nicht `APC_ENTRIES`.
+* **72.7 min** (81 prefills) follow an earlier large request within the same
+  server run — eviction with too few snapshot slots (`in_flight=2` appears 5× in
+  the log). This is the upper bound: some of them are genuinely new
+  conversations that no additional slot would save. Fix: `APC_ENTRIES`.
+* **34.9 min** (42 prefills) are the *first* large request of their run — those
+  the disk tier should have caught. Fix: namespace GC + corrected cap
+  arithmetic (see below), not `APC_ENTRIES`.
 
-#### Warum 3 — und warum das am `context_length` der Clients hängt
+#### Why 3 — and why it depends on the clients' `context_length`
 
-Hier stand zuerst **2**, gerechnet gegen den damaligen `_CTX_HINT` von 98.304.
-Diese Rechnung war nicht falsch, sie beantwortete die falsche Frage — und die
-Einstellung hat deshalb **nie gegriffen**.
+This said **2** at first, computed against the then-current `_CTX_HINT` of
+98,304. That calculation was not wrong, it answered the wrong question — and the
+setting therefore **never took effect**.
 
-**`mlx-vlm` hat kein `-c`-Flag.** Der Serverkontext kommt aus der `config.json`
-(262144); der effektive Deckel ist allein das `context_length` des *Clients*.
-`_CTX_HINT` ist eine Empfehlung fürs Banner und der Eingabewert der
-Überbuchungs-Sperre — **kein Serverlimit**. Diese Sperre reduziert `APC_ENTRIES`,
-solange `ctx_hint > Budget × 0,8`. Nachgerechnet mit dem Budget-Block des
-Skripts selbst (Working-Set 40,0 GiB, Gewichte 16,0 GiB, Patch 0013 aktiv):
+**`mlx-vlm` has no `-c` flag.** The server context comes from `config.json`
+(262144); the effective ceiling is the *client's* `context_length` alone.
+`_CTX_HINT` is a recommendation for the banner and the input to the overbooking
+guard — **not a server limit**. That guard reduces `APC_ENTRIES` while
+`ctx_hint > budget × 0.8`. Computed with the script's own budget block
+(40.0 GiB working set, 16.0 GiB weights, patch 0013 active):
 
-| `_CTX_HINT` | gesetzt | `entries_used` | Kopien | Budget |
+| `_CTX_HINT` | set | `entries_used` | copies | budget |
 |---|---|---|---|---|
 | 98304 | 2 | **1** | 2 | 182133 |
 | 98304 | 3 | **1** | 2 | 182133 |
 | 65536 | 2 | 2 | 3 | 120654 |
 | **65536** | **3** | **3** | **4** | **89914** |
 
-Mit 98.304 landet *jede* Einstellung bei 1. Da alle drei pi-Instanzen auf
-`contextWindow` 65536 stehen, beschrieb `_CTX_HINT=98304` einen Client, den es
-nicht gibt — und verplante Speicher für Prompts, die niemand schickt. Beide
-Werte sind deshalb korrigiert: `_CTX_HINT` 98304 → **65536**, `APC_ENTRIES`
-2 → **3**.
+At 98,304 *every* setting ends up at 1. Since all three pi instances run
+`contextWindow` 65536, `_CTX_HINT=98304` described a client that does not exist —
+and reserved memory for prompts nobody sends. Both values are therefore
+corrected: `_CTX_HINT` 98304 → **65536**, `APC_ENTRIES` 2 → **3**.
 
-Bedarf bei 65536 (64 KiB/Token f16 — `dequantize_for_apc()`, s. Kasten — plus
-152 MiB GDN je Kopie, Basis 16,70 GiB, nutzbar 0,95 × 40 GiB = 38,0 GiB):
+Requirement at 65536 (64 KiB/token f16 — `dequantize_for_apc()`, see box — plus
+152 MiB GDN per copy, base 16.70 GiB, usable 0.95 × 40 GiB = 38.0 GiB):
 
-| `APC_ENTRIES` | Kopien | Bedarf | |
+| `APC_ENTRIES` | copies | requirement | |
 |---|---|---|---|
-| 2 | 3 | 29,1 GiB | |
-| **3** | **4** | **33,3 GiB** | 4,7 GiB Luft — ein warmer Platz je Instanz |
-| 4 | 5 | 37,4 GiB | zu knapp |
+| 2 | 3 | 29.1 GiB | |
+| **3** | **4** | **33.3 GiB** | 4.7 GiB spare — one warm slot per instance |
+| 4 | 5 | 37.4 GiB | too tight |
 
-> **Die 3 hängt an den Clients.** Wer eine Instanz auf 98304 hebt, muss
-> `APC_ENTRIES` mit zurückziehen — sonst kappt die Sperre still auf 1 und *alle*
-> drei verlieren ihren warmen Platz. Die Warnung dazu steht im Startbanner
-> (`APC_ENTRIES N → M gekappt`); sie geht dort leicht unter.
+> **The 3 depends on the clients.** Raising one instance to 98304 requires
+> pulling `APC_ENTRIES` back with it — otherwise the guard silently caps to 1 and
+> *all* three lose their warm slot. The warning for this is in the start banner
+> (`APC_ENTRIES N → M gekappt`); it is easy to miss there.
 
-Das `KONTEXT-BUDGET` im Banner bleibt als Obergrenze markiert: **maßgeblich sind
-die `mem`-Zeilen, nicht die Rechnung.**
+The `KONTEXT-BUDGET` in the banner remains marked as an upper bound:
+**the `mem` lines are authoritative, not the calculation.**
 
-> **`KV_BITS=8` hilft hier nicht.** Naheliegend, weil ohne Score-Transient die
-> 64 KiB/Token dominieren — aber `apc_adapters.py:515` ruft beim Snapshot-Store
-> `dequantize_for_apc()`. Quantisiert wird nur der lebende Cache, die
-> APC-Snapshots bleiben f16. Gemessen: Decode 22,9 → 18,7 tok/s (Mittel aus 6
-> bzw. 8 Requests), `active` kletterte unverändert auf 37,78 GiB, gleicher OOM.
+> **`KV_BITS=8` does not help here.** Tempting, because without the score
+> transient the 64 KiB/token dominate — but `apc_adapters.py:515` calls
+> `dequantize_for_apc()` on snapshot store. Only the live cache is quantized, the
+> APC snapshots stay f16. Measured: decode 22.9 → 18.7 tok/s (mean of 6 and 8
+> requests respectively), `active` climbed to 37.78 GiB unchanged, same OOM.
 
-### Watchdog: Netz, kein Muss
+### Watchdog: a net, not a requirement
 
-Entstanden, als der Speichersockel noch unerklärt war. Seit Patch `0015` ist er
-**nicht mehr nötig** — der Speicher folgt der Kontextlänge und läuft nicht mehr
-von selbst voll. Als Netz für unbeaufsichtigte Läufe schadet er nicht.
-`watchdog-mlx_qwen3.8.sh` läuft **statt** des Start-Skripts und reicht alle
-Variablen durch:
+Written while the memory floor was still unexplained. Since patch `0015` it is
+**no longer necessary** — memory follows context length and no longer fills up
+by itself. As a net for unattended runs it does no harm.
+`watchdog-mlx_qwen3.8.sh` runs **instead of** the start script and passes all
+variables through:
 
 ```sh
 ./watchdog-mlx_qwen3.8.sh
 ENABLE_APC=0 WATCHDOG_PCT=85 ./watchdog-mlx_qwen3.8.sh
 ```
 
-| Variable | Default | |
+| variable | default | |
 |---|---|---|
-| `WATCHDOG_PCT` | `90` | Schwelle in % des Working-Sets |
-| `WATCHDOG_STREAK` | `3` | Messungen in Folge über der Schwelle |
-| `WATCHDOG_POLL` | `10` | Sekunden zwischen zwei Prüfungen |
-| `WATCHDOG_MAX_WAIT` | `180` | Sekunden auf Leerlauf warten, dann hart |
+| `WATCHDOG_PCT` | `90` | threshold in % of the working set |
+| `WATCHDOG_STREAK` | `3` | consecutive measurements above the threshold |
+| `WATCHDOG_POLL` | `10` | seconds between two checks |
+| `WATCHDOG_MAX_WAIT` | `180` | seconds to wait for idle, then hard restart |
 
-Er wartet auf `in_flight=0`, bevor er neu startet, und erkennt auch einen
-weggestorbenen Serverprozess. **90 statt 95:** bei 95 % starb am 2026-08-22 ein
-29.632-Token-Prefill nach 34 % — die Schwelle muss noch Platz für den
-laufenden Prefill lassen.
+It waits for `in_flight=0` before restarting and also detects a server process
+that has died. **90 instead of 95:** at 95% a 29,632-token prefill died at 34% on
+2026-08-22 — the threshold has to leave room for the running prefill.
 
-Ein Neustart setzt auf die 15,96-GiB-Baseline zurück. Nach Patch `0015` ist das
-nur noch relevant, wenn eine einzelne Konversation wirklich sehr lang wird —
-gegen einen Sockel, der von selbst wächst, muss er nicht mehr anlaufen.
+A restart returns to the 15.96 GiB baseline. After patch `0015` this only
+matters when a single conversation really does get very long — it no longer has
+to run against a floor that grows by itself.
 
 ---
 
-## Die Speicherrechnung
+## The memory calculation
 
-| Posten | Größe | Herkunft |
+| item | size | source |
 |---|---|---|
-| Gewichte, 4bit affine (3 Shards) | **14,95 GiB** | Dateigröße |
-| MTP-Drafter (Speculative Decoding) | 0,23 GiB | Dateigröße |
-| Aktivierungen, Metal-Heap, Python | ~1,5 GiB | Erfahrungswert |
-| KV-Cache | **64 KiB / Token** | 16 Full-Attn-Layer × 4 KV-Heads × (256+256) × 2 B |
-| GDN-State (48 Linear-Layer) | 152 MiB, **längenunabhängig** | 48 × 48 v-Heads × 128 × 128 × 4 B (float32) |
+| weights, 4bit affine (3 shards) | **14.95 GiB** | file size |
+| MTP drafter (speculative decoding) | 0.23 GiB | file size |
+| activations, Metal heap, Python | ~1.5 GiB | empirical |
+| KV cache | **64 KiB / token** | 16 full-attn layers × 4 KV heads × (256+256) × 2 B |
+| GDN state (48 linear layers) | 152 MiB, **length-independent** | 48 × 48 v-heads × 128 × 128 × 4 B (float32) |
 
-Qwen3.8-27B ist ein **Hybrid**: nur 16 der 64 Layer sind Full-Attention (die
-zahlen KV pro Token), die anderen 48 sind Gated DeltaNet mit konstantem
-rekurrentem State. Und es ist **dense** — kein MoE, jeder Token liest alle
-~15 GiB.
+Qwen3.8-27B is a **hybrid**: only 16 of the 64 layers are full attention (those
+pay KV per token), the other 48 are Gated DeltaNet with a constant recurrent
+state. And it is **dense** — no MoE, every token reads all ~15 GiB.
 
-Der KV-Posten fällt **pro Kopie** an: einmal für die laufende Sequenz, einmal
-pro Prefix-Cache-Snapshot. Mit `APC_ENTRIES=3` sind das 4 Kopien:
+The KV item is paid **per copy**: once for the running sequence, once per
+prefix-cache snapshot. With `APC_ENTRIES=3` that is 4 copies:
 
 ```
-Budget = (Working-Set − Gewichte − 1,5 GiB − Kopien × 152 MiB) / (Kopien × KV_pro_Token)
-Bedarf = 16,7 GiB + Kopien × (Token × KV_pro_Token + 152 MiB)
+budget = (working set − weights − 1.5 GiB − copies × 152 MiB) / (copies × KV_per_token)
+need   = 16.7 GiB + copies × (tokens × KV_per_token + 152 MiB)
 ```
 
-### Wieviel RAM braucht es konkret?
+### How much RAM does it actually need?
 
-Profil `default`, ctx 49152:
+Profile `default`, ctx 49152:
 
-| Zustand | RAM |
+| state | RAM |
 |---|---|
-| Gewichte geladen, Leerlauf | 15,2 GiB (gemessen: RSS 15,5 GiB) |
-| + Aktivierungen / Metal-Heap / Python | ~16,7 GiB |
-| Betrieb, 8k-Prompt | ~18,7 GiB |
-| Betrieb, Spitzenprompt 43k | **~25,0 GiB** ← dimensionierend |
+| weights loaded, idle | 15.2 GiB (measured: RSS 15.5 GiB) |
+| + activations / Metal heap / Python | ~16.7 GiB |
+| operation, 8k prompt | ~18.7 GiB |
+| operation, peak prompt 43k | **~25.0 GiB** ← the sizing case |
 
-Profil `lean` mit ctx 32768 kommt auf **~18,8 GiB** Peak. Der absolute Boden für
-dieses Modell liegt bei **~17 GiB** (ohne Drafter, ohne Cache, 8k Kontext, KV4)
-— darunter hilft nur ein anderes Modell oder ein kleineres Quant.
+Profile `lean` with ctx 32768 peaks at **~18.8 GiB**. The absolute floor for this
+model is **~17 GiB** (no drafter, no cache, 8k context, KV4) — below that only a
+different model or a smaller quant helps.
 
-Dazu kommen 5–6 GB für macOS selbst; das ist der Grund, warum auf 32 GB bei
-26 GiB Wired-Limit Schluss ist.
+On top of that, 5–6 GB for macOS itself; that is why 32 GB tops out at a 26 GiB
+wired limit.
 
-Metals `max_recommended_working_set_size` ist auf Macs **≤ 36 GB per Default
-2/3 des RAM** → auf 32 GB nur 21,33 GiB. `iogpu.wired_limit_mb` setzt diesen
-Wert direkt (verifiziert: `wired_limit_mb=45056` → Working-Set exakt 44 GiB;
-der Wert ist 1:1, `40960` → 40 GiB). **Nicht über 40960 auf einer 48-GiB-
-Maschine** — bei 44 GiB bleiben macOS ~2 GiB, und das endet in einer
-Kernel-Panik statt in einem Metal-Fehler (s. oben).
+Metal's `max_recommended_working_set_size` is **2/3 of RAM by default on Macs
+≤ 36 GB** → only 21.33 GiB on 32 GB. `iogpu.wired_limit_mb` sets this value
+directly (verified: `wired_limit_mb=45056` → working set exactly 44 GiB; the
+value is 1:1, `40960` → 40 GiB). **Not above 40960 on a 48 GiB machine** — at
+44 GiB macOS is left with ~2 GiB, and that ends in a kernel panic rather than a
+Metal error (see above).
 
-| `iogpu.wired_limit_mb` | KV | Budget | empfohlenes `context_length` |
+| `iogpu.wired_limit_mb` | KV | budget | recommended `context_length` |
 |---|---|---|---|
-| Default (21,3 GiB) | f16 | ~23k Token | 24576 — knapp, funktioniert |
-| Default (21,3 GiB) | `KV_BITS=8` | ~46k Token | 32768 |
-| **26624 (26 GiB)** | **f16** | **~48k Token** | **49152 ← Empfehlung** |
-| 26624 (26 GiB) | `KV_BITS=8` | ~97k Token | 65536 (bis 98304) |
+| default (21.3 GiB) | f16 | ~23k tokens | 24576 — tight, works |
+| default (21.3 GiB) | `KV_BITS=8` | ~46k tokens | 32768 |
+| **26624 (26 GiB)** | **f16** | **~48k tokens** | **49152 ← recommendation** |
+| 26624 (26 GiB) | `KV_BITS=8` | ~97k tokens | 65536 (up to 98304) |
 
-**Empfehlung: Wired-Limit 26 GiB, KV f16, Kontext 49152.** Damit ist kein
-einziger ungemessener Trade-off im Spiel.
+**Recommendation: wired limit 26 GiB, KV f16, context 49152.** That involves not
+a single unmeasured trade-off.
 
-Warum nicht höher als 26624: macOS braucht selbst 5–6 GB. Ein zu hohes Limit
-tauscht „Metal OOM" gegen Beachball bzw. Kernel-Panic. Reine
-Inferenz-Maschine ohne Browser/IDE: 28672 geht.
+Why not higher than 26624: macOS needs 5–6 GB itself. Too high a limit trades
+"Metal OOM" for a beachball or a kernel panic. Pure inference machine without
+browser/IDE: 28672 works.
 
 ---
 
-## Client-Konfiguration
+## Client configuration
 
-Der Server spricht OpenAI-Chat-Completions auf `http://localhost:8888/v1`.
-Für jeden Client gelten dieselben zwei Regeln: **Modellname = Alias** und
-**Kontext ≤ Budget**.
+The server speaks OpenAI chat completions on `http://localhost:8888/v1`. The
+same two rules apply to every client: **model name = alias** and
+**context ≤ budget**.
 
-| Einstellung | Wert | Warum |
+| setting | value | why |
 |---|---|---|
-| Modellname | `Qwen3.8-27B-local` | **muss** zum Symlink-Namen passen — bei mlx-vlm *ist* der Request-Modellname der Ladepfad |
+| model name | `Qwen3.8-27B-local` | **must** match the symlink name — with mlx-vlm the request model name *is* the load path |
 | `base_url` | `http://localhost:8888/v1` | |
-| `context_length` | `lean` 32768 · `balanced` 49152 · `roomy` 65536 (s. u.) | ≤ Kontext-Budget aus dem Start-Banner |
-| `max_tokens` | 8192 | **nicht erhöhen**, s. u. |
-| `reasoning_effort` | `low` | nur `low\|medium\|xhigh` — alles andere → HTTP 500 |
+| `context_length` | `lean` 32768 · `balanced` 49152 · `roomy` 65536 (see below) | ≤ context budget from the start banner |
+| `max_tokens` | 8192 | **do not raise**, see below |
+| `reasoning_effort` | `low` | only `low\|medium\|xhigh` — anything else → HTTP 500 |
 | `enable_thinking` | `true` | |
 
-Ein Client mit YAML-Konfiguration im verbreiteten `model:`-Format sieht damit
-etwa so aus:
+A client with YAML configuration in the common `model:` format then looks
+roughly like this:
 
 ```yaml
 model:
@@ -597,536 +592,527 @@ compression:
   threshold: 0.85
 ```
 
-**Warum `max_tokens` nicht hoch darf:** viele Clients lösen die Kompaktierung
-bei `(context_length − max_tokens) × threshold` aus. Ein größeres `max_tokens`
-verschiebt also den Trigger nach unten und verschenkt Kontext.
+**Why `max_tokens` must not go up:** many clients trigger compaction at
+`(context_length − max_tokens) × threshold`. A larger `max_tokens` therefore
+moves the trigger down and wastes context.
 
-Rechnung für 65536: (65536 − 8192) × 0,85 → Kompaktierung bei ~48,7k,
-Spitzenprompt ~57k — unter dem Budget.
+Calculation for 65536: (65536 − 8192) × 0.85 → compaction at ~48.7k, peak prompt
+~57k — below the budget.
 
-> **Warum für `roomy` hier 65536 steht und nicht die 98304 aus der
-> Profiltabelle:** die Profilzahl galt **mit** gesetztem `wired_limit` (die
-> Tabelle unten rechnet mit den historischen 44 GiB, s. o.). Ohne das Limit
-> gibt macOS auf 48 GB nur 37,4 GiB, und dann ist 98304 rechnerisch am
-> Anschlag — der Bedarf liegt bei 35,9 GiB, es bleiben 0,1 GiB übrig:
+> **Why `roomy` says 65536 here and not the 98304 from the profile table:** the
+> profile number applied **with** `wired_limit` set (the table below computes
+> with the historical 44 GiB, see above). Without the limit macOS gives only
+> 37.4 GiB on 48 GB, and then 98304 is right at the edge — the requirement is
+> 35.9 GiB, leaving 0.1 GiB:
 >
-> Das gilt für den **unfused** Pfad. Mit dem mlx-Quellbau fällt der
-> Prefill-Transient weg, und 98304 trägt auch auf 37,4 GiB.
+> That applies to the **unfused** path. With the mlx source build the prefill
+> transient disappears, and 98304 carries on 37.4 GiB as well.
 >
-> | `context_length` | Bedarf (3 Kopien) | bei 37,4 GiB | mit 44 GiB |
+> | `context_length` | need (3 copies) | at 37.4 GiB | with 44 GiB |
 > |---|---|---|---|
-> | 131072 | 41,9 GiB | **OOM** | +2,1 GiB knapp |
-> | 98304 | 35,9 GiB | +0,1 GiB knapp | +8,1 GiB |
-> | **65536** | **29,9 GiB** | **+7,5 GiB** | +14,1 GiB |
+> | 131072 | 41.9 GiB | **OOM** | +2.1 GiB tight |
+> | 98304 | 35.9 GiB | +0.1 GiB tight | +8.1 GiB |
+> | **65536** | **29.9 GiB** | **+7.5 GiB** | +14.1 GiB |
 >
-> Gemessen: mit 98304 und ohne Wired-Limit starb hier reproduzierbar jeder
-> vierte Request an `[METAL] Insufficient Memory` — bei Prompts von 17k Token.
-> 65536 trägt in beiden Fällen. Wer 98304 fahren will, setzt zuerst das Limit.
+> Measured: with 98304 and without the wired limit, every fourth request died
+> reproducibly with `[METAL] Insufficient Memory` — at prompts of 17k tokens.
+> 65536 carries in both cases. To run 98304, set the limit first.
 
-Das Start-Skript prüft das auf Wunsch selbst mit:
+The start script can check this for you:
 
 ```sh
-CLIENT_CONFIG=~/pfad/zu/config.yaml ./start-mlx_qwen3.8.sh
+CLIENT_CONFIG=~/path/to/config.yaml ./start-mlx_qwen3.8.sh
 ```
 
-Dann warnt es, wenn `model.context_length` über dem errechneten Budget liegt
-oder `model.default` nicht zum Alias passt. Ohne die Variable ist die Prüfung
+It then warns when `model.context_length` exceeds the computed budget or
+`model.default` does not match the alias. Without the variable the check is
 inert.
 
-**Thinking:** Das Chat-Template von Qwen3.8 akzeptiert nur `low|medium|xhigh`
-und wirft bei jedem anderen Wert — auch `none` — eine Exception (HTTP 500).
-Ohne Angabe defaultet es auf `xhigh`, die teuerste Stufe (gemessen: 1269 statt
-428 Completion-Tokens). Bei ~9 t/s sind das zwei Minuten Unterschied. Steigt
-die Tool-Fehlerrate, auf `medium` gehen — zu flaches Reasoning kann die
-Gesamtlatenz durch Fehlversuche *erhöhen*.
+**Thinking:** the Qwen3.8 chat template accepts only `low|medium|xhigh` and
+throws an exception (HTTP 500) on any other value — including `none`. With
+nothing specified it defaults to `xhigh`, the most expensive level (measured:
+1,269 instead of 428 completion tokens). At ~9 t/s that is a two-minute
+difference. If the tool error rate rises, go to `medium` — reasoning that is too
+shallow can *increase* total latency through failed attempts.
 
 ---
 
-## Zu erwartende Geschwindigkeit
+## Speed to expect
 
-Dense heißt: jeder Decode-Schritt liest ~15 GiB, das ist reine
-Speicherbandbreite. Gemessen auf einem M5 Pro, hochskaliert auf die
-bandbreitenärmere Basis-Variante (~153 GB/s):
+Dense means every decode step reads ~15 GiB; that is pure memory bandwidth.
+Measured on an M5 Pro, scaled to the lower-bandwidth base variant (~153 GB/s):
 
-| | M5 Pro / 48 GB (gemessen) | M5 Basis / 32 GB (**geschätzt**) |
+| | M5 Pro / 48 GB (measured) | M5 base / 32 GB (**estimated**) |
 |---|---|---|
-| Decode roh | 17,5–18,4 t/s | ~8–10 t/s |
-| Decode mit MTP-SpecDec (Tool-Calls/JSON) | 26,9–41,5 t/s | ~13–20 t/s |
-| Prefill | 420–470 t/s | ~180–250 t/s |
+| decode raw | 17.5–18.4 t/s | ~8–10 t/s |
+| decode with MTP spec-dec (tool calls/JSON) | 26.9–41.5 t/s | ~13–20 t/s |
+| prefill | 420–470 t/s | ~180–250 t/s |
 
-Ein **kalter** 30k-Prefill dauert damit 2–3 Minuten. Deshalb sind Prefix-Cache
-und SSD-Tier hier keine Optimierung, sondern Voraussetzung: gemessen 89 630 ms
-→ 350 ms für einen 36k-Prompt nach Serverneustart (Faktor 256).
+A **cold** 30k prefill therefore takes 2–3 minutes. That is why the prefix cache
+and the SSD tier are not an optimisation here but a precondition: measured
+89,630 ms → 350 ms for a 36k prompt after a server restart (factor 256).
 
-### Kalte Prefills sind der teuerste Posten — nicht der Decode
+### Cold prefills are the most expensive item — not decode
 
-Auswertung des Produktivlogs vom 2026-08-17 bis -20 (18 335 Zeilen):
+Analysis of the production log from 2026-08-17 to -20 (18,335 lines):
 
 | | |
 |---|---|
-| Prefills mit `cached_tokens`-Angabe | 549 |
-| davon `cached_tokens=0` | **168 (30,6 %)** |
-| davon über 8k Token | 45 |
-| deren Prefill-Zeit zusammen | **2415 s** |
+| prefills reporting `cached_tokens` | 549 |
+| of those `cached_tokens=0` | **168 (30.6%)** |
+| of those above 8k tokens | 45 |
+| their combined prefill time | **2415 s** |
 
-Zum Vergleich: der DFlash-2-Gewinn gegenüber MTP sind +17 % auf Antworten von
-rund 10 s, also ~1,5 s pro Antwort. **Ein einziger vermiedener 23k-Kaltprefill
-(54,9 s gemessen) wiegt rund 36 solche Antworten auf.** Wer hier optimiert,
-optimiert an der Trefferquote des Prefix-Cache, nicht am Drafter.
+For comparison: the DFlash-2 gain over MTP is +17% on answers of roughly 10 s,
+so ~1.5 s per answer. **A single avoided 23k cold prefill (54.9 s measured)
+outweighs about 36 such answers.** Optimising here means optimising the prefix
+cache hit rate, not the drafter.
 
-Ein Teil der Misses ist unvermeidbar (neue Konversation) oder selbstgemacht (am
-2026-08-20 liefen 31 Serverstarts — Messtag). Der Rest nicht. Im Fenster
-10:03–10:22 lief **kein** Neustart, trotzdem:
+Part of the misses is unavoidable (new conversation) or self-inflicted (on
+2026-08-20 there were 31 server starts — a measurement day). The rest is not. In
+the window 10:03–10:22 there was **no** restart, and yet:
 
 ```
-10:03:28  prompt=21667  cached=21651   1,4 s
-10:07:26  prompt=23857  cached=23613   3,6 s
-10:11:37  prompt=21665  cached=0      50,4 s   ←
-10:11:38  prompt=21740  cached=21649   0,8 s
-10:12:36  prompt=23118  cached=0      56,8 s   ←
-10:15:30  prompt=23200  cached=0      70,7 s   ←
-10:16:24  prompt=23280  cached=23184   0,8 s
+10:03:28  prompt=21667  cached=21651   1.4 s
+10:07:26  prompt=23857  cached=23613   3.6 s
+10:11:37  prompt=21665  cached=0      50.4 s   <-
+10:11:38  prompt=21740  cached=21649   0.8 s
+10:12:36  prompt=23118  cached=0      56.8 s   <-
+10:15:30  prompt=23200  cached=0      70.7 s   <-
+10:16:24  prompt=23280  cached=23184   0.8 s
 ```
 
-Kalte und warme Turns derselben Größe wechseln sich ab — das ist Verdrängung:
-mehr als zwei gleichzeitig aktive Konversationen auf zwei Snapshot-Plätzen.
-Dazu kam, dass die Rückfallebene löchrig war: der SSD-Tier stand mit 58 GB
-exakt am 60-GB-Deckel und räumte bei praktisch jedem Store
+Cold and warm turns of the same size alternate — that is eviction: more than two
+simultaneously active conversations on two snapshot slots. On top of that the
+fallback layer was leaky: the SSD tier sat at 58 GB, exactly at the 60 GB cap,
+and evicted on practically every store
 (`APC disk: evicted 6 shard(s); now 56341.8 MB / 64424.5 MB cap`).
 
-Zwei Konsequenzen, beide im Start-Skript:
+Two consequences, both in the start script:
 
-- **`APC_DISK_MAX_GB` auf `roomy` von 60 auf 80** — und generell gekappt auf
-  das, was das Volume mit 25 GB Reserve trägt. Das Skript rechnet das beim
-  Start aus und meldet die Kappung.
-- **`APC_ENTRIES` auf `roomy` von 2 auf 3**, aber nur mit gesetztem
-  `iogpu.wired_limit_mb` — diese Kopplung ist seit 2026-08-21 zurückgenommen,
-  der Wert steht jetzt fest auf 2 (s. „Aufgelöst — es war der Sockel").
+- **`APC_DISK_MAX_GB` on `roomy` from 60 to 80** — and generally capped to what
+  the volume carries with 25 GB in reserve. The script computes this at start and
+  reports the capping.
+- **`APC_ENTRIES` on `roomy` from 2 to 3.** This was briefly coupled to
+  `iogpu.wired_limit_mb` being set; that coupling was reverted on 2026-08-21. The
+  value has been fixed at 3 since 2026-08-24 (see "Why 3").
 
-#### Der Deckel gilt pro Namespace — die Rechnung tat es nicht
+#### The cap is per namespace — the arithmetic was not
 
-Gefunden am 2026-08-24, Volume bei 91 %:
+Found on 2026-08-24 with the volume at 91%:
 
 ```
-10G  ...apc/Qwen3.8-27B-local_s1-0c1f0816/   ← 21.8., alter Settings-Hash
-53G  ...apc/Qwen3.8-27B-local_s1-e063a74c/   ← aktiv
+10G  ...apc/Qwen3.8-27B-local_s1-0c1f0816/   <- 21 Aug, old settings hash
+53G  ...apc/Qwen3.8-27B-local_s1-e063a74c/   <- active
 ```
 
-`apc_disk_namespace()` (`apc.py:221`) fingerprintet den Verzeichnisnamen aus
-Modellpfad, Adapter **und KV-Quantisierung**. Jede Änderung an `KV_BITS` legt
-also einen neuen Namespace an — der `0c1f0816` oben ist der `KV_BITS=8`-Hash aus
-der Sampler-Messung. **Aufgeräumt wird nie:** der Store setzt
-`self.dir = root/<namespace>` (`apc.py:892`), und `_rebuild_index()` globt nur
-darin (`apc.py:1113`). Die Eviction sieht fremde Namespaces nicht.
+`apc_disk_namespace()` (`apc.py:221`) fingerprints the directory name from model
+path, adapter **and KV quantisation**. Every change to `KV_BITS` therefore
+creates a new namespace — the `0c1f0816` above is the `KV_BITS=8` hash from the
+sampler measurement. **It is never cleaned up:** the store sets
+`self.dir = root/<namespace>` (`apc.py:892`), and `_rebuild_index()` only globs
+inside it (`apc.py:1113`). Eviction cannot see foreign namespaces.
 
-Daraus zwei Fehler, beide behoben:
+Two faults follow, both fixed:
 
-- **Der Deckel wirkt pro Namespace, die Kappungsrechnung rechnete über alle.**
-  `du -sk "$APC_DISK"` summierte das ganze Verzeichnis und behandelte damit
-  Bytes als wiederverwendbar, die die Eviction nie anfassen kann — hier 10 GB
-  zu viel (63 statt 53), also 125 statt korrekt 115 GB Deckel. Das Skript
-  rechnet jetzt nur den aktiven Namespace.
-- **Toter Namespace ⇒ GC.** Beim Start werden inaktive Namespaces entfernt, die
-  länger als `APC_NS_KEEP_DAYS` (Default 3) unberührt sind. Der Namespace mit
-  der jüngsten `mtime` gilt als aktiv und wird **nie** geräumt — ein laufender
-  Server schreibt permanent, ist also immer der jüngste; die Regel ist damit
-  auch gegen eine zweite Instanz robust. Sofort räumen:
+- **The cap acts per namespace, the capping calculation summed across all of
+  them.** `du -sk "$APC_DISK"` summed the whole directory and thereby treated
+  bytes as reclaimable that eviction can never touch — 10 GB too many here (63
+  instead of 53), so 125 GB of cap instead of the correct 115. The script now
+  counts the active namespace only.
+- **Dead namespace ⇒ GC.** On start, inactive namespaces untouched for longer
+  than `APC_NS_KEEP_DAYS` (default 3) are removed. The namespace with the newest
+  `mtime` counts as active and is **never** collected — a running server writes
+  constantly and is therefore always the newest, which makes the rule robust
+  against a second instance as well. Clean immediately:
   `APC_NS_KEEP_DAYS=0 ./start-mlx_qwen3.8.sh`.
 
-Das ist zugleich der Fix für die 34,9 min kalte Prefills, die der Disk-Tier
-hätte fangen müssen (s. oben): ein Tier, der sich am Deckel des aktiven
-Namespace kaputträumt, während totes Gewicht daneben liegt, ist genau die
-löchrige Rückfallebene, die einen Miss 50–70 s kostet.
+This is at the same time the fix for the 34.9 min of cold prefills that the disk
+tier should have caught (see above): a tier that thrashes at the cap of the
+active namespace while dead weight sits next to it is exactly the leaky fallback
+layer that makes a miss cost 50–70 s.
 
-### Nach jeder Kontextänderung den SSD-Tier leeren
+### Clear the SSD tier after every context change
 
-**Ein Snapshot ist so groß wie der Kontext, für den er geschrieben wurde.**
-Verkleinert man `context_length` später, liegen im SSD-Tier weiter die alten,
-großen Snapshots — und beim Restore sprengen sie das Working-Set, obwohl die
-Budgetrechnung für den neuen Kontext aufgeht.
+**A snapshot is as large as the context it was written for.** If you shrink
+`context_length` later, the old large snapshots remain in the SSD tier — and on
+restore they blow the working set even though the budget calculation for the new
+context works out.
 
-Gemessen am 2026-08-21: nach dem Wechsel des Client-Kontextfensters von 98304
-auf 65536 starb **jeder vierte Request** an
-`[METAL] Command buffer execution failed: Insufficient Memory` — bei
-Promptgrößen von nur 17 000 Token und 89 % freiem Systemspeicher. Ein
-Serverneustart half nicht. Die Ursache waren 77 GB Snapshots aus der Zeit mit
-98304 und 131072 Token.
+Measured on 2026-08-21: after changing the client context window from 98304 to
+65536, **every fourth request** died with
+`[METAL] Command buffer execution failed: Insufficient Memory` — at prompt sizes
+of only 17,000 tokens and with 89% of system memory free. A server restart did
+not help. The cause was 77 GB of snapshots from the era of 98304 and 131072
+tokens.
 
-Isoliert wurde es mit `ENABLE_APC=0`: damit lief derselbe Request sofort
-durch. Nach `rm -rf ~/.mlx-qwen38/apc/*` und Neustart mit APC vier Requests
-hintereinander ohne einen einzigen Speicherfehler, Prefill wieder bis
-57 000 tok/s.
+It was isolated with `ENABLE_APC=0`: the same request then went through
+immediately. After `rm -rf ~/.mlx-qwen38/apc/*` and a restart with APC, four
+requests in a row without a single memory error, prefill back up to 57,000 tok/s.
 
 ```sh
-# Nach jeder Aenderung an context_length / contextWindow:
+# After every change to context_length / contextWindow:
 rm -rf ~/.mlx-qwen38/apc/*
 ```
 
-Der Preis ist gering: der Tier ist ein Cache, er füllt sich von selbst wieder.
-Die ersten Prompts danach laufen kalt.
+The price is low: the tier is a cache, it refills by itself. The first prompts
+afterwards run cold.
 
-> **Diagnose-Reihenfolge bei `[METAL] Insufficient Memory`**, wenn die
-> Budgetrechnung eigentlich aufgeht: erst `ENABLE_APC=0` zum Isolieren, dann
-> den SSD-Tier leeren, erst danach an `APC_ENTRIES` oder `context_length`
-> drehen. Ein Neustart allein räumt den Tier **nicht** — er liegt auf der Platte.
+> **Diagnostic order for `[METAL] Insufficient Memory`** when the budget
+> calculation should work out: first `ENABLE_APC=0` to isolate, then clear the
+> SSD tier, and only then touch `APC_ENTRIES` or `context_length`. A restart
+> alone does **not** clear the tier — it lives on disk.
 
 ---
 
-## Wenn es zu eng wird
+## When it gets too tight
 
-Erster Griff ist `PROFILE=lean`. Was dahintersteckt, einzeln und mit Preis
-(Ersparnis bezogen auf einen 43k-Spitzenprompt):
+The first move is `PROFILE=lean`. What sits behind it, individually and with its
+price (savings relative to a 43k peak prompt):
 
-| Hebel | spart | Preis |
+| lever | saves | price |
 |---|---|---|
-| `APC_ENTRIES` senken (je Stufe) | **−4,2 GiB** @ 65536 | **höher als lange angenommen.** Die Annahme war „gering, der SSD-Tier fängt es". Gemessen über 810 Prefills kostete `APC_ENTRIES=1` bis zu **72,7 min** kalten Prefill durch Verdrängung — der Tier fängt es nur, wenn er nicht selbst am Deckel räumt (s. „Der Deckel gilt pro Namespace") |
-| `KV_BITS=8 QUANT_KV_START=8192` | **−4,2 GiB** | Durchsatz auf dem MLX-Pfad *nicht* gemessen; bei llama.cpp kostete KV-Quantisierung an vergleichbarer Stelle bis 8× Prefill und 1,9× Decode → A/B messen |
-| `context_length` 49152 → 32768 | −2,6 GiB | kürzere Läufe bis zur Kompaktierung |
-| `PREFILL_STEP=512` | ~−0,2 GiB | praktisch keiner (Prefill ist rechen-, nicht chunklimitiert) |
-| Gewichte `mxfp4` statt `4bit` | −0,78 GiB | `mlx-community/Qwen3.8-27B-mxfp4` = 14,17 statt 14,95 GiB, von mlx 0.32 unterstützt; Qualität unverglichen |
-| Drafter weglassen | −0,23 GiB | **schlechter Tausch** — kostet 58–132 % Decode |
-| `ENABLE_APC=0` | −5,5 GiB | **inakzeptabel** — jeder Turn zahlt den vollen Prefill |
+| lower `APC_ENTRIES` (per step) | **−4.2 GiB** @ 65536 | **higher than long assumed.** The assumption was "small, the SSD tier catches it". Measured over 810 prefills, `APC_ENTRIES=1` cost up to **72.7 min** of cold prefill through eviction — the tier only catches it when it is not thrashing at its own cap (see "The cap is per namespace") |
+| `KV_BITS=8 QUANT_KV_START=8192` | **−4.2 GiB** | throughput on the MLX path *not* measured; on llama.cpp, KV quantisation at a comparable place cost up to 8× prefill and 1.9× decode → measure A/B |
+| `context_length` 49152 → 32768 | −2.6 GiB | shorter runs before compaction |
+| `PREFILL_STEP=512` | ~−0.2 GiB | practically none (prefill is compute-bound, not chunk-bound) |
+| weights `mxfp4` instead of `4bit` | −0.78 GiB | `mlx-community/Qwen3.8-27B-mxfp4` = 14.17 instead of 14.95 GiB, supported by mlx 0.32; quality not compared |
+| drop the drafter | −0.23 GiB | **a bad trade** — costs 58–132% decode |
+| `ENABLE_APC=0` | −5.5 GiB | **unacceptable** — every turn pays the full prefill |
 
-Zwei Dinge, die man beim Suchen findet und die nichts bringen:
+Two things you find while looking that do not help:
 
-- **Der Vision-Tower ist 0,86 GiB und liegt unquantisiert in BF16 im Modell**
-  (5,7 % der Gewichte; die 4bit-Quantisierung hat ihn übersprungen). Für einen
-  reinen Text-Agenten totes Gewicht — aber mlx-vlm 0.6.13 wertet den
-  `language_model_only`-Schalter aus der `config.json` nicht aus (kein Treffer
-  im Code). Es gibt also keinen Schalter; nur Strippen/Requantisieren der
-  Gewichte von Hand.
-- **Unter 4bit gibt es nichts Fertiges.** mlx-community führt für Qwen3.8-27B
-  4bit, 8bit, mxfp4, nvfp4, oQ4/oQ6 und OptiQ — alles ≥ 14,17 GiB, kein 3bit,
-  kein DWQ. Selbst quantisieren ginge (`mlx_vlm.convert -q --q-bits 3`, ~11,5 GiB),
-  ist aber ein Qualitätsexperiment mit offenem Ausgang.
+- **The vision tower is 0.86 GiB and sits unquantized in BF16 inside the model**
+  (5.7% of the weights; the 4bit quantisation skipped it). Dead weight for a
+  pure text agent — but mlx-vlm 0.6.13 does not evaluate the
+  `language_model_only` switch from `config.json` (no hit in the code). So there
+  is no switch; only stripping/requantising the weights by hand.
+- **There is nothing ready-made below 4bit.** mlx-community lists 4bit, 8bit,
+  mxfp4, nvfp4, oQ4/oQ6 and OptiQ for Qwen3.8-27B — all ≥ 14.17 GiB, no 3bit, no
+  DWQ. Quantising yourself would work (`mlx_vlm.convert -q --q-bits 3`,
+  ~11.5 GiB) but is a quality experiment with an open outcome.
 
-Ab hier ist die ehrliche Antwort, dass 27B dense auf 32 GB knapp ist und ein
-kleineres Modell die bessere Wahl wäre.
+From here on the honest answer is that 27B dense is tight on 32 GB and a smaller
+model would be the better choice.
 
-**Nicht** `--max-kv-size` benutzen (rotierendes KV-Fenster): dieselbe Idee wurde
-mit einem Needle-in-Haystack-Test widerlegt — die Nadel außerhalb des Fensters
-ging verloren und wurde in einem Fall sogar halluziniert (8347 statt 8342).
-Stiller Qualitätsverlust ist schlimmer als ein sauberer kleiner Kontext.
+Do **not** use `--max-kv-size` (rotating KV window): the same idea was disproved
+with a needle-in-a-haystack test — the needle outside the window was lost and in
+one case even hallucinated (8347 instead of 8342). Silent quality loss is worse
+than a cleanly small context.
 
 ---
 
-## DFlash 2 ist der Default-Drafter
+## DFlash 2 is the default drafter
 
-[DFlash 2](https://inco.ai/blog/dflash2/) läuft über `patches/0040` (Module,
-= Upstream-PR [#1959](https://github.com/Blaizzy/mlx-vlm/pull/1959)) und
-`patches/0021` (Prefix-Cache-Routing) und ist seit 2026-08-20 der Default.
-Zurück auf den MTP-Kopf: `DRAFT_KIND=mtp ./start-mlx_qwen3.8.sh`.
+[DFlash 2](https://inco.ai/blog/dflash2/) runs via `patches/0040` (modules,
+= upstream PR [#1959](https://github.com/Blaizzy/mlx-vlm/pull/1959)) and
+`patches/0021` (prefix-cache routing) and has been the default since 2026-08-20.
+Back to the MTP head: `DRAFT_KIND=mtp ./start-mlx_qwen3.8.sh`.
 
-Hintergrund: mlx-vlm implementiert bis 0.6.15 und auf `main` nur DFlash **v1**,
-oMLX 0.6.2 ebenso — für Qwen3.8-27B existiert aber ausschließlich ein
-v2-Drafter. Bis 2026-08-20 lief das hier über eine eigene Transkription der
-MLX-Referenz von z-lab
+Background: up to 0.6.15 and on `main`, mlx-vlm implements only DFlash **v1**,
+as does oMLX 0.6.2 — but for Qwen3.8-27B only a v2 drafter exists. Until
+2026-08-20 this ran on an own transcription of the z-lab MLX reference
 ([`dflash/model_mlx.py`](https://github.com/z-lab/dflash/blob/main/dflash/model_mlx.py),
-Patch `0020`), geprüft gegen die Referenz (Conv `max|diff| = 0`, identische
-Selector-Pfade) und gegen den Checkpoint (81/81 Parameter in Name und Form).
+patch `0020`), verified against the reference (conv `max|diff| = 0`, identical
+selector paths) and against the checkpoint (81/81 parameters in name and shape).
 
-**Seit 2026-08-20 kommt der Code stattdessen aus Upstream-PR #1959.** Die eigene
-Transkription war korrekt — inklusive des Codebook-Renames
-(`candidate_selector.{predecessor,successor}_codebook` → `…weight`), den z-lab
-selbst erst am 2026-08-18 mit
-[`e128a7e`](https://github.com/z-lab/dflash/commit/e128a7e) kanonisierte und den
-#1959 identisch macht. Ersetzt wurde sie trotzdem, weil #1959 drei Dinge
-mitbringt, die sie nicht hatte:
+**Since 2026-08-20 the code comes from upstream PR #1959 instead.** The own
+transcription was correct — including the codebook rename
+(`candidate_selector.{predecessor,successor}_codebook` → `…weight`), which z-lab
+itself only canonicalised on 2026-08-18 with
+[`e128a7e`](https://github.com/z-lab/dflash/commit/e128a7e) and which #1959
+makes identical. It was replaced anyway, because #1959 brings three things it
+did not have:
 
-- einen dedizierten **bit-exakten 4bit-M=4-Metal-Verifier-Kernel**, der die vier
-  Verify-Zeilen zusammen streamt und die packed weights über alle vier Token
-  wiederverwendet
-- **verteilungserhaltendes Rejection Sampling** für `temperature > 0` — die
-  eigene Fassung war nur gegen greedy auf Bit-Gleichheit geprüft
-- optionale **In-Memory-Quantisierung** des Drafters (`MLX_VLM_DRAFT_BITS`)
+- a dedicated **bit-exact 4bit M=4 Metal verifier kernel** that streams the four
+  verify rows together and reuses the packed weights across all four tokens
+- **distribution-preserving rejection sampling** for `temperature > 0` — the own
+  version was only checked for bit equality against greedy
+- optional **in-memory quantisation** of the drafter (`MLX_VLM_DRAFT_BITS`)
 
-Der vorhandene Checkpoint `Qwen3.8-27B-DFlash2-4bit` lädt damit unverändert
-(`DFlash2DraftModel`, 179 Parameter, 1,008 GiB) — keine Neukonvertierung nötig.
-Upstream misst auf einem M3 Ultra mit BF16-Drafter und `block_size 4`:
-31,85 → 47,07 t/s (1,48×) bei 500/500 identischen Token und 60,5 % Acceptance.
-Was #1959 **nicht** hat, ist der Guard gegen korrupte Bonus-Tokens — der bleibt
-als `0041` lokal.
+The existing checkpoint `Qwen3.8-27B-DFlash2-4bit` loads unchanged with it
+(`DFlash2DraftModel`, 179 parameters, 1.008 GiB) — no reconversion needed.
+Upstream measures on an M3 Ultra with a BF16 drafter and `block_size 4`:
+31.85 → 47.07 t/s (1.48×) at 500/500 identical tokens and 60.5% acceptance.
+What #1959 does **not** have is the guard against corrupt bonus tokens — that
+stays local as `0041`.
 
-### Messung: ohne Drafter / MTP / DFlash 2
+### Measurement: no drafter / MTP / DFlash 2
 
-Identische Prompts, `temperature 0`, Decode-Rate aus dem `predicted_ms` des
-Servers, Median aus drei Läufen:
+Identical prompts, `temperature 0`, decode rate from the server's `predicted_ms`,
+median of three runs:
 
-| Fall | ohne Drafter | MTP | DFlash 2 | |
+| case | no drafter | MTP | DFlash 2 | |
 |---|---|---|---|---|
-| JSON | 16,4 t/s | 37,8 t/s | **44,2 t/s** | +17 % |
-| Code | 16,4 t/s | 35,8 t/s | **42,6 t/s** | +19 % |
-| Langkontext (5,8k) | 14,2 t/s | 36,0 t/s | **40,8 t/s** | +13 % |
-| Tool-Call | 18,3 t/s | 33,8 t/s | **39,8 t/s** | +18 % |
-| Prosa | 16,5 t/s | **29,8 t/s** | 29,9 t/s | ±0 % |
+| JSON | 16.4 t/s | 37.8 t/s | **44.2 t/s** | +17% |
+| code | 16.4 t/s | 35.8 t/s | **42.6 t/s** | +19% |
+| long context (5.8k) | 14.2 t/s | 36.0 t/s | **40.8 t/s** | +13% |
+| tool call | 18.3 t/s | 33.8 t/s | **39.8 t/s** | +18% |
+| prose | 16.5 t/s | **29.8 t/s** | 29.9 t/s | ±0% |
 
-**Der Gewinn steckt in strukturierter Ausgabe** — Tool-Calls, JSON, Code — und
-damit genau in der Agentenlast. Bei freier Prosa sind beide gleichauf; dort
-liegt MTP bei der Acceptance sogar vorn (57 % gegen 45 %).
+**The gain sits in structured output** — tool calls, JSON, code — and therefore
+exactly in the agent workload. On free prose the two are level; there MTP is even
+ahead on acceptance (57% against 45%).
 
-Interessant ist, *warum*: die Acceptance-**Rate** ist bei beiden praktisch
-identisch (Median 81 % gegen 80 %). DFlash 2 draftet pro Runde schlicht mehr
-Token (`block_size 4` statt 3) und gewinnt darüber. Genau deshalb ist die
-Blockgröße der empfindlichste Parameter — Sweep gegen MTP: `3` +6 %, **`4` +19 %,
-`5` +20 %**, `8` +6 %. Der Checkpoint ist auf `block_size 8` ausgelegt, was auf
-einem 4bit-Target die schlechteste Wahl ist; z-lab empfiehlt für quantisierte
-MLX-Modelle ebenfalls ≤ 5.
+What is interesting is *why*: the acceptance **rate** is practically identical
+for both (median 81% against 80%). DFlash 2 simply drafts more tokens per round
+(`block_size 4` instead of 3) and wins through that. Which is exactly why block
+size is the most sensitive parameter — sweep against MTP: `3` +6%, **`4` +19%,
+`5` +20%**, `8` +6%. The checkpoint is designed for `block_size 8`, which is the
+worst choice on a 4bit target; z-lab likewise recommends ≤ 5 for quantized MLX
+models.
 
-Korrektheit: Ausgabe bei `temperature 0` in allen fünf Fällen identisch zum Lauf
-**ohne** Drafter, Tool-Call-Argumente identisch. Beide Drafter erreichen ~2,1×
-gegenüber gar keinem Drafter.
+Correctness: output at `temperature 0` identical to the run **without** drafter
+in all five cases, tool-call arguments identical. Both drafters reach ~2.1× over
+no drafter at all.
 
-Kosten: der Drafter belegt 1,01 GiB statt 0,23 GiB. Auf `lean` und `balanced`
-ist das direkt weniger Kontext — dort lohnt die Abwägung, ob `DRAFT_KIND=mtp`
-die bessere Wahl ist.
+Cost: the drafter occupies 1.01 GiB instead of 0.23 GiB. On `lean` and
+`balanced` that is directly less context — there it is worth weighing whether
+`DRAFT_KIND=mtp` is the better choice.
 
-### Der Prefix-Cache greift jetzt auch unter DFlash2
+### The prefix cache now works under DFlash2 as well
 
-Ursprünglich meldete unter `DRAFT_KIND=dflash` **jeder** Request
-`cached_tokens=0`. Ursache gefunden: `server/generation.py` routet jeden
-Nicht-MTP-Drafter in eine zweite Generierungsschleife (`_run_speculative`), die
-ihren eigenen Prompt-Cache baut und den APC-Manager nie verdrahtet. Der
-Continuous-Batching-Pfad kann dflash längst — er ist durchgehend generisch über
-`draft_kind` und bekommt `apc_manager`, `draft_kind` und `draft_block_size` in
-derselben Zeile übergeben. Nur die Weiche hielt dflash davon fern.
+Originally **every** request under `DRAFT_KIND=dflash` reported
+`cached_tokens=0`. Cause found: `server/generation.py` routes every non-MTP
+drafter into a second generation loop (`_run_speculative`) that builds its own
+prompt cache and never wires up the APC manager. The continuous-batching path
+has long been able to do dflash — it is generic over `draft_kind` throughout and
+receives `apc_manager`, `draft_kind` and `draft_block_size` on the same line.
+Only the switch kept dflash away from it.
 
-`patches/0021-speculative-apc-routing.patch` macht den Batch-Pfad über
-`MLX_VLM_SPECULATIVE_BATCH=1` erreichbar; das Start-Skript setzt die Variable
-automatisch, sobald `DRAFT_KIND != mtp`. Gemessen (5,8k-Konversation, Turn 2):
+`patches/0021-speculative-apc-routing.patch` makes the batch path reachable via
+`MLX_VLM_SPECULATIVE_BATCH=1`; the start script sets the variable automatically
+as soon as `DRAFT_KIND != mtp`. Measured (5.8k conversation, turn 2):
 
-| | `cached_tokens` | Decode 64/66/76 Tok | 5767 Tok |
+| | `cached_tokens` | decode 64/66/76 tok | 5767 tok |
 |---|---|---|---|
-| MTP | 5772 / 5788 | 33,9 / 33,9 / 36,7 t/s | 33,9 t/s |
-| DFlash2, alte Schleife | **0** | 40,8 / 38,2 / 45,6 t/s | 38,4 t/s |
-| DFlash2, Batch-Pfad | **5748 / 5788** | 38,7 / 40,7 / 43,0 t/s | **40,9 t/s** |
+| MTP | 5772 / 5788 | 33.9 / 33.9 / 36.7 t/s | 33.9 t/s |
+| DFlash2, old loop | **0** | 40.8 / 38.2 / 45.6 t/s | 38.4 t/s |
+| DFlash2, batch path | **5748 / 5788** | 38.7 / 40.7 / 43.0 t/s | **40.9 t/s** |
 
-Der Durchsatz bleibt also gleich (im Mittel 40,8 statt 41,5 t/s — Rauschen) und
-wird beim langen Prompt sogar besser, aber der Prefix-Cache ist wieder da.
-`--draft-block-size` wirkt weiterhin (Block 4 schlägt Block 8 auf beiden Pfaden),
-zwei parallele Requests mit `MAX_NUM_SEQS=2` laufen sauber, und MTP bleibt
-unverändert (`cached=5772`).
+Throughput therefore stays the same (40.8 instead of 41.5 t/s on average —
+noise) and even improves on the long prompt, but the prefix cache is back.
+`--draft-block-size` still takes effect (block 4 beats block 8 on both paths),
+two parallel requests with `MAX_NUM_SEQS=2` run cleanly, and MTP is unchanged
+(`cached=5772`).
 
-### Die verbleibende Patch-Abhängigkeit
+### The remaining patch dependency
 
-DFlash 2 hängt weiter an **zwei** Patches: `0040` für die Drafter-Module und
-`0021` fürs Prefix-Cache-Routing. Ein `pip install -U mlx-vlm` ohne
-anschließendes `apply-patches.sh` macht den Drafter unladbar. Das Start-Skript
-fängt das ab — es prüft beide und fällt notfalls mit Warnung auf MTP zurück.
+DFlash 2 still hangs on **two** patches: `0040` for the drafter modules and
+`0021` for prefix-cache routing. A `pip install -U mlx-vlm` without a subsequent
+`apply-patches.sh` makes the drafter unloadable. The start script catches this —
+it checks both and falls back to MTP with a warning if necessary.
 
-Für `0040` ist absehbar, dass die Abhängigkeit entfällt: es *ist* der
-Upstream-PR. Für `0021` nicht: das zugehörige Issue
-[#1966](https://github.com/Blaizzy/mlx-vlm/issues/1966) wurde am 2026-08-20
-**geschlossen** — zugunsten von
-[#1923](https://github.com/Blaizzy/mlx-vlm/pull/1923) („conservative DFlash APC
-prefix reuse", nur `B=1`, text-only, exact-prefix). Der hier gefahrene Ansatz
-(Batch-Pfad über `MLX_VLM_SPECULATIVE_BATCH=1`) landet also nicht; bis #1923
-gemerged ist, bleibt `0021` lokal.
+For `0040` the dependency will foreseeably disappear: it *is* the upstream PR.
+For `0021` it will not: the corresponding issue
+[#1966](https://github.com/Blaizzy/mlx-vlm/issues/1966) was **closed** on
+2026-08-20 in favour of
+[#1923](https://github.com/Blaizzy/mlx-vlm/pull/1923) ("conservative DFlash APC
+prefix reuse", `B=1` only, text-only, exact-prefix). The approach used here
+(batch path via `MLX_VLM_SPECULATIVE_BATCH=1`) will therefore not land; until
+#1923 is merged, `0021` stays local.
 
 ---
 
-## Diagnose
+## Diagnostics
 
 ```sh
-# Trifft der Prefix-Cache? (Turn 2 muss cached_tokens > 0 zeigen)
+# Is the prefix cache hitting? (turn 2 must show cached_tokens > 0)
 grep -o 'cached[_ ]tokens[=:] *[0-9]*' ~/.mlx-qwen38/logs/server.log | tail -20
 
-# Draft-Acceptance (unter ~40 % lohnt Speculative Decoding nicht)
+# Draft acceptance (below ~40% speculative decoding is not worth it)
 grep -i "accept" ~/.mlx-qwen38/logs/server.log | tail -10
 
-# Speicherlage
+# Memory situation
 ~/src/mlx/.venv/bin/python -c "import mlx.core as mx;print(mx.device_info())"
 sysctl iogpu.wired_limit_mb
 ps -o rss=,command= -p "$(pgrep -f mlx_vlm.server)" | awk '{printf "%.1f GiB\n", $1/1048576}'
 
-# Patch-Status (Patches liegen in site-packages und verschwinden bei JEDEM pip install)
+# Patch status (patches live in site-packages and vanish on EVERY pip install)
 ./patches/apply-patches.sh --check
 
-# Ist die Maschine mitten in einem Request eingeschlafen? (s.u.)
+# Did the machine fall asleep mid-request? (see below)
 pmset -g log | grep -E "Entering Sleep state|Wake Requests" | tail -5
 ```
 
-> **Auf Akku schläft der Mac mitten in die Generierung hinein.** Signatur im
-> Log: `Decode completed` meldet eine plausible `elapsed`- und `rate`-Zahl,
-> aber zwischen zwei `Decode progress`-Zeilen springt die **Wanduhr** um
-> Minuten. Real gemessen am 2026-08-21: ein 400-Token-Request stand zwischen
-> Token 210 und 220 **989,7 s** still, während der Decode-Zähler nur 0,49 s
-> zählte. `pmset -g log` zeigte dazu passend
-> `06:22:20 Entering Sleep state due to 'Idle Sleep' … Using Batt` und einen
-> Weckauftrag mit `deltaSecs=991`.
-> Für Messungen und für jeden Agent-Lauf, der länger als der Idle-Timer dauert,
-> heißt das: `caffeinate -dimsu` davorsetzen (oder den Server gleich so
-> starten). Ohne das misst man Schlafphasen statt Durchsatz.
+> **On battery the Mac falls asleep in the middle of generation.** Signature in
+> the log: `Decode completed` reports a plausible `elapsed` and `rate`, but the
+> **wall clock** jumps by minutes between two `Decode progress` lines. Measured
+> on 2026-08-21: a 400-token request stood still for **989.7 s** between tokens
+> 210 and 220, while the decode counter recorded only 0.49 s. `pmset -g log`
+> showed a matching
+> `06:22:20 Entering Sleep state due to 'Idle Sleep' … Using Batt` and a wake
+> request with `deltaSecs=991`.
+> For measurements and for every agent run longer than the idle timer this means:
+> put `caffeinate -dimsu` in front (or start the server that way). Without it you
+> measure sleep phases instead of throughput.
 
-| Symptom | Ursache |
+| symptom | cause |
 |---|---|
-| `cached_tokens=1` bei großen Prompts | Patch 0002 fehlt |
-| `cached_tokens=0` in Turn 2 | mlx-vlm < 0.6.13, oder Snapshot verdrängt (`APC_ENTRIES`, Patch 0010) |
-| `cached_tokens=1` bei großen Prompts | mlx-vlm < 0.6.14 (Kurzprompt-Bug, PR #1901) |
-| HTTP 401 / HF-Download beim Request | Modellname ≠ Alias-Symlink |
-| HTTP 500 bei jedem Request | `reasoning_effort` außerhalb `low\|medium\|xhigh` |
-| `[METAL] Insufficient Memory` | Kontext über Budget → `context_length` senken oder `KV_BITS=8` |
+| `cached_tokens=1` on large prompts | patch 0002 missing |
+| `cached_tokens=0` in turn 2 | mlx-vlm < 0.6.13, or snapshot evicted (`APC_ENTRIES`, patch 0010) |
+| `cached_tokens=1` on large prompts | mlx-vlm < 0.6.14 (short-prompt bug, PR #1901) |
+| HTTP 401 / HF download on request | model name ≠ alias symlink |
+| HTTP 500 on every request | `reasoning_effort` outside `low\|medium\|xhigh` |
+| `[METAL] Insufficient Memory` | context over budget → lower `context_length` or `KV_BITS=8` |
 
 ---
 
 ## Patches
 
-Neun Patches gegen `site-packages`, angewendet von `patches/apply-patches.sh`
-(idempotent, `--check` / `--revert`). Sie verschwinden bei jedem
-`pip install -U mlx-vlm` — danach erneut ausführen. Die Reihenfolge ist ab
-`0040` bindend: `--revert` läuft deshalb rückwärts.
+Eleven patches against `site-packages`, applied by `patches/apply-patches.sh`
+(idempotent, `--check` / `--revert`). They vanish on every
+`pip install -U mlx-vlm` — run it again afterwards. The order is binding from
+`0040` onwards, which is why `--revert` runs backwards.
 
-**Eigene:** `0010` (APC-Einzel-Snapshot), `0011` (Rollen-Kompatibilität),
-`0012` (Decode-Rate im Log), `0013` (fused Attention für `head_dim` 256),
-`0014` (`QUANT_KV_START` auf dem uniform-Pfad), `0021` (Prefix-Cache-Routing
-für Nicht-MTP-Drafter), `0041` (Guard gegen korrupte DFlash-Bonus-Tokens).
+**Own:** `0010` (APC single snapshot), `0011` (role compatibility),
+`0012` (decode rate in the log), `0013` (fused attention for `head_dim` 256),
+`0014` (`QUANT_KV_START` on the uniform path), `0015` (optional fused quantized
+linears), `0021` (prefix-cache routing for non-MTP drafters), `0041` (guard
+against corrupt DFlash bonus tokens).
 
-**Fremde, noch offene Upstream-PRs** — alle selbst reproduziert und
-gegengetestet:
+**Foreign, still-open upstream PRs** — all reproduced and cross-tested here:
 
-| Patch | Wirkung | Betrifft uns |
+| patch | effect | affects us |
 |---|---|---|
-| `0040` = [#1959](https://github.com/Blaizzy/mlx-vlm/pull/1959) | DFlash 2 upstream: exakter 4bit-M=4-Verifier-Kernel, verteilungserhaltendes Rejection Sampling für `temperature > 0`, In-Memory-Drafter-Quantisierung | **ersetzt den eigenen Patch `0020`**; muss als letzter Patch laufen |
-| `0030` = [#1956](https://github.com/Blaizzy/mlx-vlm/pull/1956) | `KV_BITS` + Drafter + Batch-Cache stirbt an `AttributeError: 'tuple' object has no attribute 'shape'` | **Normalbetrieb auf `lean`** — s. u. |
-| `0031` = [#1835](https://github.com/Blaizzy/mlx-vlm/pull/1835) | Prefix-Wiederverwendung auf nicht-trimmbaren rekurrenten Caches (die 48 GDN-Layer) → `'ArraysCache' object has no attribute 'trim'` | **nicht** über den Server (`_prefix_cache_trim_amount` läuft nur in `stream_generate`); Vorsorge für `chat_ui` und eigene Skripte |
+| `0040` = [#1959](https://github.com/Blaizzy/mlx-vlm/pull/1959) | DFlash 2 upstream: exact 4bit M=4 verifier kernel, distribution-preserving rejection sampling for `temperature > 0`, in-memory drafter quantisation | **replaces our own patch `0020`**; must run as the last patch |
+| `0030` = [#1956](https://github.com/Blaizzy/mlx-vlm/pull/1956) | `KV_BITS` + drafter + batch cache dies with `AttributeError: 'tuple' object has no attribute 'shape'` | **normal operation on `lean`** — see below |
+| `0031` = [#1835](https://github.com/Blaizzy/mlx-vlm/pull/1835) | prefix reuse on non-trimmable recurrent caches (the 48 GDN layers) → `'ArraysCache' object has no attribute 'trim'` | **not** via the server (`_prefix_cache_trim_amount` only runs in `stream_generate`); precaution for `chat_ui` and own scripts |
 
-> **Korrektur vom 2026-08-20 zu `0030`:** hier stand, der Patch sei nur bei
-> `MAX_NUM_SEQS > 1` relevant. Das galt, solange MTP der Default war. Seit
-> DFlash 2 Default ist, setzt das Start-Skript `MLX_VLM_SPECULATIVE_BATCH=1` —
-> und `_make_cache` baut den Batch-Cache auch bei `MAX_NUM_SEQS=1`, sobald
-> `KV_BITS` gesetzt ist (`generate/ar.py:796`). Auf `PROFILE=lean` ist
-> `KV_BITS=8` Default. Dort ist `0030` also Normalbetrieb, nicht Vorsorge.
-> Dazu: **#1956 und [#1938](https://github.com/Blaizzy/mlx-vlm/pull/1938) sind
-> derselbe Fix von zwei Autoren** — dieselben zwei Dateien, derselbe Inhalt.
-> Nur einer wird mergen; `0030` deckt beide ab.
+> **Correction from 2026-08-20 regarding `0030`:** this used to say the patch was
+> only relevant at `MAX_NUM_SEQS > 1`. That held while MTP was the default. Since
+> DFlash 2 became the default, the start script sets
+> `MLX_VLM_SPECULATIVE_BATCH=1` — and `_make_cache` builds the batch cache even
+> at `MAX_NUM_SEQS=1` as soon as `KV_BITS` is set (`generate/ar.py:796`). On
+> `PROFILE=lean`, `KV_BITS=8` is the default. So `0030` is normal operation
+> there, not a precaution.
+> Also: **#1956 and [#1938](https://github.com/Blaizzy/mlx-vlm/pull/1938) are the
+> same fix by two authors** — same two files, same content. Only one will merge;
+> `0030` covers both.
 
-Sobald einer davon upstream gemerged ist, meldet `apply-patches.sh` „KONFLIKT" —
-das ist das Signal, die Datei zu löschen.
+As soon as one of them is merged upstream, `apply-patches.sh` reports
+"KONFLIKT" — that is the signal to delete the file.
 
+In detail:
 
-Im Einzelnen:
+- **`0013-force-fused-sdpa-head-dim-256.patch`** — local, no upstream PR.
+  Qwen3.8 has `head_dim 256`. mlx's default dispatch only permits fused full
+  attention for `head_dim` 64/80/128; the 16 full-attn layers therefore run on
+  the unfused graph and materialise a score transient of `O(n_heads × qL × kL)`
+  per layer — which is the actual reason `PREFILL_STEP` is a RAM lever here at
+  all. mlx 0.32.2 ([#4185](https://github.com/ml-explore/mlx/pull/4185)) restores
+  the 192/256 kernels, reachable **only** via `force_fused=True`; the default
+  dispatch still does not route there. The PR justifies this by saying only the
+  runtime knows its memory budget — which applies here. Narrowly scoped: only
+  `qL > 1` (prefill/verify, not decode), only `head_dim` 192/256, no array mask,
+  no sinks. **Inert on mlx < 0.32.2** (the import probe falls to `TypeError`;
+  verified on 0.32.0 and 0.32.1). **Active since the source build of 2026-08-21**
+  (`_FORCE_FUSED == True`), measured at `qL=512` / `kL=22747`: peak 662 →
+  123 MiB, prefill ceiling 22,747 → 37,822 tokens. The start banner shows the
+  state in the `Full-Attn:` line. Rollback: `QWEN38_FORCE_FUSED_SDPA=0`.
+- **`0015-optional-fused-quantized-linears.patch`** — local, no upstream PR.
+  `_fused_quantized_linears()` concatenates the QKV and MLP weights of each layer
+  into a fused tensor and attaches it to the module as
+  `_qwen3_5_fused_decode_linears` **permanently** — a second copy of the
+  quantized weights. This was the fixed memory floor: it appears on the first
+  generation, is length-independent and is never released. Measured, idle after
+  5 requests on a 40 GiB working set:
 
-- **`0013-force-fused-sdpa-head-dim-256.patch`** — lokal, kein Upstream-PR.
-  Qwen3.8 hat `head_dim 256`. mlx' Default-Dispatch lässt fused Full-Attention
-  nur für `head_dim` 64/80/128 zu; die 16 Full-Attn-Layer laufen deshalb auf dem
-  unfused Graph und materialisieren pro Layer einen Score-Transienten von
-  `O(n_heads × qL × kL)` — das ist der eigentliche Grund, warum `PREFILL_STEP`
-  hier überhaupt ein RAM-Hebel ist. mlx 0.32.2 ([#4185](https://github.com/ml-explore/mlx/pull/4185))
-  stellt die 192/256-Kernel wieder her, erreichbar **nur** über
-  `force_fused=True`; der Default-Dispatch routet weiterhin nicht dorthin. Der
-  PR begründet das damit, dass nur die Runtime ihr Speicherbudget kennt — was
-  hier zutrifft. Eng gefasst: nur `qL > 1` (Prefill/Verify, nicht Decode), nur
-  `head_dim` 192/256, ohne Array-Maske, ohne Sinks. **Auf mlx < 0.32.2 inert**
-  (Probe beim Import fällt auf `TypeError`; auf 0.32.0 und 0.32.1 verifiziert).
-  **Seit dem Quellbau vom 2026-08-21 aktiv** (`_FORCE_FUSED == True`), gemessen
-  bei `qL=512` / `kL=22747`: Peak 662 → 123 MiB, Prefill-Decke 22.747 → 37.822
-  Token. Das Start-Banner zeigt den Zustand in der Zeile `Full-Attn:`.
-  Rollback: `QWEN38_FORCE_FUSED_SDPA=0`.
-- **`0015-optional-fused-quantized-linears.patch`** — lokal, kein Upstream-PR.
-  `_fused_quantized_linears()` kopiert QKV- und MLP-Gewichte je Layer zu einem
-  fusionierten Tensor zusammen und hängt ihn als
-  `_qwen3_5_fused_decode_linears` **dauerhaft ans Modul** — eine zweite Fassung
-  der quantisierten Gewichte. Das war der fixe Speichersockel: er entsteht beim
-  ersten Generieren, ist längenunabhängig und wird nie freigegeben. Gemessen,
-  idle nach 5 Requests auf 40 GiB Working-Set:
-
-  | | mit Fusion | ohne Fusion | Decode (Mittel aus je 5) |
+  | | with fusion | without fusion | decode (mean of 5 each) |
   |---|---|---|---|
-  | mit SpecDecode | 26,00 GiB | **17,00 GiB** | 26,1 vs 25,7 tok/s |
-  | ohne SpecDecode | 17,08 GiB | **14,96 GiB** | 18,4 vs 18,2 tok/s |
+  | with spec decode | 26.00 GiB | **17.00 GiB** | 26.1 vs 25.7 tok/s |
+  | without spec decode | 17.08 GiB | **14.96 GiB** | 18.4 vs 18.2 tok/s |
 
-  9 GiB gegen 1,5 %, und die Streuung beider Decode-Reihen überlappt
-  vollständig. Der Patch selbst ändert nichts — er fügt nur den Schalter hinzu,
-  Default bleibt Upstream-Verhalten. Abgeschaltet wird die Fusion vom
-  Start-Skript. Rollback: `QWEN38_FUSED_LINEARS=1`.
-- **`0014-quantized-kv-start-uniform.patch`** — lokal, kein Upstream-PR.
-  `quantized_kv_start` galt auf dem Batch-Pfad nur für TurboQuant
-  (`generate/ar.py:786`, `defer_turbo`). Auf dem uniform-Pfad — `--kv-bits` ohne
-  `--kv-quant-scheme turboquant`, also unser Default — wurde **ab Token 0**
-  quantisiert, egal was `--quantized-kv-start` sagt. Gemessen mit
-  `_make_cache(kv_bits=8, quantized_kv_start=8192)`:
+  9 GiB against 1.5%, and the spread of both decode series overlaps completely.
+  The patch itself changes nothing — it only adds the switch, the default stays
+  upstream behaviour. The fusion is switched off by the start script. Rollback:
+  `QWEN38_FUSED_LINEARS=1`.
+- **`0014-quantized-kv-start-uniform.patch`** — local, no upstream PR.
+  `quantized_kv_start` applied on the batch path only for TurboQuant
+  (`generate/ar.py:786`, `defer_turbo`). On the uniform path — `--kv-bits`
+  without `--kv-quant-scheme turboquant`, i.e. our default — quantisation
+  happened **from token 0**, regardless of what `--quantized-kv-start` said.
+  Measured with `_make_cache(kv_bits=8, quantized_kv_start=8192)`:
 
-  | `prefill_length` | ohne Patch | mit Patch |
+  | `prefill_length` | without patch | with patch |
   |---|---|---|
   | 1000 | `BatchQuantizedKVCache` | `BatchKVCache` (f16) |
   | 20000 | `BatchQuantizedKVCache` | `BatchQuantizedKVCache` |
 
-  Betrifft `PROFILE=lean` im Normalbetrieb (dort ist `KV_BITS=8` Default). Die
-  Entscheidung fällt wie bei `defer_turbo` **einmal** beim Anlegen des Cache
-  anhand der Promptlänge — es wird nicht mitten im Request umgeschaltet.
-  Rollback: `QUANT_KV_START=0`.
-- **`0041-dflash2-guard-invalid-bonus-token.patch`** — lokal, kein Upstream-PR,
-  Nachfolger von `0022`. `propose_block` baut den nächsten Block aus dem
-  Bonus-Token des vorigen `_speculative_walk`. Ist der Wert korrupt, wirft
-  `mx.array()` nur `RuntimeError: std::bad_cast` — ohne Wert, ohne Index, ohne
-  Hinweis, dass es um eine Integer-Konvertierung geht (reproduzierbar mit
-  `mx.array([[2**63]], dtype=mx.int32)`). Genau so starb am 2026-08-20 10:07
-  ein Request nach 250 Tokens. Der Patch prüft gegen `vocab_size` und nennt den
-  Wert. Bewusst kein Clamping: ein still ersetztes Token verfälscht die Ausgabe,
-  statt den Bug zu zeigen. **PR #1959 hat diesen Guard nicht** — die Stelle ist
-  upstream offen. Der nackte `std::bad_cast` selbst ist ein Upstream-Papercut in
-  mlx — `mx.array` sollte bei Integer-Überlauf einen `OverflowError` mit Wert und
-  Index werfen, wie es die Nachbarpfade
-  (`Invalid type NoneType received in array initialization.`) längst tun.
-- **`0012-decode-progress-cumulative-rate.patch`** — lokal, kein Upstream-PR.
-  Das `rate=` in `Decode progress` war die Momentanrate zwischen zwei
-  Log-Aufrufen (`emitted_tokens / (now - previous_token_at)`). Unter
-  spekulativer Dekodierung wird ein akzeptierter Block in Mikrosekunden
-  ausgegeben, deshalb meldeten 17 % aller Zeilen über 1000 tok/s (Spitze
-  162153) im Wechsel mit viel zu niedrigen Werten — im Widerspruch zum
-  `elapsed=` derselben Zeile. `rate=` ist jetzt die kumulative Rate wie in
-  `Decode completed`, die Momentanrate bleibt als `inst=`.
-- **`0011-role-compat-developer-to-system.patch`** — lokal, kein Upstream-PR.
-  Das Qwen3.8-Template kennt nur `system/user/assistant/tool` und wirft bei
-  allem anderen `Unexpected message role.` → HTTP 500. Das Request-Schema
-  erlaubt aber zusätzlich `developer`; genau diese eine Rolle rutscht durch die
-  Validierung in die Template-Ausnahme (manche Clients schicken sie). Der Patch bildet
-  `developer → system` und `function → tool` ab, alles andere fällt weiterhin
-  durch.
-- **`0010-qwen38-apc-single-snapshot.patch`** — lokal, kein Upstream-PR.
-  mlx-vlm legt pro Request zwei fast identische Snapshots ab (Checkpoint bei
-  `len-16` und den vollen Prompt); getroffen wird gemessen immer der
-  Checkpoint. Der Patch unterdrückt den zweiten und halbiert damit den
-  Cache-Speicher. Ohne die Env-Variable `QWEN38_APC_SINGLE_SNAPSHOT=1` inert —
-  das ist der Rollback-Pfad.
+  Affects `PROFILE=lean` in normal operation (where `KV_BITS=8` is the default).
+  As with `defer_turbo`, the decision is made **once** when the cache is created,
+  based on prompt length — there is no switching mid-request. Rollback:
+  `QUANT_KV_START=0`.
+- **`0041-dflash2-guard-invalid-bonus-token.patch`** — local, no upstream PR,
+  successor to `0022`. `propose_block` builds the next block from the bonus token
+  of the previous `_speculative_walk`. If the value is corrupt, `mx.array()`
+  throws only `RuntimeError: std::bad_cast` — without the value, without an
+  index, without any hint that an integer conversion is involved (reproducible
+  with `mx.array([[2**63]], dtype=mx.int32)`). That is exactly how a request died
+  after 250 tokens on 2026-08-20 at 10:07. The patch checks against `vocab_size`
+  and names the value. Deliberately no clamping: a silently replaced token
+  corrupts the output instead of showing the bug. **PR #1959 does not have this
+  guard** — the spot is open upstream. The bare `std::bad_cast` itself is an
+  upstream papercut in mlx — `mx.array` should throw an `OverflowError` with
+  value and index on integer overflow, as the neighbouring paths
+  (`Invalid type NoneType received in array initialization.`) have long done.
+- **`0012-decode-progress-cumulative-rate.patch`** — local, no upstream PR.
+  The `rate=` in `Decode progress` was the instantaneous rate between two log
+  calls (`emitted_tokens / (now - previous_token_at)`). Under speculative
+  decoding an accepted block is emitted in microseconds, so 17% of all lines
+  reported over 1000 tok/s (peak 162153) alternating with far too low values — in
+  contradiction to the `elapsed=` on the same line. `rate=` is now the cumulative
+  rate as in `Decode completed`; the instantaneous rate remains as `inst=`.
+- **`0011-role-compat-developer-to-system.patch`** — local, no upstream PR.
+  The Qwen3.8 template knows only `system/user/assistant/tool` and throws
+  `Unexpected message role.` → HTTP 500 on anything else. The request schema,
+  however, additionally allows `developer`; that one role slips through
+  validation into the template exception (some clients send it). The patch maps
+  `developer → system` and `function → tool`; everything else still falls
+  through.
+- **`0010-qwen38-apc-single-snapshot.patch`** — local, no upstream PR.
+  mlx-vlm stores two nearly identical snapshots per request (checkpoint at
+  `len-16` and the full prompt); measurements show the checkpoint is always the
+  one that hits. The patch suppresses the second and thereby halves the cache
+  memory. Inert without the env variable `QWEN38_APC_SINGLE_SNAPSHOT=1` — that is
+  the rollback path.
 
 ---
 
-## Dateien
+## Files
 
-| Datei | Zweck |
+| file | purpose |
 |---|---|
-| `install-prereqs.sh` | Komplettes Setup ab frischem macOS, idempotent |
+| `install-prereqs.sh` | complete setup from a fresh macOS, idempotent |
 | `LICENSE` | MIT No Attribution (SPDX `MIT-0`) |
-| `start-mlx_qwen3.8.sh` | Server-Start, Profile lean/balanced/roomy, Live-Budgetrechnung |
-| `watchdog-mlx_qwen3.8.sh` | Startet den Server und startet ihn neu, bevor der Speicher volläuft |
-| `download-mlx-model.sh` | Resume-fähiger HuggingFace-Downloader (curl, mit Größenprüfung) |
-| `patches/apply-patches.sh` | Patches anwenden / prüfen / zurücknehmen |
-| `com.local.iogpu-wired-limit.plist` | LaunchDaemon für das Wired-Limit (ruft das Skript unten) |
-| `install-wired-limit-daemon.sh` | Installiert Helper + LaunchDaemon in einem Aufruf, idempotent |
-| `set-iogpu-wired-limit.sh` | Rechnet `iogpu.wired_limit_mb` aus `hw.memsize`, clampt nach oben |
+| `start-mlx_qwen3.8.sh` | server start, profiles lean/balanced/roomy, live budget calculation |
+| `watchdog-mlx_qwen3.8.sh` | starts the server and restarts it before memory fills up |
+| `download-mlx-model.sh` | resumable HuggingFace downloader (curl, with size check) |
+| `patches/apply-patches.sh` | apply / check / revert patches |
+| `com.local.iogpu-wired-limit.plist` | LaunchDaemon for the wired limit (calls the script below) |
+| `install-wired-limit-daemon.sh` | installs helper + LaunchDaemon in one call, idempotent |
+| `set-iogpu-wired-limit.sh` | computes `iogpu.wired_limit_mb` from `hw.memsize`, clamps upwards |
 
 ---
 
-## Herkunft der Zahlen
+## Where the numbers come from
 
-Alle mit „gemessen" markierten Werte stammen von einer **M5 Pro / 48 GB**
-Maschine (mlx-vlm 0.6.13/0.6.15, Qwen3.8-27B-4bit, `temperature=0`). Übernommen sind
-nur die hardwareunabhängigen Erkenntnisse:
+All values marked "measured" come from an **M5 Pro / 48 GB** machine (mlx-vlm
+0.6.13/0.6.15, Qwen3.8-27B-4bit, `temperature=0`). Only the hardware-independent
+findings are carried over:
 
-- MTP-Speculative-Decoding lohnt (Decode +58…132 %, Acceptance 42 % Prosa /
-  90 % JSON / 93 % Tool-Call, Qualität 7/7 bit-identisch)
-- Prefix-Caching + SSD-Tier lohnen (Faktor 256 auf einen kalten 36k-Prefill)
-- KV-Fensterung ist widerlegt (Halluzination außerhalb des Fensters)
+- MTP speculative decoding is worth it (decode +58…132%, acceptance 42% prose /
+  90% JSON / 93% tool call, quality 7/7 bit-identical)
+- prefix caching + SSD tier are worth it (factor 256 on a cold 36k prefill)
+- KV windowing is disproved (hallucination outside the window)
 
-**Die Speicherrechnung ist Arithmetik** aus `config.json` und den
-Dateigrößen — die gilt auf jeder Maschine. **Die Durchsatzangaben für 32 GB
-sind Schätzungen**, hochskaliert über die Speicherbandbreite, und als solche
-gekennzeichnet.
+**The memory calculation is arithmetic** from `config.json` and the file sizes —
+that holds on any machine. **The throughput figures for 32 GB are estimates**,
+scaled via memory bandwidth, and marked as such.
 
 ---
 
-## Lizenz
+## License
 
-[MIT No Attribution](LICENSE) (SPDX: `MIT-0`) — MIT ohne die Pflicht, den
-Copyright-Vermerk weiterzugeben. Kopieren, anpassen, weiterverwenden ohne
-Namensnennung.
+[MIT No Attribution](LICENSE) (SPDX: `MIT-0`) — MIT without the obligation to
+pass on the copyright notice. Copy, adapt and reuse without attribution.
