@@ -46,7 +46,7 @@ done
 # mlx-vlm 0.6.15 is the version the patches in patches/ are written against. APC
 # is correct upstream from 0.6.13; the short-prompt fix (PR #1901) is included
 # from 0.6.14.
-# --latest gets you something newer; apply-patches.sh may then report "KONFLIKT"
+# --latest gets you something newer; apply-patches.sh may then report "CONFLICT"
 # (meaning: merged upstream -> delete the patch) and the measured values in the
 # start script no longer hold unexamined.
 PINS=(
