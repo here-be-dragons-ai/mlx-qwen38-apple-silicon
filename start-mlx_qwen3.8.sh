@@ -649,11 +649,30 @@ if [[ "$DRAFT_KIND" == "dflash" && "$ENABLE_SPEC_DECODE" != "0" ]]; then
     DRAFT_KIND=mtp
     DRAFT_MODEL="$MODELS_ROOT/Qwen3.8-27B-MTP-4bit"
     DRAFT_BLOCK_SIZE=""
-  elif ! grep -q "_speculative_batch_path_enabled" \
-         "$SITE_PACKAGES/mlx_vlm/server/generation.py" 2>/dev/null; then
-    echo "⚠️  WARNING: patch 0021 missing -- under dflash NO prefix cache applies" >&2
-    echo "    (every turn pays the full prefill). Fix:  ./patches/apply-patches.sh" >&2
   fi
+fi
+
+# ── Broken combination: quantized KV + parallel slots + drafter ───────────────
+# MEASURED on mlx-vlm main @3fd38f4 (2026-08-28): KV_BITS set together with
+# MAX_NUM_SEQS > 1 and a drafter kills the request with
+#   [METAL] Command buffer execution failed: Caused GPU Address Fault Error
+#           (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)
+# Not an OOM -- it faulted at 42% of the working set. Isolated by elimination:
+#   KV_BITS=8 · 1 slot  · drafter        ok   (this is PROFILE=lean)
+#   KV_BITS=8 · 2 slots · no drafter     ok
+#   no KV_BITS · 2 slots · drafter       ok
+#   KV_BITS=8 · 2 slots · drafter        FAULT
+# All three conditions are required. This is the same combination upstream
+# PR #1956 / #1938 address (both still open); the cache-layer half of our old
+# patch 0030 landed upstream, the verify-side half did not, and the verifier was
+# rewritten meanwhile -- so the symptom moved from an AttributeError to a GPU
+# fault. No profile ships MAX_NUM_SEQS > 1, so this only triggers on a manual
+# override. Refuse it rather than hand out a page fault.
+if [[ -n "$KV_BITS" && "$MAX_NUM_SEQS" -gt 1 && "$ENABLE_SPEC_DECODE" != "0" ]]; then
+  echo "ERROR: KV_BITS + MAX_NUM_SEQS>1 + drafter faults the GPU on this mlx-vlm." >&2
+  echo "       Pick one: drop KV_BITS, set MAX_NUM_SEQS=1, or ENABLE_SPEC_DECODE=0." >&2
+  echo "       Upstream: Blaizzy/mlx-vlm#1956 and #1938, both open." >&2
+  exit 1
 fi
 
 SPEC_STATUS="OFF"
@@ -977,16 +996,12 @@ args=(
 
 if [[ "$ENABLE_SPEC_DECODE" != "0" ]]; then
   args+=( --draft-model "$DRAFT_MODEL" --draft-kind "$DRAFT_KIND" )
-  # Without this, non-MTP drafters run in their own generation loop that never
-  # wires up the APC manager: cached_tokens=0 on EVERY turn. Needs patch 0021.
-  # Measured: cached 0 -> 5748/5788, decode unchanged.
-  # Overridable since 2026-08-21 so the path can be measured. It was suspected of
-  # causing the fixed ~9.4 GiB memory floor -- MEASURED, IT IS NOT: with BATCH=0
-  # the floor stays unchanged at +9.46 GiB. The floor hangs on
-  # --draft-block-size >= 2 (1 -> +0.16 GiB, 2 -> +9.31).
-  # BATCH=0 costs the prefix cache under dflash, so it is nothing for production
-  # use -- the switch exists only for diagnostic runs.
-  [[ "$DRAFT_KIND" != "mtp" ]] && export MLX_VLM_SPECULATIVE_BATCH="${MLX_VLM_SPECULATIVE_BATCH:-1}"
+  # MLX_VLM_SPECULATIVE_BATCH used to be set here. It is gone as of 2026-08-28:
+  # the APC redesign (PR #1960) removed _run_speculative entirely, so non-MTP
+  # drafters no longer take a separate generation loop that skips the APC
+  # manager. Verified on main @3fd38f4: zero occurrences of _run_speculative,
+  # apc_manager is wired into the batching generator, and the variable is
+  # referenced nowhere upstream. Local patch 0021 was deleted with it.
   [[ -n "$DRAFT_BLOCK_SIZE" ]] && args+=( --draft-block-size "$DRAFT_BLOCK_SIZE" )
 fi
 

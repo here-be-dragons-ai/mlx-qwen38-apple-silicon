@@ -12,10 +12,24 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-08-25: written against mlx-vlm 0.6.16 and mlx 0.32.2 (PyPI, no
-# source build needed). Patch 0040 was removed -- DFlash 2 ships upstream since
-# 0.6.16 (PR #2014); the earlier PR #1959 it carried was closed unmerged.
-# 0015, 0030 and 0041 were rebased for 0.6.16, see their blocks below.
+# STATE 2026-08-28: written against mlx-vlm main @3fd38f4 (post PR #1960) and
+# mlx 0.32.2. Eight patches, down from eleven.
+#
+# The APC redesign (PR #1960, merged 2026-08-28) removed two of them:
+#   0021  obsolete. _run_speculative is gone; non-MTP drafters no longer take a
+#         separate loop that skips the APC manager, and apc_manager is wired
+#         into the batching generator. MLX_VLM_SPECULATIVE_BATCH is referenced
+#         nowhere upstream and the start script no longer sets it.
+#   0030  replaced by a guard. Its cache-layer half landed upstream
+#         (BatchQuantizedKVCache.is_trimmable/trim are now exactly what the patch
+#         added); the verify-side half did not, and the verifier was rewritten.
+#         The bug survives with a new symptom: KV_BITS + MAX_NUM_SEQS>1 + drafter
+#         now produces a GPU Address Fault instead of an AttributeError. Isolated
+#         by elimination -- all three conditions are required. No profile ships
+#         MAX_NUM_SEQS>1, so the start script refuses the combination instead of
+#         carrying a patch against rewritten code. Upstream #1956/#1938 open.
+#   0010  rebased onto the coordinator path. Still needed: three distinct
+#         requests produced five snapshot files on main without it, three with.
 #
 # ── INCLUDED PATCHES ─────────────────────────────────────────────────────────
 #

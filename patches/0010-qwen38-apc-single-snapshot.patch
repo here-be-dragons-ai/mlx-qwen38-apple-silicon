@@ -1,26 +1,35 @@
---- a/mlx_vlm/generate/ar.py	2026-08-19 20:28:25
-+++ b/mlx_vlm/generate/ar.py	2026-08-19 20:28:25
-@@ -2080,7 +2080,22 @@
+--- a/mlx_vlm/generate/ar.py
++++ b/mlx_vlm/generate/ar.py
+@@ -2186,7 +2186,22 @@
                      if meta is None:
                          continue
-                     if self._apc_mode == "exact":
--                        prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
-+                        # ── P3: Doppel-Snapshot vermeiden (lokaler Patch, 2026-08-17)
-+                        # Pro Request werden sonst ZWEI fast identische Snapshots
-+                        # abgelegt: der Checkpoint bei len-APC_EXACT_PREFIX_GUARD_
-+                        # TOKENS (s. _store_apc_checkpoints, setzt checkpoint_done)
-+                        # und hier der volle Prompt. Gemessen trifft immer der
-+                        # Checkpoint (prompt 3194 -> cached 3178, Differenz = 16 =
-+                        # Guard), der Voll-Snapshot ist toter Ballast und halbiert
-+                        # die Zahl der warm gehaltenen Konversationen.
-+                        # Default AUS => exaktes Upstream-Verhalten.
-+                        _skip_full = bool(
-+                            os.environ.get("QWEN38_APC_SINGLE_SNAPSHOT")
-+                        ) and meta.get("checkpoint_done")
-+                        prompt_cache = (
-+                            None if _skip_full
-+                            else self._apc_prompt_cache_for_store(batch_idx)
-+                        )
+                     coordinator = getattr(self, "_apc_coordinator", None)
+-                    if coordinator is not None:
++                    # Avoid the double snapshot (local patch 0010).
++                    # Two near-identical snapshots are stored per request
++                    # otherwise: the checkpoint at len-APC_EXACT_PREFIX_GUARD_
++                    # TOKENS (_store_apc_exact_checkpoints, sets checkpoint_done)
++                    # and the full prompt here. Measured, the checkpoint is
++                    # always the one that hits (prompt 3194 -> cached 3178,
++                    # difference exactly the guard), so the full snapshot is dead
++                    # weight and halves the number of conversations kept warm.
++                    # Verified against the redesigned APC (PR #1960, 2026-08-28):
++                    # three distinct requests produced five snapshot files, so
++                    # the behaviour survived the rewrite.
++                    # Default OFF => exact upstream behaviour.
++                    _skip_full = bool(
++                        os.environ.get("QWEN38_APC_SINGLE_SNAPSHOT")
++                    ) and meta.get("checkpoint_done")
++                    if coordinator is not None and not _skip_full:
+                         coordinator.commit(
+                             self.prompt_cache,
+                             meta["full_input_ids"],
+@@ -2195,6 +2210,8 @@
+                             skip_first_n_tokens=meta.get("prefix_len", 0),
+                             blocks_in_use=meta.get("apc_blocks", []),
+                         )
++                    elif coordinator is not None:
++                        self._apc_manager.release(meta.get("apc_blocks", []))
+                     elif self._apc_mode == "exact":
+                         prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                          if prompt_cache is not None:
-                             self._apc_manager.store_exact_cache(
-                                 meta["full_input_ids"],
