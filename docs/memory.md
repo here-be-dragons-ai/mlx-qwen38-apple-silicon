@@ -229,6 +229,21 @@ built in sequence and then continued in the same order:
 Three out of three warm, a factor of about 68 on the prefill. Peak memory during
 the run was 26.10 GiB, 65% of the working set.
 
+**Re-verified on mlx-vlm main after the APC redesign (2026-08-28).** PR #1960
+rewrote the cache plumbing this measurement depends on, so it was run again
+unchanged:
+
+| | turn 1 (cold) | turn 2 |
+|---|---|---|
+| A | 14,958 tok, 33.10 s | 14,957 cached, **0.43 s** |
+| B | 14,980 tok, 36.03 s | 14,979 cached, **0.56 s** |
+| C | 14,988 tok, 35.34 s | 14,987 cached, **0.42 s** |
+
+Three out of three still warm, peak 22.32 GiB at 56%. Throughput on the same
+build is unchanged against 0.6.16 (JSON 41.3 vs 41.6, code 43.9 vs 43.8, prose
+29.0 vs 29.5, tool call 31.2 vs 31.6 t/s -- identical completion token counts,
+all differences inside the spread).
+
 > A first attempt at this test used ~200-token prompts and showed all three cold.
 > That was the test being wrong, not the cache: at that size the APC machinery
 > (block size 16, checkpoint at len-16) stores nothing worth reusing. Any APC

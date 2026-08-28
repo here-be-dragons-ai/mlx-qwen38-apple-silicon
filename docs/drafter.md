@@ -5,6 +5,8 @@ is the default and how to switch back.
 
 ## Status since mlx-vlm 0.6.16 (2026-08-24)
 
+> Superseded in part on 2026-08-28 -- see "After the APC redesign" at the end.
+
 **DFlash 2 ships upstream** (PR #2014) at `speculative/drafters/dflash2/`. Local
 patch `0040` carried the earlier PR #1959, which was closed unmerged in favour of
 #2014 -- that patch is gone.
@@ -163,3 +165,23 @@ prefix reuse", `B=1` only, text-only, exact-prefix). The approach used here
 #1923 is merged, `0021` stays local.
 
 ---
+
+
+---
+
+## After the APC redesign (2026-08-28)
+
+PR #1960 landed and removed the reason patch `0021` existed. `_run_speculative`
+is gone from `server/generation.py`; non-MTP drafters no longer take a separate
+generation loop that skips the APC manager, and `apc_manager` is wired into the
+batching generator. `MLX_VLM_SPECULATIVE_BATCH` is referenced nowhere upstream
+and the start script no longer sets it.
+
+Everything above about *why* the prefix cache was broken under DFlash 2 stays
+accurate as history; the workaround is simply no longer needed. The measurement
+that justified it (cached 0 -> 5748/5788) still stands as the record of the bug.
+
+DFlash 2 remains the default. The DSpark comparison above was run on 0.6.16 and
+has not been repeated; PR #1914 (native DSpark with load-time `--draft-bits`
+quantization) is still open and would make that comparison fairer, since DSpark
+was measured as bf16 against a 4bit DFlash 2.

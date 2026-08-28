@@ -65,15 +65,20 @@ self-test → patches → model + drafter → `~/.mlx-qwen38/{logs,apc}`.
 
 Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 
-**Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`, **`mlx-vlm 0.6.16`**,
-`transformers 5.15.1`, `numpy 2.5.2`, `huggingface-hub 1.27.0`, `pillow 12.3.0`,
-Python 3.12.
+**Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`,
+**`mlx-vlm` main @`3fd38f4`**, `transformers 5.15.1`, `numpy 2.5.2`,
+`huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 
-`mlx-vlm >= 0.6.16` is what the patches are written against. It also removes two
-long-standing constraints: DFlash 2 ships upstream (PR #2014), and the
-ArraysCache buffer leak that killed generations at ~10.3k tokens is fixed
-(#1972 via PR #1984) -- verified here with 11,436 tokens in one response, peak
-18.56 GiB. `max_tokens` no longer needs the old 8192 cap.
+> This tracks a git commit, not a release. `0.7.0rc0` is still an open PR. The
+> reason is PR #1960 (APC redesign, merged 2026-08-28), which rewrote the files
+> two patches targeted -- see [docs/memory.md](docs/memory.md). Pinning the
+> release instead means `uv pip install "mlx-vlm==0.6.17"` and reverting to the
+> patch set of commit `5752c4b`.
+
+0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
+upstream (PR #2014), and the ArraysCache buffer leak that killed generations at
+~10.3k tokens is fixed (#1972 via PR #1984) -- verified here with 11,436 tokens
+in one response, peak 18.56 GiB. `max_tokens` no longer needs the old 8192 cap.
 
 `mlx 0.32.2` has been on PyPI since 2026-08-25 including `mlx-metal` and
 `macosx_26_0_arm64` wheels, so **no source build is required** for the fused
@@ -189,7 +194,7 @@ trigger down and wastes context. Pick the value your client reserves for a
 response and no more.
 
 The old hard cap of 8192 came from an upstream bug (#1972) that killed
-generations at ~10.3k tokens; it is fixed in mlx-vlm 0.6.16.
+generations at ~10.3k tokens; it is fixed since mlx-vlm 0.6.16.
 
 The start script can cross-check a YAML config for you:
 
@@ -224,9 +229,14 @@ SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
 
 ## Patches
 
-Ten patches against `site-packages`, applied by `patches/apply-patches.sh`
+Eight patches against `site-packages`, applied by `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). **They vanish on every
 `pip install -U mlx-vlm`** -- run it again afterwards.
+
+The set shrank from eleven on 2026-08-28 when the APC redesign landed: `0021`
+became obsolete (the separate generation loop it worked around is gone) and
+`0030` was replaced by a start-script guard. `0040` went earlier, when DFlash 2
+landed upstream.
 
 ```sh
 ./patches/apply-patches.sh --check
