@@ -66,14 +66,20 @@ self-test → patches → model + drafter → `~/.mlx-qwen38/{logs,apc}`.
 Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 
 **Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`,
-**`mlx-vlm` main @`3fd38f4`**, `transformers 5.15.1`, `numpy 2.5.2`,
+**`mlx-vlm 0.7.0rc0`**, `transformers 5.15.1`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 
-> This tracks a git commit, not a release. `0.7.0rc0` is still an open PR. The
-> reason is PR #1960 (APC redesign, merged 2026-08-28), which rewrote the files
-> two patches targeted -- see [docs/memory.md](docs/memory.md). Pinning the
-> release instead means `uv pip install "mlx-vlm==0.6.17"` and reverting to the
-> patch set of commit `5752c4b`.
+> Back on a tagged release since 2026-09-01 (previously main @`3fd38f4`).
+> Install it with **`--no-deps`**:
+>
+> ```sh
+> uv pip install --python ~/src/mlx/.venv/bin/python --no-deps "mlx-vlm==0.7.0rc0"
+> ```
+>
+> Without `--no-deps` the resolver pulls `mlx` from PyPI down to 0.32.1, which
+> silently disables patch `0013` -- see [docs/build-mlx.md](docs/build-mlx.md).
+> All eight patches apply to this tag unchanged. Note the tag (`579cd51`) is
+> behind main: `#1822` and the TurboQuant batch-decode fix are **not** in it.
 
 0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
 upstream (PR #2014), and the ArraysCache buffer leak that killed generations at

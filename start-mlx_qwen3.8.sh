@@ -653,23 +653,33 @@ if [[ "$DRAFT_KIND" == "dflash" && "$ENABLE_SPEC_DECODE" != "0" ]]; then
 fi
 
 # ── Broken combination: quantized KV + parallel slots + drafter ───────────────
-# MEASURED on mlx-vlm main @3fd38f4 (2026-08-28): KV_BITS set together with
-# MAX_NUM_SEQS > 1 and a drafter kills the request with
+# KV_BITS together with MAX_NUM_SEQS > 1 and a drafter is broken. Still true on
+# 0.7.0rc0, but the symptom changed -- which is why the wording below is not the
+# one this guard shipped with.
+#
+# On main @3fd38f4 (2026-08-28) the request died loudly:
 #   [METAL] Command buffer execution failed: Caused GPU Address Fault Error
 #           (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)
-# Not an OOM -- it faulted at 42% of the working set. Isolated by elimination:
+# Not an OOM -- it faulted at 42% of the working set.
+#
+# On 0.7.0rc0 (2026-09-01) it no longer faults. It returns HTTP 200 with
+# corrupted text instead:
+#   'Here!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+#   'Binary search is!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+# Silent corruption is worse than a crash, so the guard matters more, not less.
+#
+# Re-measured on 0.7.0rc0, all three conditions still required:
 #   KV_BITS=8 · 1 slot  · drafter        ok   (this is PROFILE=lean)
 #   KV_BITS=8 · 2 slots · no drafter     ok
-#   no KV_BITS · 2 slots · drafter       ok
-#   KV_BITS=8 · 2 slots · drafter        FAULT
-# All three conditions are required. This is the same combination upstream
-# PR #1956 / #1938 address (both still open); the cache-layer half of our old
-# patch 0030 landed upstream, the verify-side half did not, and the verifier was
-# rewritten meanwhile -- so the symptom moved from an AttributeError to a GPU
-# fault. No profile ships MAX_NUM_SEQS > 1, so this only triggers on a manual
-# override. Refuse it rather than hand out a page fault.
+#   KV_BITS=8 · 2 slots · drafter        CORRUPT OUTPUT
+# #2113 (clamp ragged batched speculative acceptance) is in this tag and did
+# change the failure mode, but did not fix it. The two PRs that address this
+# combination head-on, #1956 and #1938, are both still open and are not in the
+# tag. No profile ships MAX_NUM_SEQS > 1, so this only triggers on a manual
+# override.
 if [[ -n "$KV_BITS" && "$MAX_NUM_SEQS" -gt 1 && "$ENABLE_SPEC_DECODE" != "0" ]]; then
-  echo "ERROR: KV_BITS + MAX_NUM_SEQS>1 + drafter faults the GPU on this mlx-vlm." >&2
+  echo "ERROR: KV_BITS + MAX_NUM_SEQS>1 + drafter returns corrupted text on this" >&2
+  echo "       mlx-vlm (0.7.0rc0). It used to fault the GPU; now it fails silently." >&2
   echo "       Pick one: drop KV_BITS, set MAX_NUM_SEQS=1, or ENABLE_SPEC_DECODE=0." >&2
   echo "       Upstream: Blaizzy/mlx-vlm#1956 and #1938, both open." >&2
   exit 1
