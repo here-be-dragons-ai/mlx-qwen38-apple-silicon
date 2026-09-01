@@ -380,6 +380,36 @@ afterwards run cold.
 
 ---
 
+### Do not measure APC with `served_tokens`
+
+`GET /v1/cache/stats` reports `served_tokens: 0` on this stack even when the
+cache is doing all the work. The counter has exactly one increment site, and it
+is a **write** path — `apc.py:3447`, inside `def store_kv_blocks(...)`, directly
+next to `self.stats.stores += 1`. It counts tokens written into the block pool,
+not tokens served. In exact mode `store_kv_blocks` never runs, so `stores` and
+`served_tokens` both stay at 0 while the exact tier serves every hit. Unchanged
+in 0.7.0rc0, same line number.
+
+Knock-on effect: `token_hit_rate = matched/(matched + served)` is then a constant
+1.0 and equally useless.
+
+Measured on 2026-08-29, 27B 4-bit, the same 14,878-token prompt twice:
+
+| | wall clock | `cached_tokens` | `served_tokens` |
+|---|---|---|---|
+| cold | 32.4 s | 0 | 0 |
+| identical repeat | **1.3 s** | 14,877 | **0** |
+| conversation continuation | 1.5 s | 14,877 | **0** |
+
+Upstream issue #2048 reads "hits counted, zero restored" off this counter and
+concludes APC serves nothing, for `qwen4_exp` and for Qwen3.8-27B 4-bit. That is
+a misreading of the metric, not data loss — the `APC_ENTRIES` sizing holds.
+
+**Measure `cached_tokens` from the response `usage`, and the wall clock of the
+second request.** Re-verified on 0.7.0rc0: cold 33.9 s for 15,338 tokens
+(2.21 ms/token against 2.18 on the previous pin — no regression), and the
+continuation now matches 14,922 of 14,923 tokens instead of 14,877.
+
 ---
 
 ## When it gets too tight

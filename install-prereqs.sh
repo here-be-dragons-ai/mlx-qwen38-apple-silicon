@@ -58,7 +58,7 @@ done
 PINS=(
   "mlx==0.32.2"
   "mlx-lm==0.31.3"
-  "mlx-vlm==0.6.16"
+  "mlx-vlm==0.7.0rc0"
   "transformers==5.15.1"
   "numpy==2.5.2"
   "huggingface-hub==1.27.0"

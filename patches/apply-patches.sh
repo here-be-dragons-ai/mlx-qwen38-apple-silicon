@@ -12,8 +12,13 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-08-28: written against mlx-vlm main @3fd38f4 (post PR #1960) and
-# mlx 0.32.2. Eight patches, down from eleven.
+# STATE 2026-09-01: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
+# 0.32.2. Eight patches, down from eleven. All eight apply to the tag unchanged
+# -- no rebase was needed for the move off main @3fd38f4.
+#
+# Careful when moving past the tag: main has since drifted in models/base.py
+# (0b73936, 9606b86, efd0479, all quantized-KV work) and patch 0013 no longer
+# applies there -- one hunk of three, context drift only, mechanical to reanchor.
 #
 # The APC redesign (PR #1960, merged 2026-08-28) removed two of them:
 #   0021  obsolete. _run_speculative is gone; non-MTP drafters no longer take a
@@ -23,11 +28,13 @@
 #   0030  replaced by a guard. Its cache-layer half landed upstream
 #         (BatchQuantizedKVCache.is_trimmable/trim are now exactly what the patch
 #         added); the verify-side half did not, and the verifier was rewritten.
-#         The bug survives with a new symptom: KV_BITS + MAX_NUM_SEQS>1 + drafter
-#         now produces a GPU Address Fault instead of an AttributeError. Isolated
-#         by elimination -- all three conditions are required. No profile ships
-#         MAX_NUM_SEQS>1, so the start script refuses the combination instead of
-#         carrying a patch against rewritten code. Upstream #1956/#1938 open.
+#         The bug survives, and on 0.7.0rc0 it changed symptom again: no longer
+#         a GPU Address Fault but HTTP 200 with corrupted text. #2113 (in this
+#         tag) touches that rollback path and moved the failure mode without
+#         fixing it. Isolated by elimination -- all three conditions are still
+#         required. No profile ships MAX_NUM_SEQS>1, so the start script refuses
+#         the combination instead of carrying a patch against rewritten code.
+#         Upstream #1956/#1938 still open, neither in the tag.
 #   0010  rebased onto the coordinator path. Still needed: three distinct
 #         requests produced five snapshot files on main without it, three with.
 #
