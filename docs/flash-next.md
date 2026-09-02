@@ -190,22 +190,29 @@ And that bound is structural: **70.31 GiB of experts against a ~34 GiB cache is
 come off SSD on every token. For reference, PR #2045 reports 19.04 tok/s for
 this model on an M2 Ultra / 128 GB — with everything resident.
 
-### The lever, unmeasured
+### Expert pruning: rejected, for now
 
 `sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit` prunes to 288 of 512 experts,
 which puts the expert set at roughly 39.5 GiB — **~86 % inside the same cache
-instead of 48 %**. That changes the miss rate in kind rather than by degree. It
-also passes the norm check and carries no quality hold.
+instead of 48 %**. That would change the miss rate in kind rather than by
+degree. It passes the norm check and carries no quality hold.
 
-The price is that REAP discards 44 % of the experts, and nobody has published a
-quality comparison against the unpruned model. We have not measured it either —
-throughput or quality.
+**Decided against it on 2026-09-02: there are no published benchmarks.** Neither
+throughput nor, more importantly, quality. REAP discards 44 % of the experts and
+nobody has compared the result against the unpruned model. Buying an unmeasured
+speedup with an unmeasured quality regression leaves two unknowns instead of one
+problem, and a faster wrong answer is not an improvement.
+
+Revisit if a quality comparison against the unpruned model appears. Until then
+the position is that Flash-Next has no usable configuration on 48 GB — not that
+one was found.
 
 ---
 
 ## Verdict
 
-Feasible and correct, not useful yet. The interesting result is how cheap the
+Feasible and correct, not useful. The interesting result is how cheap the
 *resident* part is: 3.76 GiB of core and 24 KiB/token of KV for a 177B model.
-Everything expensive is streamable, and the only thing standing between this and
-usable speed is how much of 70 GiB of experts fits in 34 GiB of cache.
+Everything expensive is streamable, and what is missing is bandwidth, not
+memory — 70 GiB of experts against 34 GiB of cache, with the misses on the SSD
+path of every token.
