@@ -118,6 +118,32 @@ Cost: the drafter occupies 1.01 GiB instead of 0.23 GiB. On `lean` and
 `balanced` that is directly less context — there it is worth weighing whether
 `DRAFT_KIND=mtp` is the better choice.
 
+#### Re-measured on 0.7.0rc0, and against a published M5 Max run
+
+Upstream PR #2133 (raise the `mlx` floor to 0.32.2) carries a benchmark in
+exactly this configuration — Qwen3.8-27B 4-bit, DFlash2, `block_size 4`, greedy,
+200 tokens, median of three — on an **M5 Max** with 48 GB. Re-running the same
+shape here after the move to 0.7.0rc0, prose prompt, three runs, spread under
+1.5%:
+
+| | no drafter | DFlash 2 | factor |
+|---|---|---|---|
+| M5 Max, published in #2133 | 33.02 t/s | 56.45 t/s | 1.71× |
+| **M5 Pro, here** | **16.22 t/s** | **32.84 t/s** | **2.02×** |
+
+Two things follow. **No regression across the version bump:** 16.22 against the
+16.5 t/s for prose without a drafter in the table above, and 32.84 against
+29.9 t/s with DFlash2 — the same workload class, slightly better.
+
+**The absolute gap to the M5 Max is the chip, not the configuration.** This is an
+18-core M5 Pro (6 Super + 12 Performance) against an M5 Max; both baselines sit
+almost exactly a factor of two apart, which is the memory-bandwidth ratio. The
+speedup *factor* is better here than the published one, so nothing in this stack
+is leaving drafter throughput on the table.
+
+Use these as prose-workload numbers. Structured output is the faster case — see
+the table above, where JSON and code reach 44.2 and 42.6 t/s.
+
 ---
 
 ### The prefix cache now works under DFlash2 as well
