@@ -299,6 +299,7 @@ clear the SSD tier, and only then touch `APC_ENTRIES` or `context_length`.
 | [docs/memory.md](docs/memory.md) | sizing, the memory investigation, what was ruled out and why |
 | [docs/drafter.md](docs/drafter.md) | DFlash 2 vs MTP, measurements, patch dependency |
 | [docs/build-mlx.md](docs/build-mlx.md) | building mlx 0.32.2 for fused `head_dim 256` |
+| [docs/flash-next.md](docs/flash-next.md) | Qwen3.8-Flash-Next (177B) on 48 GB: how to spot a broken conversion, external PLE, expert offloading, why it lands at 4 tok/s |
 | `patches/apply-patches.sh` | the patch set, each with its measurement |
 
 ---
