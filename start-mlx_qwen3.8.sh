@@ -763,6 +763,7 @@ BUDGET=$(
   FUSED_OK="$FUSED_OK" \
   "$VENV_PY" - <<'PY'
 import os
+import time
 import mlx.core as mx
 
 GiB = 1 << 30
@@ -873,8 +874,64 @@ if apc_on and ctx_hint:
         entries_used -= 1
         copies, avail, tokens = budget(entries_used)
 
+# ── Decode ceiling ────────────────────────────────────────────────────────────
+# Taken from Perplexity's Lily write-up (2026-09-01). They measured their MoE
+# kernels at 97.9% of the sustained weight-read rate and showed that removing the
+# arithmetic entirely changed throughput by 0.2% -- which proves the workload
+# bandwidth-bound and further kernel tuning pointless. The same statement is one
+# division here, and it is worth having in the banner because it answers a
+# question this repository kept re-asking: is there anything left to gain?
+#
+# This model is DENSE. Batch-1 decode therefore reads every weight once per
+# token, plus the fixed recurrent state of the 48 GDN layers, plus the KV cache
+# grown to the current context. Bandwidth divided by those bytes is the fastest
+# this machine can possibly emit, with any engine and any configuration.
+#
+# The denominator is MEASURED rather than taken from the spec sheet: a streaming
+# read over 1 GiB reaches ~279 GB/s here, 91% of the 307 GB/s an M5 Pro is rated
+# at. What the machine does is the honest bound; what the datasheet says is not.
+# Cost is one 1 GiB allocation and ~50 ms, before the model is loaded.
+#
+# HOW TO READ IT: a measurement close to the ceiling means tuning is finished --
+# on 2026-09-03 this machine ran 16.22 tok/s against a 17.1 tok/s ceiling, i.e.
+# 95%, so no configuration change could have been worth more than 5%.
+# A DRAFTER LEGITIMATELY EXCEEDS THE CEILING (32.84 tok/s here, 192% of it). That
+# is not a contradiction: speculative decoding amortises ONE weight pass over
+# several accepted tokens. It is also why Perplexity's negative result does not
+# transfer -- on their MoE, draft tokens pull in additional experts and pay the
+# amortisation back; a dense model has no extra weights to read.
+#
+# MEM_BW_GBS overrides the probe (e.g. with a spec figure); MEM_BW_GBS=0 skips it.
+def _bandwidth_gbs():
+    override = os.environ.get("MEM_BW_GBS")
+    if override is not None and override != "":
+        return float(override) or 0.0
+    try:
+        probe = 1 << 30
+        a = mx.random.normal((probe // 2,)).astype(mx.bfloat16)
+        mx.eval(a)
+        for _ in range(2):
+            mx.eval(mx.sum(a))
+        t0 = time.perf_counter()
+        for _ in range(5):
+            mx.eval(mx.sum(a))
+        dt = (time.perf_counter() - t0) / 5
+        del a
+        mx.clear_cache()
+        return probe / dt / 1e9 if dt > 0 else 0.0
+    except Exception:
+        return 0.0                                       # never block the start
+
+
+bw = _bandwidth_gbs()
+# The drafter is NOT in here: it is read per draft block, not per target token.
+per_step = int(os.environ["WEIGHTS_KB"]) * 1024 + recurrent
+ceil_0 = bw * 1e9 / per_step if bw else 0.0
+ceil_ctx = bw * 1e9 / (per_step + ctx_hint * per_tok) if (bw and ctx_hint) else 0.0
+
 print(f"{ws/GiB:.1f}|{ram/GiB:.0f}|{weights/GiB:.1f}|{avail/GiB:.1f}|{tokens}|{copies}"
-      f"|{per_tok//1024}|{entries_used}|{info['device_name']}")
+      f"|{per_tok//1024}|{entries_used}|{bw:.0f}|{ceil_0:.1f}|{ceil_ctx:.1f}"
+      f"|{info['device_name']}")
 PY
 )
 WS_GIB="${BUDGET%%|*}"; REST="${BUDGET#*|}"
@@ -884,7 +941,10 @@ AVAIL_GIB="${REST%%|*}"; REST="${REST#*|}"
 MAX_TOKENS_FIT="${REST%%|*}"; REST="${REST#*|}"
 COPIES="${REST%%|*}";  REST="${REST#*|}"
 KV_KIB="${REST%%|*}";  REST="${REST#*|}"
-ENTRIES_USED="${REST%%|*}"; DEV_NAME="${REST#*|}"
+ENTRIES_USED="${REST%%|*}"; REST="${REST#*|}"
+MEM_BW="${REST%%|*}";  REST="${REST#*|}"
+CEIL_0="${REST%%|*}";  REST="${REST#*|}"
+CEIL_CTX="${REST%%|*}"; DEV_NAME="${REST#*|}"
 
 # If the budget calculation capped the snapshot count, the capped value applies.
 if [[ "$ENABLE_APC" == "1" && "$ENTRIES_USED" != "$APC_ENTRIES" ]]; then
@@ -952,6 +1012,20 @@ echo "     between requests. The mem lines in the log are authoritative."
 if [[ "$FUSED_OK" == "0" ]]; then
 echo "  score transient  : ${SCORE_GIB} GiB  at chunk $PREFILL_STEP @ ${_CTX_HINT} tokens"
 echo "                     (unfused; comes ON TOP of the KV budget above)"
+fi
+# The decode ceiling, measured. Unlike the budget above this one is a hard
+# physical bound: a dense model reads every weight once per token, so bandwidth
+# divided by bytes is the fastest anything can go on this machine.
+if [[ "$MEM_BW" != "0" && -n "$MEM_BW" ]]; then
+echo "  ──────────── decode ceiling (measured, bandwidth-bound) ─────"
+echo "  memory bandwidth : ${MEM_BW} GB/s   (streaming read over 1 GiB, MEM_BW_GBS overrides)"
+echo "  ->  DECODE CEILING: ${CEIL_0} tok/s at empty context"
+if [[ "$CEIL_CTX" != "0.0" ]]; then
+echo "                      ${CEIL_CTX} tok/s at ${_CTX_HINT} tokens (the KV cache is read too)"
+fi
+echo "     Without a drafter, a rate near this is DONE -- not slow. A drafter"
+echo "     exceeds it legitimately: it amortises one weight pass over several"
+echo "     accepted tokens (measured here 32.84 t/s against a 17.1 t/s ceiling)."
 fi
 echo "──────────────────────────────────────────────────────────────"
 
