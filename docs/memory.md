@@ -412,6 +412,83 @@ continuation now matches 14,922 of 14,923 tokens instead of 14,877.
 
 ---
 
+## The decode ceiling, and when to stop tuning
+
+The budget above answers "does it fit". It does not answer the other question
+this document kept circling: *is there anything left to gain?* One division
+does, and the start banner now prints it.
+
+The idea is borrowed from Perplexity's Lily write-up (2026-09-01), which
+measured its own MoE kernels at 97.9 % of the sustained weight-read rate and
+showed that removing the arithmetic entirely moved throughput by 0.2 % — proving
+the workload bandwidth-bound and further kernel work pointless. The same
+statement is cheap to make here.
+
+Qwen3.8-27B is **dense**. Batch-1 decode therefore reads every weight once per
+token, plus the fixed recurrent state of the 48 GDN layers (144 MiB), plus the
+KV cache grown to the current context. Bandwidth divided by those bytes is the
+fastest this machine can emit — with any engine, any configuration:
+
+| | bytes read per token | ceiling |
+|---|---:|---:|
+| empty context | 16.2 GB | **17.1 tok/s** |
+| 32k context, f16 KV | 18.4 GB | 15.1 tok/s |
+| 65k context, f16 KV | 20.5 GB | **13.5 tok/s** |
+| 65k context, `KV_BITS=8` | 18.4 GB | **15.1 tok/s** |
+
+All four rows are computed at the same 277 GB/s, so they compare. The banner
+recomputes them from its own probe at start, which lands a percent or two away.
+
+The denominator is measured, not taken from the spec sheet: a streaming read
+over 1 GiB reaches **277 GB/s** here, 90 % of the 307 GB/s an M5 Pro is rated
+at. Run-to-run spread is about ±1.3 %. `MEM_BW_GBS` overrides the probe,
+`MEM_BW_GBS=0` skips it.
+
+**What it is for.** On 2026-09-03 this machine ran 16.22 tok/s without a drafter
+against a 17.1 tok/s ceiling — 95 %. No configuration change could have been
+worth more than 5 %, and anything claiming more was measuring a warm-up or a
+different workload. That is a decision rule, and it is the one thing that would
+have shortened several of the investigations in this file.
+
+**A drafter exceeds the ceiling, and that is not a contradiction.** 32.84 tok/s
+is 192 % of it. Speculative decoding does not make the memory faster; it
+amortises one weight pass over several accepted tokens. This is also why
+Perplexity's negative result for speculative decoding does not transfer: on
+their MoE the draft tokens pull in *additional* experts and hand the
+amortisation back, while a dense model has no extra weights to read.
+
+**The one prediction to check.** The table above says `KV_BITS=8` should be
+worth about **+12 % decode at 65k context** (13.5 → 15.1 tok/s), for the same
+−4.2 GiB it already buys. That is derived, not measured — and it is the first
+quantitative counterweight to the llama.cpp figure in the table below, which is
+the reason KV quantisation has stayed off. Worth an A/B before the next time
+memory gets tight.
+
+### Open: 65k died at a stated budget of 90k
+
+Measured 2026-09-03 on `PROFILE=roomy`, fused path genuinely active, `f16` KV.
+Two 32,803-token requests went through at 400–430 tok/s prefill and 19–20 tok/s
+decode. The next request at 65,536 tokens died with
+
+```
+[METAL] Command buffer execution failed: Insufficient Memory
+```
+
+The working set had climbed to 40.00 GiB of 40.00 GiB, peak 41.33 GiB, while the
+banner was advertising a context budget of **~89,914 tokens**.
+
+**Not yet separated:** whether 65k fails on its own, or only after the APC has
+been filled by earlier long requests. The two 32k requests left three snapshots
+behind, and memory was already at ~30 GiB before the 65k attempt started. A cold
+server has not been tried at 65k. Until it has, the honest reading is that the
+budget line is optimistic by at least 27 % under realistic APC load — which is
+what its own caveat says, but this is the first time the gap has been measured.
+
+Also worth recording, because the repository had no numbers for it: prefill runs
+at ~386 tok/s at 8k and ~400–430 tok/s at 32k.
+
+---
+
 ## When it gets too tight
 
 The first move is `PROFILE=lean`. What sits behind it, individually and with its
@@ -420,7 +497,7 @@ price (savings relative to a 43k peak prompt):
 | lever | saves | price |
 |---|---|---|
 | lower `APC_ENTRIES` (per step) | **−4.2 GiB** @ 65536 | **higher than long assumed.** The assumption was "small, the SSD tier catches it". Measured over 810 prefills, `APC_ENTRIES=1` cost up to **72.7 min** of cold prefill through eviction — the tier only catches it when it is not thrashing at its own cap (see "The cap is per namespace") |
-| `KV_BITS=8 QUANT_KV_START=8192` | **−4.2 GiB** | throughput on the MLX path *not* measured; on llama.cpp, KV quantisation at a comparable place cost up to 8× prefill and 1.9× decode → measure A/B |
+| `KV_BITS=8 QUANT_KV_START=8192` | **−4.2 GiB** | still not measured on MLX, but no longer a blind bet: the ceiling calculation predicts decode **+12 % at 65k** (13.5 → 15.1 tok/s), against the llama.cpp figure of up to 8× prefill and 1.9× decode *lost*. Those point in opposite directions, which is exactly why it needs an A/B rather than a decision |
 | `context_length` 49152 → 32768 | −2.6 GiB | shorter runs before compaction |
 | `PREFILL_STEP=512` | ~−0.2 GiB | practically none (prefill is compute-bound, not chunk-bound) |
 | weights `mxfp4` instead of `4bit` | −0.78 GiB | `mlx-community/Qwen3.8-27B-mxfp4` = 14.17 instead of 14.95 GiB, supported by mlx 0.32; quality not compared |

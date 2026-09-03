@@ -12,13 +12,15 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-01: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
-# 0.32.2. Eight patches, down from eleven. All eight apply to the tag unchanged
-# -- no rebase was needed for the move off main @3fd38f4.
+# STATE 2026-09-02: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
+# 0.32.2. Nine patches. All nine apply to the tag unchanged.
+#   - 0013 was REWRITTEN (it had never once fired on the server; see below).
+#   - 0032 is NEW, carrying the still-open upstream PR #2096.
 #
 # Careful when moving past the tag: main has since drifted in models/base.py
-# (0b73936, 9606b86, efd0479, all quantized-KV work) and patch 0013 no longer
-# applies there -- one hunk of three, context drift only, mechanical to reanchor.
+# (0b73936, 9606b86, efd0479, all quantized-KV work, plus #1822 merged
+# 2026-09-01) and patch 0013 no longer applies there -- context drift only,
+# mechanical to reanchor.
 #
 # The APC redesign (PR #1960, merged 2026-08-28) removed two of them:
 #   0021  obsolete. _run_speculative is gone; non-MTP drafters no longer take a
@@ -65,13 +67,45 @@
 #   justifies this explicitly by saying only the runtime knows its memory
 #   budget -- which applies here.
 #   Narrowly scoped: only qL > 1 (prefill/verify, not decode), only head_dim
-#   192/256, only without an array mask and without sinks. If force_fused throws
-#   once, the path is disabled permanently and logged once.
+#   192/256, only without sinks.
+#
+#   REWRITTEN 2026-09-02, AND IT ONLY STARTED WORKING ON THE SERVER THEN.
+#   The old condition also required "no array mask", and that excluded exactly
+#   the production case: the server runs every request through the batching
+#   generator, whose BatchKVCache.make_mask() ALWAYS returns an array (it
+#   encodes left_padding) and never the "causal" string. The patch was applied,
+#   the start banner said "fused", and all 16 layers ran unfused. force_fused
+#   handles array masks perfectly well -- the restriction was unfounded.
+#   MEASURED through the patched entry point with the real server mask,
+#   24 q-heads / 4 kv-heads / head_dim 256, bf16, per layer:
+#     qL=2048 / kL=22747   unfused 2362 MiB, 83.9 ms -> fused 205 MiB, 68.7 ms
+#     qL= 512 / kL=22747   unfused  675 MiB, 20.6 ms -> fused 136 MiB, 17.2 ms
+#   Numerically the fused kernel is the better one (max error against an fp32
+#   reference 0.0011 vs 0.0050): it accumulates in fp32 instead of materialising
+#   the scores in fp16. Verified for a left-padded B=2 batch as well.
+#   The start script's FUSED_OK probe was rewritten with it -- it used to ask
+#   only whether mlx knows the force_fused argument, which said nothing about
+#   whether the path is taken.
+#
+#   THE REFUSAL SET, AND WHY IT IS KEYED BY SHAPE: there is a narrow hole in the
+#   kernel coverage, measured on mlx 0.32.2 at GQA factor 6 / head_dim 256 --
+#     qL <= 5 fused (sdpa_vector wants qL x GQA <= 32) / qL 6,7,8 NO KERNEL /
+#     qL >= 12 fused
+#   -- and it sits where speculative verify runs. Until 2026-09-02 a single
+#   throw set a global flag and the fused path was gone for the whole process,
+#   including the qL=2048 prefills that carry the 2.1 GiB per layer.
+#   _FORCE_FUSED_REFUSED is now keyed by (head_dim, dtype, mask kind, qL): one
+#   refused shape disables one shape. DRAFT_BLOCK_SIZE=4 (the default) verifies
+#   at qL 4-5 and stays clear of the hole; 7 or 8 lands in it.
 #   INERT ON mlx < 0.32.2: the import probe falls to TypeError.
 #   VERIFIED on mlx 0.32.0: _FORCE_FUSED == False, behaviour unchanged.
 #   Rollback: QWEN38_FORCE_FUSED_SDPA=0
-#   CAREFUL: PR #3842 (fused head_dim 256 on NAX/M5) requires qL >= 1024 --
-#   PROFILE=lean sets PREFILL_STEP=512 and therefore falls out of it.
+#   ON PR #3842 (fused head_dim 256 on NAX/M5, qL >= 1024): the win does NOT
+#   depend on it. At qL=512 the fused path engages and saves 539 MiB per layer,
+#   so PROFILE=lean is not cut off from it.
+#   UPSTREAM: mlx PR #4416 (merged 2026-09-02, unreleased) routes head_dim 256
+#   with an array mask through the DEFAULT dispatch. Once that is in a release,
+#   the array-mask half of this patch is redundant; the force_fused half is not.
 #
 # 0014-quantized-kv-start-uniform.patch   (LOCAL, no upstream PR)
 #   quantized_kv_start applied on the batch path only for TurboQuant. On the
@@ -170,6 +204,49 @@
 #   decoding with quantized batch cache") change the same two files with the same
 #   content. Only one will merge -- this patch covers both.
 #
+# 0032-pr2096-chunked-prefill-drafter-priming.patch  (PR #2096, @Lazarus-931, open)
+#   "Prime speculative drafters from the whole prompt during chunked prefill",
+#   fixes upstream #2022. THIS ONE IS NORMAL OPERATION HERE, not a precaution.
+#   Chunked prefill requested the speculative capture kwargs only on the FINAL
+#   prefill call. Drafters that read target hidden past the last prompt position
+#   were therefore primed from a one-token prompt -- and DFlash 2, our default,
+#   cross-attends its first draft block over exactly that prompt hidden.
+#   PROFILE=roomy runs PREFILL_STEP=2048, so every prompt above 2048 tokens is
+#   chunked and lands in this. The cost is invisible in the decode rate on its
+#   own; it only shows against a short, unchunked prompt.
+#   Upstream numbers (Qwen3.5-9B, prefill_step_size 512, % of drafted accepted):
+#     prompt 2048   unchunked 82.3%   chunked before 57.1%   chunked after 82.3%
+#     prompt 4096   unchunked 64.9%   chunked before 55.4%   chunked after 82.3%
+#
+#   MEASURED HERE 2026-09-03 with ./measure-drafter-acceptance.py, n=12 per arm,
+#   one server restart per arm, 400 generated tokens, temperature 0:
+#     prompt 1024 (unchunked)   48.6% -> 53.9%   (+5.3 pp)
+#     prompt 4096               46.5% -> 54.7%   (+8.2 pp)
+#     prompt 8192               49.4% -> 55.4%   (+6.1 pp)
+#     pooled                    48.2% -> 54.7%   (+6.5 pp, Welch t = 6.34)
+#   Target passes per 400 tokens fall by about 6% (202->192, 206->191, 201->190).
+#
+#   TWO THINGS THE MEASUREMENT DOES NOT SHOW, both worth knowing before quoting
+#   the upstream framing:
+#     - DECODE THROUGHPUT DOES NOT MOVE: -3.2% / +1.0% / +1.2% across the three
+#       lengths, inside the noise. Six percent fewer target passes should have
+#       been worth roughly six percent; something absorbs it, and this has not
+#       been isolated.
+#     - THE UNCHUNKED CONTROL IMPROVES TOO (+5.3 pp at 1024, below PREFILL_STEP).
+#       Upstream reports an unchanged control and a gap that closes only for
+#       chunked prompts. So the effect here is not purely the chunked-prefill
+#       defect -- the patch also routes speculative_prompt_ids differently, which
+#       applies to every prompt.
+#   KEPT anyway: it restores the upstream-intended priming, acceptance is up
+#   reproducibly, and nothing regressed.
+#   The tests from the PR are NOT carried (test_generate.py, test_models.py):
+#   site-packages is not where they run.
+#   SIDE EFFECT worth knowing: the PR deletes qwen3_5's own
+#   chunked_prefill_policy and replaces four per-model copies of the predicate
+#   with one capability check on rollback_speculative_cache in
+#   generate/common.py. Checked here: chunked prefill stays enabled for dflash,
+#   mtp and no drafter -- the RAM lever is not touched.
+#
 # 0031-pr1835-recurrent-cache-no-trim.patch    (PR #1835, @kylesyx, open)
 #   "Decline prefix-cache reuse for non-trimmable recurrent caches".
 #   _prefix_cache_trim_amount() only checks whether the prefix is still PRESENT,
@@ -185,6 +262,15 @@
 #   dispatch.stream_generate, and the server path does not go through there.
 #   Included as a precaution for mlx_vlm.chat_ui, the generate CLI and own
 #   scripts that pass prompt_cache_state through.
+#   THE PR HAS MOVED ON (checked 2026-09-02): head 08b0c9e is broader than what
+#   this patch carries. @kylesyx found that CacheList and a bare ArraysCache
+#   expose no top-level offset, so cached_len collapses to 0, n_drop to 0, and
+#   both guards are short-circuited -- Qwen3.5/3.6 only got fixed here because a
+#   sibling KVCache contributes a nonzero offset. Affects mamba/mamba2/rwkv7 and
+#   the per-layer-CacheList models. Not our server path, so not re-pulled; do
+#   pull it if this patch ever becomes load-bearing. CI has never run on that
+#   head -- the fork PR is waiting on maintainer approval, so the red X on the
+#   PR page is the stale Aug 20 run.
 #
 # ── DONE / OBSOLETE ──────────────────────────────────────────────────────────
 #

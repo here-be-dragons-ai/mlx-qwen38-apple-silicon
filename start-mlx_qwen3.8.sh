@@ -558,19 +558,53 @@ fi
 # force_fused at all (>= 0.32.2); below that it is deliberately inert.
 # Hence a runtime probe rather than a plain grep: "the patch is in the venv" and
 # "the path is active" are two different statements here.
+#
+# THE PROBE ASKED THE WRONG QUESTION UNTIL 2026-09-02. It called mlx directly
+# with a 1x1x1x128 tensor and only established that the installed mlx ACCEPTS
+# the force_fused argument. Since 0.32.2 that is always true and says nothing
+# about the production path: the server serves every request through the
+# batching generator, whose BatchKVCache passes down an ARRAY mask (it has to
+# encode left_padding), and patch 0013 declined array masks. So the banner read
+# "fused" while all 16 layers ran unfused, and the budget below dropped the
+# score transient on the strength of it. The probe now calls the PATCHED entry
+# point with the real server mask at the configured PREFILL_STEP and reports
+# what force_fused actually received. Costs one SDPA call at startup.
 FUSED_OK=0
 _FUSED_PROBE=no
 _PATCH0013=0
 if grep -q "_FORCE_FUSED_HEAD_DIMS" "$SITE_PACKAGES/mlx_vlm/models/base.py" 2>/dev/null; then
   _PATCH0013=1
-  _FUSED_PROBE=$("$VENV_PY" -c '
+  _FUSED_PROBE=$(PREFILL_STEP="$PREFILL_STEP" "$VENV_PY" -c '
+import os
 import mlx.core as mx
-q = mx.zeros((1, 1, 1, 128), dtype=mx.bfloat16)
+import mlx_vlm.models.base as base
+from mlx_vlm.models.cache import BatchKVCache
+
+qL = int(os.environ.get("PREFILL_STEP") or 2048)
+kL = qL + 512
+D, HQ, HKV = 256, 24, 4
+q = mx.zeros((1, HQ, qL, D), dtype=mx.bfloat16)
+k = mx.zeros((1, HKV, kL, D), dtype=mx.bfloat16)
+v = mx.zeros((1, HKV, kL, D), dtype=mx.bfloat16)
+cache = BatchKVCache(left_padding=[0])
+cache._idx = kL - qL
+mask = cache.make_mask(qL)
+
+seen = []
+real = mx.fast.scaled_dot_product_attention
+def spy(*a, **kw):
+    seen.append(bool(kw.get("force_fused", False)))
+    return real(*a, **kw)
+mx.fast.scaled_dot_product_attention = spy
 try:
-    mx.fast.scaled_dot_product_attention(q, q, q, scale=1.0, mask=None, force_fused=False)
-    print("ok")
-except TypeError:
-    print("no")
+    mx.eval(
+        base.scaled_dot_product_attention(
+            q, k, v, cache=None, scale=D ** -0.5, mask=mask
+        )
+    )
+finally:
+    mx.fast.scaled_dot_product_attention = real
+print("ok" if seen and seen[-1] else "no")
 ' 2>/dev/null || echo no)
 fi
 
@@ -579,10 +613,10 @@ if [[ "${QWEN38_FORCE_FUSED_SDPA:-1}" == "0" ]]; then
 elif [[ "$_PATCH0013" == "0" ]]; then
   FUSED_STATUS="unfused (patch 0013 missing -- ./patches/apply-patches.sh)"
 elif [[ "$_FUSED_PROBE" == "ok" ]]; then
-  FUSED_STATUS="fused (patch 0013 active)"
+  FUSED_STATUS="fused (patch 0013 active, verified at qL=$PREFILL_STEP with the server mask)"
   FUSED_OK=1
 else
-  FUSED_STATUS="unfused (patch 0013 inert: mlx $MLX_VER has no force_fused, needs >= 0.32.2)"
+  FUSED_STATUS="unfused (patch 0013 present, but no fused kernel at qL=$PREFILL_STEP -- mlx $MLX_VER)"
 fi
 
 # ── Fused quantized linears (patch 0015) ─────────────────────────────────────
@@ -729,6 +763,7 @@ BUDGET=$(
   FUSED_OK="$FUSED_OK" \
   "$VENV_PY" - <<'PY'
 import os
+import time
 import mlx.core as mx
 
 GiB = 1 << 30
@@ -761,9 +796,16 @@ ctx_hint = int(os.environ.get("CTX_HINT") or 0)
 # entry, without: one per two entries).
 # ── Prefill transient ─────────────────────────────────────────────────────────
 # The item that was missing until 2026-08-21, and the reason for "[METAL]
-# Insufficient Memory" despite an apparently ample budget. Applies only WITHOUT
-# the source build -- with patch 0013 active the item is zero (FUSED_OK branch
-# below).
+# Insufficient Memory" despite an apparently ample budget. Zero once the fused
+# path is genuinely taken (FUSED_OK branch below).
+#
+# THE FUSED_OK BRANCH WAS WRONG BETWEEN 2026-08-21 AND 2026-09-02: FUSED_OK came
+# from a probe that only asked whether mlx knows the force_fused argument, while
+# patch 0013 declined the array masks that the server actually passes. The item
+# was dropped from the budget while it was still fully present in reality -- the
+# budget was too optimistic by exactly this amount, which is the direction that
+# ends in "Insufficient Memory". Both are fixed since 2026-09-02: the patch
+# fuses array masks, and the probe calls the patched entry point.
 #
 # head_dim is 256. mlx's default dispatch permits fused full attention only for
 # 64/80/128 (up to 0.32.1), so the 16 full-attn layers run on the unfused graph
@@ -780,14 +822,19 @@ ctx_hint = int(os.environ.get("CTX_HINT") or 0)
 # direction to err. Underestimating here means a crash mid-operation, and it does
 # not arrive as a clean error but as
 # "[METAL] Command buffer execution failed: Insufficient Memory".
-# The item disappears as soon as mlx 0.32.2 + patch 0013 provide the fused path --
-# which is the case since the source build of 2026-08-21, hence the FUSED_OK
-# branch.
-# MEASURED with mlx 0.32.2.dev+a082cb91, production shape qL=512 / kL=22747,
-# 24 heads / 4 KV heads / head_dim 256:
-#   force_fused=False : peak 662 MiB   (difference 539 MiB = the score tensor)
-#   force_fused=True  : peak 123 MiB
+# The item disappears as soon as mlx 0.32.2 + patch 0013 provide the fused path
+# AND the path is actually taken, hence the FUSED_OK branch.
+# RE-MEASURED 2026-09-02 on mlx 0.32.2 from PyPI, with the mask the server really
+# passes (BatchKVCache array mask), 24 heads / 4 KV heads / head_dim 256, per
+# layer -- through the patched entry point, not against mx.fast directly:
+#   qL=2048 / kL=22747  unfused 2362 MiB  ->  fused 205 MiB   (83.9 -> 68.7 ms)
+#   qL= 512 / kL=22747  unfused  675 MiB  ->  fused 136 MiB   (20.6 -> 17.2 ms)
 # With the fused path the item is therefore not "smaller" but gone.
+# CAREFUL, THERE IS A HOLE: at GQA factor 6 and head_dim 256 no fused kernel
+# exists for qL 6, 7, 8 -- above and below it there is one. PREFILL_STEP never
+# lands there, but a DRAFT_BLOCK_SIZE of 7 or 8 does (verify runs at block+1).
+# Patch 0013 falls back per shape in that case and logs it once; it does not
+# cost the prefill its fused path.
 INFLIGHT = 16
 n_heads = 24
 prefill_step = int(os.environ.get("PREFILL_STEP") or 2048)
@@ -827,8 +874,64 @@ if apc_on and ctx_hint:
         entries_used -= 1
         copies, avail, tokens = budget(entries_used)
 
+# ── Decode ceiling ────────────────────────────────────────────────────────────
+# Taken from Perplexity's Lily write-up (2026-09-01). They measured their MoE
+# kernels at 97.9% of the sustained weight-read rate and showed that removing the
+# arithmetic entirely changed throughput by 0.2% -- which proves the workload
+# bandwidth-bound and further kernel tuning pointless. The same statement is one
+# division here, and it is worth having in the banner because it answers a
+# question this repository kept re-asking: is there anything left to gain?
+#
+# This model is DENSE. Batch-1 decode therefore reads every weight once per
+# token, plus the fixed recurrent state of the 48 GDN layers, plus the KV cache
+# grown to the current context. Bandwidth divided by those bytes is the fastest
+# this machine can possibly emit, with any engine and any configuration.
+#
+# The denominator is MEASURED rather than taken from the spec sheet: a streaming
+# read over 1 GiB reaches ~279 GB/s here, 91% of the 307 GB/s an M5 Pro is rated
+# at. What the machine does is the honest bound; what the datasheet says is not.
+# Cost is one 1 GiB allocation and ~50 ms, before the model is loaded.
+#
+# HOW TO READ IT: a measurement close to the ceiling means tuning is finished --
+# on 2026-09-03 this machine ran 16.22 tok/s against a 17.1 tok/s ceiling, i.e.
+# 95%, so no configuration change could have been worth more than 5%.
+# A DRAFTER LEGITIMATELY EXCEEDS THE CEILING (32.84 tok/s here, 192% of it). That
+# is not a contradiction: speculative decoding amortises ONE weight pass over
+# several accepted tokens. It is also why Perplexity's negative result does not
+# transfer -- on their MoE, draft tokens pull in additional experts and pay the
+# amortisation back; a dense model has no extra weights to read.
+#
+# MEM_BW_GBS overrides the probe (e.g. with a spec figure); MEM_BW_GBS=0 skips it.
+def _bandwidth_gbs():
+    override = os.environ.get("MEM_BW_GBS")
+    if override is not None and override != "":
+        return float(override) or 0.0
+    try:
+        probe = 1 << 30
+        a = mx.random.normal((probe // 2,)).astype(mx.bfloat16)
+        mx.eval(a)
+        for _ in range(2):
+            mx.eval(mx.sum(a))
+        t0 = time.perf_counter()
+        for _ in range(5):
+            mx.eval(mx.sum(a))
+        dt = (time.perf_counter() - t0) / 5
+        del a
+        mx.clear_cache()
+        return probe / dt / 1e9 if dt > 0 else 0.0
+    except Exception:
+        return 0.0                                       # never block the start
+
+
+bw = _bandwidth_gbs()
+# The drafter is NOT in here: it is read per draft block, not per target token.
+per_step = int(os.environ["WEIGHTS_KB"]) * 1024 + recurrent
+ceil_0 = bw * 1e9 / per_step if bw else 0.0
+ceil_ctx = bw * 1e9 / (per_step + ctx_hint * per_tok) if (bw and ctx_hint) else 0.0
+
 print(f"{ws/GiB:.1f}|{ram/GiB:.0f}|{weights/GiB:.1f}|{avail/GiB:.1f}|{tokens}|{copies}"
-      f"|{per_tok//1024}|{entries_used}|{info['device_name']}")
+      f"|{per_tok//1024}|{entries_used}|{bw:.0f}|{ceil_0:.1f}|{ceil_ctx:.1f}"
+      f"|{info['device_name']}")
 PY
 )
 WS_GIB="${BUDGET%%|*}"; REST="${BUDGET#*|}"
@@ -838,7 +941,10 @@ AVAIL_GIB="${REST%%|*}"; REST="${REST#*|}"
 MAX_TOKENS_FIT="${REST%%|*}"; REST="${REST#*|}"
 COPIES="${REST%%|*}";  REST="${REST#*|}"
 KV_KIB="${REST%%|*}";  REST="${REST#*|}"
-ENTRIES_USED="${REST%%|*}"; DEV_NAME="${REST#*|}"
+ENTRIES_USED="${REST%%|*}"; REST="${REST#*|}"
+MEM_BW="${REST%%|*}";  REST="${REST#*|}"
+CEIL_0="${REST%%|*}";  REST="${REST#*|}"
+CEIL_CTX="${REST%%|*}"; DEV_NAME="${REST#*|}"
 
 # If the budget calculation capped the snapshot count, the capped value applies.
 if [[ "$ENABLE_APC" == "1" && "$ENTRIES_USED" != "$APC_ENTRIES" ]]; then
@@ -906,6 +1012,20 @@ echo "     between requests. The mem lines in the log are authoritative."
 if [[ "$FUSED_OK" == "0" ]]; then
 echo "  score transient  : ${SCORE_GIB} GiB  at chunk $PREFILL_STEP @ ${_CTX_HINT} tokens"
 echo "                     (unfused; comes ON TOP of the KV budget above)"
+fi
+# The decode ceiling, measured. Unlike the budget above this one is a hard
+# physical bound: a dense model reads every weight once per token, so bandwidth
+# divided by bytes is the fastest anything can go on this machine.
+if [[ "$MEM_BW" != "0" && -n "$MEM_BW" ]]; then
+echo "  ──────────── decode ceiling (measured, bandwidth-bound) ─────"
+echo "  memory bandwidth : ${MEM_BW} GB/s   (streaming read over 1 GiB, MEM_BW_GBS overrides)"
+echo "  ->  DECODE CEILING: ${CEIL_0} tok/s at empty context"
+if [[ "$CEIL_CTX" != "0.0" ]]; then
+echo "                      ${CEIL_CTX} tok/s at ${_CTX_HINT} tokens (the KV cache is read too)"
+fi
+echo "     Without a drafter, a rate near this is DONE -- not slow. A drafter"
+echo "     exceeds it legitimately: it amortises one weight pass over several"
+echo "     accepted tokens (measured here 32.84 t/s against a 17.1 t/s ceiling)."
 fi
 echo "──────────────────────────────────────────────────────────────"
 

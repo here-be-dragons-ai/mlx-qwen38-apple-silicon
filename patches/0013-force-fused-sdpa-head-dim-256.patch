@@ -8,27 +8,42 @@
  from abc import abstractmethod
  from dataclasses import dataclass
  from typing import Dict, List, Optional
-@@ -300,8 +302,94 @@
-         out = mx.reshape(out, (B, n_q_heads, L, D))
- 
-     return out
+@@ -299,6 +301,133 @@
+         insert_at = max(mask.ndim - 2, 0)
+         mask = mx.expand_dims(mask, axis=insert_at)
+     return mask
 +
 +
-+# ── Fused Full-Attention fuer head_dim 192/256 (lokaler Patch 0013) ──────────
-+# Qwen3.8-27B hat head_dim 256. mlx' Default-Dispatch laesst fused Full-Attn nur
-+# fuer head_dim 64/80/128 zu; alles andere faellt auf den unfused Graph zurueck,
-+# der pro Full-Attn-Layer einen Score-Transienten von O(n_heads x qL x kL)
-+# materialisiert. Genau das macht PREFILL_STEP bei uns ueberhaupt erst zu einem
-+# RAM-Hebel.
-+# mlx 0.32.2 (PR #4185) stellt die 192/256-Kernel wieder her, erreichbar NUR
-+# ueber force_fused=True — der Default-Dispatch routet weiterhin nicht dorthin.
-+# Begruendung aus dem PR: die Entscheidung gehoert der Runtime, die ihr
-+# Speicherbudget kennt. Das ist hier der Fall.
-+# PR #3842 ergaenzt auf NAX-Geraeten (M5) einen fused Pfad speziell fuer
-+# head_dim 256; Bedingung u. a. qL >= 1024 → PREFILL_STEP muss >= 1024 bleiben,
-+# sonst greift er nicht (PROFILE=lean setzt 512).
++# ── Fused full attention for head_dim 192/256 (local patch 0013) ─────────────
++# Qwen3.8-27B has head_dim 256. mlx's default dispatch only permits fused full
++# attention for head_dim 64/80/128; everything else falls back to the unfused
++# graph, which materialises a score transient of O(n_heads x qL x kL) per
++# full-attn layer. That is the real reason PREFILL_STEP is a RAM lever here.
++# mlx 0.32.2 (PR #4185) restores the 192/256 kernels, reachable ONLY via
++# force_fused=True; the default dispatch still does not route there. The PR
++# justifies this explicitly by saying only the runtime knows its memory budget --
++# which applies here.
 +#
-+# Inert auf mlx < 0.32.2: die Probe faellt auf TypeError, der Pfad bleibt aus.
++# ARRAY MASKS ARE INCLUDED SINCE 2026-09-02, and on the server that is the whole
++# point. Every request goes through the batching generator, which builds
++# BatchKVCache, and its make_mask() ALWAYS returns an array -- it has to encode
++# left_padding -- never the "causal" string. The previous condition excluded
++# exactly that case, so the fused path was live in the start banner and dead in
++# production. Measured on mlx 0.32.2 with the real server mask, 24 q-heads /
++# 4 kv-heads / head_dim 256, bf16, PER LAYER (there are 16 of them):
++#
++#   qL / kL         default dispatch     force_fused=True
++#    512 / 22747     675 MiB, 20.6 ms     136 MiB, 17.2 ms
++#   2048 / 22747    2362 MiB, 83.9 ms     205 MiB, 68.7 ms
++#
++# The fused kernel is also the more accurate one: max error against an fp32
++# reference 0.0011, against 0.0050 for the default dispatch, because it
++# accumulates in fp32 instead of materialising the scores in fp16.
++# Upstream mlx PR #4416 (merged 2026-09-02, unreleased) routes head_dim 256 with
++# an array mask through the DEFAULT dispatch. Once that is in a release, the
++# array-mask half of this patch is redundant -- the force_fused half is not.
++#
++# Inert on mlx < 0.32.2: the probe falls to TypeError, the path stays off.
 +# Rollback: QWEN38_FORCE_FUSED_SDPA=0
 +_FORCE_FUSED_HEAD_DIMS = (192, 256)
 +
@@ -45,51 +60,77 @@
 +        )
 +        return True
 +    except TypeError:
-+        return False  # mlx < 0.32.2 kennt force_fused nicht
++        return False  # mlx < 0.32.2 does not know force_fused
 +    except Exception:
 +        return False
- 
- 
++
++
 +_FORCE_FUSED = _probe_force_fused()
-+# Wird gesetzt, sobald force_fused einmal wirft (keine passende Kernel-Form).
-+# Danach bleibt es beim Default-Dispatch, statt pro Aufruf erneut zu werfen.
-+_FORCE_FUSED_DISABLED = False
++# Kernel configurations that force_fused refused, keyed by what the dispatch
++# actually depends on: (head_dim, dtype, kind of mask, qL).
++#
++# This was a single global flag until 2026-09-02, and that was a trap. There is
++# a NARROW HOLE in the kernel coverage, measured on mlx 0.32.2 for head_dim 256
++# at GQA factor 6 (24 q-heads / 4 kv-heads), identical for causal and array
++# masks:
++#
++#   qL <= 5     fused   (sdpa_vector; it wants qL x GQA <= 32)
++#   qL 6, 7, 8  NO KERNEL -- raises
++#   qL >= 12    fused
++#
++# That hole sits exactly where speculative verify lives. DRAFT_BLOCK_SIZE=4 (the
++# default) verifies at qL 4-5 and stays below it, but the DFlash 2 checkpoint is
++# designed for block_size 8 -- one env variable away from qL 8. With the old
++# global flag the first such verify would have turned fusion off for the whole
++# process, including the qL=2048 prefills where the 2.1 GiB per layer are.
++# qL therefore belongs in the key: one refused shape disables one shape.
++_FORCE_FUSED_REFUSED = set()
 +
 +
 +def _sdpa_maybe_fused(queries, keys, values, scale, mask, sinks):
-+    """mx.fast.scaled_dot_product_attention, fused wo es sich lohnt.
++    """mx.fast.scaled_dot_product_attention, fused where it pays off.
 +
-+    Eng gefasst: nur Prefill/Verify (qL > 1), nur head_dim 192/256, nur ohne
-+    Array-Maske und ohne Sinks. Decode (qL == 1) laeuft weiter ueber den
-+    Default-Dispatch — dort sind die sdpa_vector-Kernel schneller.
++    Narrowly scoped: only prefill/verify (qL > 1), only head_dim 192/256, only
++    without sinks. Decode (qL == 1) keeps the default dispatch -- the
++    sdpa_vector kernels are faster there. Any mask string other than "causal"
++    (e.g. the "left_padded_decode" sentinel) stays on the default dispatch too.
 +    """
-+    global _FORCE_FUSED_DISABLED
 +    if (
 +        _FORCE_FUSED
-+        and not _FORCE_FUSED_DISABLED
 +        and sinks is None
 +        and queries.shape[-1] in _FORCE_FUSED_HEAD_DIMS
 +        and queries.shape[-2] > 1
-+        and (mask is None or (isinstance(mask, str) and mask == "causal"))
++        and (
++            mask is None
++            or isinstance(mask, mx.array)
++            or (isinstance(mask, str) and mask == "causal")
++        )
 +    ):
-+        try:
-+            return mx.fast.scaled_dot_product_attention(
-+                queries,
-+                keys,
-+                values,
-+                scale=scale,
-+                mask=mask,
-+                force_fused=True,
-+            )
-+        except Exception as exc:
-+            _FORCE_FUSED_DISABLED = True
-+            logging.getLogger(__name__).warning(
-+                "force_fused SDPA nicht verfuegbar fuer head_dim=%s qL=%s (%s) — "
-+                "ab jetzt Default-Dispatch.",
-+                queries.shape[-1],
-+                queries.shape[-2],
-+                exc,
-+            )
++        refusal_key = (
++            queries.shape[-1],
++            queries.dtype,
++            "array" if isinstance(mask, mx.array) else (mask or "none"),
++            queries.shape[-2],
++        )
++        if refusal_key not in _FORCE_FUSED_REFUSED:
++            try:
++                return mx.fast.scaled_dot_product_attention(
++                    queries,
++                    keys,
++                    values,
++                    scale=scale,
++                    mask=mask,
++                    force_fused=True,
++                )
++            except Exception as exc:
++                _FORCE_FUSED_REFUSED.add(refusal_key)
++                logging.getLogger(__name__).warning(
++                    "force_fused SDPA unavailable for head_dim=%s dtype=%s "
++                    "mask=%s qL=%s (%s) -- default dispatch for THIS shape "
++                    "from now on, other shapes keep the fused path.",
++                    *refusal_key,
++                    exc,
++                )
 +    return mx.fast.scaled_dot_product_attention(
 +        queries,
 +        keys,
@@ -98,12 +139,10 @@
 +        mask=mask,
 +        sinks=sinks,
 +    )
-+
-+
- def scaled_dot_product_attention(
-     queries,
-     keys,
-@@ -363,14 +451,7 @@
+ 
+ 
+ def quantized_scaled_dot_product_attention(
+@@ -407,14 +536,7 @@
              bits=cache.bits,
          )
  

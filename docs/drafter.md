@@ -3,6 +3,13 @@
 Background and measurements for the drafter. The README states only that DFlash 2
 is the default and how to switch back.
 
+> **The throughput numbers on this page predate patch `0032` (2026-09-02), and
+> measurement says they still stand.** The patch fixes the drafter being primed
+> from a one-token prompt under chunked prefill. Measured on 2026-09-03 it
+> raises the acceptance rate by 6.5 pp and leaves decode throughput unchanged
+> — see "Patch 0032 measured" below. So the tables here are not invalidated;
+> read them as slightly pessimistic on acceptance and correct on tok/s.
+
 ## Status since mlx-vlm 0.6.16 (2026-08-24)
 
 > Superseded in part on 2026-08-28 -- see "After the APC redesign" at the end.
@@ -143,6 +150,51 @@ is leaving drafter throughput on the table.
 
 Use these as prose-workload numbers. Structured output is the faster case — see
 the table above, where JSON and code reach 44.2 and 42.6 t/s.
+
+---
+
+### Patch 0032 measured: acceptance up, throughput flat
+
+Upstream PR [#2096](https://github.com/Blaizzy/mlx-vlm/pull/2096) fixes chunked
+prefill requesting the speculative capture kwargs only on the *final* prefill
+call, which primed DFlash 2 — it cross-attends its first draft block over the
+prompt hidden state — from a single token. `PROFILE=roomy` chunks at 2048, so
+every longer prompt was affected.
+
+Measured 2026-09-03 with `./measure-drafter-acceptance.py`, one server restart
+per arm, n=12 each, 400 generated tokens, `temperature 0`, percentage of drafted
+tokens accepted:
+
+| prompt | without `0032` | with `0032` | Δ |
+|---|---:|---:|---:|
+| 1024 (below `PREFILL_STEP`) | 48.6 % (sd 3.6) | 53.9 % (sd 1.9) | +5.3 pp |
+| 4096 | 46.5 % (sd 1.5) | 54.7 % (sd 3.4) | +8.2 pp |
+| 8192 | 49.4 % (sd 1.4) | 55.4 % (sd 2.6) | +6.1 pp |
+| **pooled** | **48.2 %** | **54.7 %** | **+6.5 pp** |
+
+Welch *t* = 6.34, so the arms are clearly separated. Target passes per 400
+tokens drop by roughly 6 % (202→192, 206→191, 201→190).
+
+**Decode throughput does not follow.** Across the same three lengths it moves
+−3.2 %, +1.0 %, +1.2 % — inside the run-to-run spread. Six percent fewer target
+passes should have been worth about six percent, and it was not. Unexplained;
+whatever absorbs it has not been isolated.
+
+**The unchunked control improves too**, which upstream's framing does not
+predict. At 1024 tokens the prompt fits in one prefill call and should be
+untouched, yet it gains 5.3 pp. The patch also hands `speculative_prompt_ids`
+through differently, and that applies to every prompt, chunked or not. So the
+effect measured here is not purely the chunked-prefill defect.
+
+Kept regardless: it restores the intended priming, acceptance is reproducibly
+higher, and nothing regressed.
+
+**Method note.** The first version of the measurement script built its filler by
+repeating one sentence. That produced 100 % acceptance at every length — a
+drafter predicts a text it has already seen fifty times perfectly, and the
+defect could not show through. The pool is now cycled with a stride so
+neighbouring sentences differ. A prompt that is too predictable is not a
+neutral instrument.
 
 ---
 
