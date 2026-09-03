@@ -558,19 +558,53 @@ fi
 # force_fused at all (>= 0.32.2); below that it is deliberately inert.
 # Hence a runtime probe rather than a plain grep: "the patch is in the venv" and
 # "the path is active" are two different statements here.
+#
+# THE PROBE ASKED THE WRONG QUESTION UNTIL 2026-09-02. It called mlx directly
+# with a 1x1x1x128 tensor and only established that the installed mlx ACCEPTS
+# the force_fused argument. Since 0.32.2 that is always true and says nothing
+# about the production path: the server serves every request through the
+# batching generator, whose BatchKVCache passes down an ARRAY mask (it has to
+# encode left_padding), and patch 0013 declined array masks. So the banner read
+# "fused" while all 16 layers ran unfused, and the budget below dropped the
+# score transient on the strength of it. The probe now calls the PATCHED entry
+# point with the real server mask at the configured PREFILL_STEP and reports
+# what force_fused actually received. Costs one SDPA call at startup.
 FUSED_OK=0
 _FUSED_PROBE=no
 _PATCH0013=0
 if grep -q "_FORCE_FUSED_HEAD_DIMS" "$SITE_PACKAGES/mlx_vlm/models/base.py" 2>/dev/null; then
   _PATCH0013=1
-  _FUSED_PROBE=$("$VENV_PY" -c '
+  _FUSED_PROBE=$(PREFILL_STEP="$PREFILL_STEP" "$VENV_PY" -c '
+import os
 import mlx.core as mx
-q = mx.zeros((1, 1, 1, 128), dtype=mx.bfloat16)
+import mlx_vlm.models.base as base
+from mlx_vlm.models.cache import BatchKVCache
+
+qL = int(os.environ.get("PREFILL_STEP") or 2048)
+kL = qL + 512
+D, HQ, HKV = 256, 24, 4
+q = mx.zeros((1, HQ, qL, D), dtype=mx.bfloat16)
+k = mx.zeros((1, HKV, kL, D), dtype=mx.bfloat16)
+v = mx.zeros((1, HKV, kL, D), dtype=mx.bfloat16)
+cache = BatchKVCache(left_padding=[0])
+cache._idx = kL - qL
+mask = cache.make_mask(qL)
+
+seen = []
+real = mx.fast.scaled_dot_product_attention
+def spy(*a, **kw):
+    seen.append(bool(kw.get("force_fused", False)))
+    return real(*a, **kw)
+mx.fast.scaled_dot_product_attention = spy
 try:
-    mx.fast.scaled_dot_product_attention(q, q, q, scale=1.0, mask=None, force_fused=False)
-    print("ok")
-except TypeError:
-    print("no")
+    mx.eval(
+        base.scaled_dot_product_attention(
+            q, k, v, cache=None, scale=D ** -0.5, mask=mask
+        )
+    )
+finally:
+    mx.fast.scaled_dot_product_attention = real
+print("ok" if seen and seen[-1] else "no")
 ' 2>/dev/null || echo no)
 fi
 
@@ -579,10 +613,10 @@ if [[ "${QWEN38_FORCE_FUSED_SDPA:-1}" == "0" ]]; then
 elif [[ "$_PATCH0013" == "0" ]]; then
   FUSED_STATUS="unfused (patch 0013 missing -- ./patches/apply-patches.sh)"
 elif [[ "$_FUSED_PROBE" == "ok" ]]; then
-  FUSED_STATUS="fused (patch 0013 active)"
+  FUSED_STATUS="fused (patch 0013 active, verified at qL=$PREFILL_STEP with the server mask)"
   FUSED_OK=1
 else
-  FUSED_STATUS="unfused (patch 0013 inert: mlx $MLX_VER has no force_fused, needs >= 0.32.2)"
+  FUSED_STATUS="unfused (patch 0013 present, but no fused kernel at qL=$PREFILL_STEP -- mlx $MLX_VER)"
 fi
 
 # ── Fused quantized linears (patch 0015) ─────────────────────────────────────
@@ -761,9 +795,16 @@ ctx_hint = int(os.environ.get("CTX_HINT") or 0)
 # entry, without: one per two entries).
 # ── Prefill transient ─────────────────────────────────────────────────────────
 # The item that was missing until 2026-08-21, and the reason for "[METAL]
-# Insufficient Memory" despite an apparently ample budget. Applies only WITHOUT
-# the source build -- with patch 0013 active the item is zero (FUSED_OK branch
-# below).
+# Insufficient Memory" despite an apparently ample budget. Zero once the fused
+# path is genuinely taken (FUSED_OK branch below).
+#
+# THE FUSED_OK BRANCH WAS WRONG BETWEEN 2026-08-21 AND 2026-09-02: FUSED_OK came
+# from a probe that only asked whether mlx knows the force_fused argument, while
+# patch 0013 declined the array masks that the server actually passes. The item
+# was dropped from the budget while it was still fully present in reality -- the
+# budget was too optimistic by exactly this amount, which is the direction that
+# ends in "Insufficient Memory". Both are fixed since 2026-09-02: the patch
+# fuses array masks, and the probe calls the patched entry point.
 #
 # head_dim is 256. mlx's default dispatch permits fused full attention only for
 # 64/80/128 (up to 0.32.1), so the 16 full-attn layers run on the unfused graph
@@ -780,14 +821,19 @@ ctx_hint = int(os.environ.get("CTX_HINT") or 0)
 # direction to err. Underestimating here means a crash mid-operation, and it does
 # not arrive as a clean error but as
 # "[METAL] Command buffer execution failed: Insufficient Memory".
-# The item disappears as soon as mlx 0.32.2 + patch 0013 provide the fused path --
-# which is the case since the source build of 2026-08-21, hence the FUSED_OK
-# branch.
-# MEASURED with mlx 0.32.2.dev+a082cb91, production shape qL=512 / kL=22747,
-# 24 heads / 4 KV heads / head_dim 256:
-#   force_fused=False : peak 662 MiB   (difference 539 MiB = the score tensor)
-#   force_fused=True  : peak 123 MiB
+# The item disappears as soon as mlx 0.32.2 + patch 0013 provide the fused path
+# AND the path is actually taken, hence the FUSED_OK branch.
+# RE-MEASURED 2026-09-02 on mlx 0.32.2 from PyPI, with the mask the server really
+# passes (BatchKVCache array mask), 24 heads / 4 KV heads / head_dim 256, per
+# layer -- through the patched entry point, not against mx.fast directly:
+#   qL=2048 / kL=22747  unfused 2362 MiB  ->  fused 205 MiB   (83.9 -> 68.7 ms)
+#   qL= 512 / kL=22747  unfused  675 MiB  ->  fused 136 MiB   (20.6 -> 17.2 ms)
 # With the fused path the item is therefore not "smaller" but gone.
+# CAREFUL, THERE IS A HOLE: at GQA factor 6 and head_dim 256 no fused kernel
+# exists for qL 6, 7, 8 -- above and below it there is one. PREFILL_STEP never
+# lands there, but a DRAFT_BLOCK_SIZE of 7 or 8 does (verify runs at block+1).
+# Patch 0013 falls back per shape in that case and logs it once; it does not
+# cost the prefill its fused path.
 INFLIGHT = 16
 n_heads = 24
 prefill_step = int(os.environ.get("PREFILL_STEP") or 2048)

@@ -65,13 +65,45 @@
 #   justifies this explicitly by saying only the runtime knows its memory
 #   budget -- which applies here.
 #   Narrowly scoped: only qL > 1 (prefill/verify, not decode), only head_dim
-#   192/256, only without an array mask and without sinks. If force_fused throws
-#   once, the path is disabled permanently and logged once.
+#   192/256, only without sinks.
+#
+#   REWRITTEN 2026-09-02, AND IT ONLY STARTED WORKING ON THE SERVER THEN.
+#   The old condition also required "no array mask", and that excluded exactly
+#   the production case: the server runs every request through the batching
+#   generator, whose BatchKVCache.make_mask() ALWAYS returns an array (it
+#   encodes left_padding) and never the "causal" string. The patch was applied,
+#   the start banner said "fused", and all 16 layers ran unfused. force_fused
+#   handles array masks perfectly well -- the restriction was unfounded.
+#   MEASURED through the patched entry point with the real server mask,
+#   24 q-heads / 4 kv-heads / head_dim 256, bf16, per layer:
+#     qL=2048 / kL=22747   unfused 2362 MiB, 83.9 ms -> fused 205 MiB, 68.7 ms
+#     qL= 512 / kL=22747   unfused  675 MiB, 20.6 ms -> fused 136 MiB, 17.2 ms
+#   Numerically the fused kernel is the better one (max error against an fp32
+#   reference 0.0011 vs 0.0050): it accumulates in fp32 instead of materialising
+#   the scores in fp16. Verified for a left-padded B=2 batch as well.
+#   The start script's FUSED_OK probe was rewritten with it -- it used to ask
+#   only whether mlx knows the force_fused argument, which said nothing about
+#   whether the path is taken.
+#
+#   THE REFUSAL SET, AND WHY IT IS KEYED BY SHAPE: there is a narrow hole in the
+#   kernel coverage, measured on mlx 0.32.2 at GQA factor 6 / head_dim 256 --
+#     qL <= 5 fused (sdpa_vector wants qL x GQA <= 32) / qL 6,7,8 NO KERNEL /
+#     qL >= 12 fused
+#   -- and it sits where speculative verify runs. Until 2026-09-02 a single
+#   throw set a global flag and the fused path was gone for the whole process,
+#   including the qL=2048 prefills that carry the 2.1 GiB per layer.
+#   _FORCE_FUSED_REFUSED is now keyed by (head_dim, dtype, mask kind, qL): one
+#   refused shape disables one shape. DRAFT_BLOCK_SIZE=4 (the default) verifies
+#   at qL 4-5 and stays clear of the hole; 7 or 8 lands in it.
 #   INERT ON mlx < 0.32.2: the import probe falls to TypeError.
 #   VERIFIED on mlx 0.32.0: _FORCE_FUSED == False, behaviour unchanged.
 #   Rollback: QWEN38_FORCE_FUSED_SDPA=0
-#   CAREFUL: PR #3842 (fused head_dim 256 on NAX/M5) requires qL >= 1024 --
-#   PROFILE=lean sets PREFILL_STEP=512 and therefore falls out of it.
+#   ON PR #3842 (fused head_dim 256 on NAX/M5, qL >= 1024): the win does NOT
+#   depend on it. At qL=512 the fused path engages and saves 539 MiB per layer,
+#   so PROFILE=lean is not cut off from it.
+#   UPSTREAM: mlx PR #4416 (merged 2026-09-02, unreleased) routes head_dim 256
+#   with an array mask through the DEFAULT dispatch. Once that is in a release,
+#   the array-mask half of this patch is redundant; the force_fused half is not.
 #
 # 0014-quantized-kv-start-uniform.patch   (LOCAL, no upstream PR)
 #   quantized_kv_start applied on the batch path only for TurboQuant. On the
