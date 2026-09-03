@@ -12,13 +12,15 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-01: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
-# 0.32.2. Eight patches, down from eleven. All eight apply to the tag unchanged
-# -- no rebase was needed for the move off main @3fd38f4.
+# STATE 2026-09-02: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
+# 0.32.2. Nine patches. All nine apply to the tag unchanged.
+#   - 0013 was REWRITTEN (it had never once fired on the server; see below).
+#   - 0032 is NEW, carrying the still-open upstream PR #2096.
 #
 # Careful when moving past the tag: main has since drifted in models/base.py
-# (0b73936, 9606b86, efd0479, all quantized-KV work) and patch 0013 no longer
-# applies there -- one hunk of three, context drift only, mechanical to reanchor.
+# (0b73936, 9606b86, efd0479, all quantized-KV work, plus #1822 merged
+# 2026-09-01) and patch 0013 no longer applies there -- context drift only,
+# mechanical to reanchor.
 #
 # The APC redesign (PR #1960, merged 2026-08-28) removed two of them:
 #   0021  obsolete. _run_speculative is gone; non-MTP drafters no longer take a
@@ -202,6 +204,49 @@
 #   decoding with quantized batch cache") change the same two files with the same
 #   content. Only one will merge -- this patch covers both.
 #
+# 0032-pr2096-chunked-prefill-drafter-priming.patch  (PR #2096, @Lazarus-931, open)
+#   "Prime speculative drafters from the whole prompt during chunked prefill",
+#   fixes upstream #2022. THIS ONE IS NORMAL OPERATION HERE, not a precaution.
+#   Chunked prefill requested the speculative capture kwargs only on the FINAL
+#   prefill call. Drafters that read target hidden past the last prompt position
+#   were therefore primed from a one-token prompt -- and DFlash 2, our default,
+#   cross-attends its first draft block over exactly that prompt hidden.
+#   PROFILE=roomy runs PREFILL_STEP=2048, so every prompt above 2048 tokens is
+#   chunked and lands in this. The cost is invisible in the decode rate on its
+#   own; it only shows against a short, unchunked prompt.
+#   Upstream numbers (Qwen3.5-9B, prefill_step_size 512, % of drafted accepted):
+#     prompt 2048   unchunked 82.3%   chunked before 57.1%   chunked after 82.3%
+#     prompt 4096   unchunked 64.9%   chunked before 55.4%   chunked after 82.3%
+#
+#   MEASURED HERE 2026-09-03 with ./measure-drafter-acceptance.py, n=12 per arm,
+#   one server restart per arm, 400 generated tokens, temperature 0:
+#     prompt 1024 (unchunked)   48.6% -> 53.9%   (+5.3 pp)
+#     prompt 4096               46.5% -> 54.7%   (+8.2 pp)
+#     prompt 8192               49.4% -> 55.4%   (+6.1 pp)
+#     pooled                    48.2% -> 54.7%   (+6.5 pp, Welch t = 6.34)
+#   Target passes per 400 tokens fall by about 6% (202->192, 206->191, 201->190).
+#
+#   TWO THINGS THE MEASUREMENT DOES NOT SHOW, both worth knowing before quoting
+#   the upstream framing:
+#     - DECODE THROUGHPUT DOES NOT MOVE: -3.2% / +1.0% / +1.2% across the three
+#       lengths, inside the noise. Six percent fewer target passes should have
+#       been worth roughly six percent; something absorbs it, and this has not
+#       been isolated.
+#     - THE UNCHUNKED CONTROL IMPROVES TOO (+5.3 pp at 1024, below PREFILL_STEP).
+#       Upstream reports an unchanged control and a gap that closes only for
+#       chunked prompts. So the effect here is not purely the chunked-prefill
+#       defect -- the patch also routes speculative_prompt_ids differently, which
+#       applies to every prompt.
+#   KEPT anyway: it restores the upstream-intended priming, acceptance is up
+#   reproducibly, and nothing regressed.
+#   The tests from the PR are NOT carried (test_generate.py, test_models.py):
+#   site-packages is not where they run.
+#   SIDE EFFECT worth knowing: the PR deletes qwen3_5's own
+#   chunked_prefill_policy and replaces four per-model copies of the predicate
+#   with one capability check on rollback_speculative_cache in
+#   generate/common.py. Checked here: chunked prefill stays enabled for dflash,
+#   mtp and no drafter -- the RAM lever is not touched.
+#
 # 0031-pr1835-recurrent-cache-no-trim.patch    (PR #1835, @kylesyx, open)
 #   "Decline prefix-cache reuse for non-trimmable recurrent caches".
 #   _prefix_cache_trim_amount() only checks whether the prefix is still PRESENT,
@@ -217,6 +262,15 @@
 #   dispatch.stream_generate, and the server path does not go through there.
 #   Included as a precaution for mlx_vlm.chat_ui, the generate CLI and own
 #   scripts that pass prompt_cache_state through.
+#   THE PR HAS MOVED ON (checked 2026-09-02): head 08b0c9e is broader than what
+#   this patch carries. @kylesyx found that CacheList and a bare ArraysCache
+#   expose no top-level offset, so cached_len collapses to 0, n_drop to 0, and
+#   both guards are short-circuited -- Qwen3.5/3.6 only got fixed here because a
+#   sibling KVCache contributes a nonzero offset. Affects mamba/mamba2/rwkv7 and
+#   the per-layer-CacheList models. Not our server path, so not re-pulled; do
+#   pull it if this patch ever becomes load-bearing. CI has never run on that
+#   head -- the fork PR is waiting on maintainer approval, so the red X on the
+#   PR page is the stale Aug 20 run.
 #
 # ── DONE / OBSOLETE ──────────────────────────────────────────────────────────
 #

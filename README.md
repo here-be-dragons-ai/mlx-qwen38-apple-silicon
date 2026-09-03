@@ -78,7 +78,7 @@ Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 >
 > Without `--no-deps` the resolver pulls `mlx` from PyPI down to 0.32.1, which
 > silently disables patch `0013` -- see [docs/build-mlx.md](docs/build-mlx.md).
-> All eight patches apply to this tag unchanged. Note the tag (`579cd51`) is
+> All nine patches apply to this tag unchanged. Note the tag (`579cd51`) is
 > behind main: `#1822` and the TurboQuant batch-decode fix are **not** in it.
 
 0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
@@ -235,14 +235,29 @@ SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
 
 ## Patches
 
-Eight patches against `site-packages`, applied by `patches/apply-patches.sh`
+Nine patches against `site-packages`, applied by `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). **They vanish on every
 `pip install -U mlx-vlm`** -- run it again afterwards.
 
 The set shrank from eleven on 2026-08-28 when the APC redesign landed: `0021`
 became obsolete (the separate generation loop it worked around is gone) and
 `0030` was replaced by a start-script guard. `0040` went earlier, when DFlash 2
-landed upstream.
+landed upstream. `0032` came in on 2026-09-02 (upstream PR `#2096`).
+
+Two of them changed on 2026-09-02, both because the effect they claimed was not
+the effect they had:
+
+- `0013` (fused `head_dim 256`) had **never once fired on the server**. It
+  declined array masks, and the batching generator's `BatchKVCache` passes down
+  nothing else -- so the start banner read `fused` while all 16 full-attention
+  layers ran unfused. Measured per layer at `qL=2048 / kL=22747`: 2362 MiB
+  unfused against 205 MiB fused, 83.9 ms against 68.7 ms. The `FUSED_OK` probe
+  was rewritten with it; it used to ask only whether mlx knows the `force_fused`
+  argument, which says nothing about whether the path is taken.
+- `0032` fixes the mirror image on the drafter side: chunked prefill primed
+  DFlash 2 from a one-token prompt, which costs acceptance rate and nothing
+  else visible. `./measure-drafter-acceptance.py` sweeps prompt lengths around
+  `PREFILL_STEP` to show it.
 
 ```sh
 ./patches/apply-patches.sh --check
@@ -313,6 +328,7 @@ clear the SSD tier, and only then touch `APC_ENTRIES` or `context_length`.
 | `watchdog-mlx_qwen3.8.sh` | restarts the server before memory fills up |
 | `download-mlx-model.sh` | resumable HuggingFace downloader, with size check |
 | `convert-dflash2-drafter.py` | quantizes the DFlash 2 drafter (bf16 → 4bit) |
+| `measure-drafter-acceptance.py` | acceptance rate across the chunked-prefill boundary (patch `0032`) |
 | `set-iogpu-wired-limit.sh` | computes `iogpu.wired_limit_mb` from `hw.memsize`, clamps |
 | `install-wired-limit-daemon.sh` | installs helper + LaunchDaemon, idempotent |
 | `patches/apply-patches.sh` | apply / check / revert patches |
