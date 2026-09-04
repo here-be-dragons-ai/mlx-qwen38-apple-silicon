@@ -270,13 +270,40 @@ case "$PROFILE" in
   # three lose their warm slot. The mem lines in the log stay authoritative, not
   # this calculation.
   #
+  # PULLED BACK TO 2 ON 2026-09-04, and the reason is a measured failure rather
+  # than a calculation. At 13:29 a 32,256-token request died with
+  #   [METAL] Command buffer execution failed: Insufficient Memory
+  # NOT in the prefill -- that finished at 96.1% -- but in the APC snapshot
+  # store that follows it:
+  #   _store_apc_exact_checkpoints -> store_exact_cache
+  #     -> _clone_prompt_cache_for_apc -> mx.eval
+  # The clone asks for a SECOND copy of the live KV (1.97 GiB at that length)
+  # while the working set already stood at 95% (37.99 of 40.00 GiB). The mx peak
+  # counter reached 40.69 GiB against a 40.00 GiB working set. Two earlier OOMs,
+  # on 2026-09-03, sit at the same call site.
+  #
+  # Going 3 -> 2 frees one snapshot copy: by the table above, 4 copies -> 3, and
+  # the computed budget rises from 89,914 to 120,654 tokens. The measured traffic
+  # that day was 22k-32k prompts, so the headroom lands where the failures are.
+  #
+  # THE PRICE IS EXPLICIT: there are three pi instances and now two warm slots,
+  # so one of them loses its snapshot on every rotation. The SSD tier catches a
+  # miss in ~350 ms instead of a full cold prefill, which is why this is the
+  # cheaper lever than cutting the context -- but it is not free, and the
+  # eviction measurement in docs/memory.md (up to 72.7 min of cold prefill over
+  # 810 prefills at APC_ENTRIES=1) is the warning about going further down.
+  #
+  # Patch 0033 (upstream PR #2072) attacks the same peak properly, by not
+  # re-cloning an already-detached snapshot and by materialising one layer at a
+  # time. If it holds up in measurement, the 3 can come back.
+  #
   # Side finding from the same measurement: KV_BITS=8 does NOT attack the
   # consumer. apc_adapters.py:515 calls dequantize_for_apc() on snapshot store --
   # the live cache shrinks to 32 KiB/token, the snapshots stay f16 at 64. It cost
   # 22.9 -> 18.7 tok/s decode (mean of 6 and 8 requests respectively).
   # That is why _KV_BITS stays empty here.
   roomy)
-    _APC_ENTRIES=3
+    _APC_ENTRIES=2
     if [[ "${_WIRED_MB:-0}" -ge 40960 ]]; then _PREFILL=2048; else _PREFILL=512; fi
     _KV_BITS="";  _VISION=20; _APC_MAXGB=80; _APC_MINFREE=2.0; _CTX_HINT=65536 ;;
   *)

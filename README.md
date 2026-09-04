@@ -242,10 +242,9 @@ Nine patches against `site-packages`, applied by `patches/apply-patches.sh`
 The set shrank from eleven on 2026-08-28 when the APC redesign landed: `0021`
 became obsolete (the separate generation loop it worked around is gone) and
 `0030` was replaced by a start-script guard. `0040` went earlier, when DFlash 2
-landed upstream. `0032` came in on 2026-09-02 (upstream PR `#2096`).
+landed upstream.
 
-Two of them changed on 2026-09-02, both because the effect they claimed was not
-the effect they had:
+What changed over 2026-09-02 to 09-04:
 
 - `0013` (fused `head_dim 256`) had **never once fired on the server**. It
   declined array masks, and the batching generator's `BatchKVCache` passes down
@@ -254,10 +253,15 @@ the effect they had:
   unfused against 205 MiB fused, 83.9 ms against 68.7 ms. The `FUSED_OK` probe
   was rewritten with it; it used to ask only whether mlx knows the `force_fused`
   argument, which says nothing about whether the path is taken.
-- `0032` fixes the mirror image on the drafter side: chunked prefill primed
-  DFlash 2 from a one-token prompt, which costs acceptance rate and nothing
-  else visible. `./measure-drafter-acceptance.py` sweeps prompt lengths around
-  `PREFILL_STEP` to show it.
+- `0032` (upstream PR `#2096`, drafter priming under chunked prefill) came in on
+  09-02 and went out again on 09-04. It does what it says -- acceptance 48.2% ->
+  54.7% over 24 measured runs -- but decode throughput did not move and it held
+  1.5-3 GiB of per-chunk hidden captures on long prompts. On a machine at 95% of
+  its working set that is the wrong trade. `./measure-drafter-acceptance.py` is
+  the instrument, and it stays.
+- `0033` (upstream PR `#2072`) is new: the exact-APC snapshot store clones the
+  live prompt cache, and that clone -- not the prefill -- is where three OOMs in
+  two days actually happened. `APC_ENTRIES` on `roomy` went 3 -> 2 alongside it.
 
 ```sh
 ./patches/apply-patches.sh --check
