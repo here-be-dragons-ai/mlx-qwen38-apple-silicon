@@ -235,7 +235,7 @@ SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
 
 ## Patches
 
-Nine patches against `site-packages`, applied by `patches/apply-patches.sh`
+Ten patches against `site-packages`, applied by `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). **They vanish on every
 `pip install -U mlx-vlm`** -- run it again afterwards.
 
@@ -262,6 +262,10 @@ What changed over 2026-09-02 to 09-04:
 - `0033` (upstream PR `#2072`) is new: the exact-APC snapshot store clones the
   live prompt cache, and that clone -- not the prefill -- is where three OOMs in
   two days actually happened. `APC_ENTRIES` on `roomy` went 3 -> 2 alongside it.
+- `0034` (upstream PR `#2090`, merged upstream but after the pinned tag) keeps
+  exact-APC checkpoints packed instead of dequantizing them to float on store.
+  It removes the documented reason `KV_BITS` is off on `roomy` -- the snapshots
+  now shrink with the live cache. The default still waits on an A/B.
 
 ```sh
 ./patches/apply-patches.sh --check

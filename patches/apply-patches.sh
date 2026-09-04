@@ -13,12 +13,15 @@
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
 # STATE 2026-09-04: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
-# 0.32.2. Nine patches. All nine apply to the tag unchanged.
+# 0.32.2. Ten patches. All ten apply to the tag.
 #   - 0013 was REWRITTEN (it had never once fired on the server; see below).
 #   - 0032 came and went inside a day: measured, then removed for its memory
 #     cost. See DONE / OBSOLETE.
 #   - 0033 is NEW, carrying the still-open upstream PR #2072 against the APC
 #     snapshot-clone peak that produced three OOMs in two days.
+#   - 0034 is NEW, carrying the already-merged PR #2090 (packed APC
+#     checkpoints), which lands after the tag. It removes the reason _KV_BITS is
+#     empty on roomy; the default still waits on a measurement.
 #   - 0031 is now ORPHANED: upstream closed PR #1835 unmerged on 2026-09-03 in
 #     favour of #2152, which is merged. The effect is upstream, so this patch
 #     goes at the next move past the tag.
@@ -184,9 +187,12 @@
 #   Deliberately no clamping: a silently replaced token corrupts the output.
 #   CHECKED: PR #1959 does NOT have this guard -- the spot is open upstream.
 #
-# ── FOREIGN, STILL-OPEN UPSTREAM PRs (cherry-picked) ─────────────────────────
-# Other people's bugfixes that are still open upstream. As soon as they are
+# ── FOREIGN UPSTREAM PRs (cherry-picked) ─────────────────────────────────────
+# Other people's bugfixes. Most are still open upstream; as soon as they are
 # merged, this script reports "CONFLICT" -- remove them then.
+# ONE OF THEM (0034) IS ALREADY MERGED and is carried only because it landed
+# AFTER the pinned tag. That one goes as soon as the pin moves past it, and it
+# is the reason each entry below states open/merged explicitly.
 #
 # 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, open)
 #   "Fix speculative decoding against a quantized KV cache".
@@ -209,6 +215,32 @@
 #   TWO PRs FOR THE SAME THING: #1956 (here) and #1938 ("Fix Qwen speculative
 #   decoding with quantized batch cache") change the same two files with the same
 #   content. Only one will merge -- this patch covers both.
+#
+# 0034-pr2090-packed-apc-checkpoints.patch  (PR #2090, @Blaizzy, MERGED upstream
+#   2026-09-02, but AFTER the v0.7.0rc0 tag -- hence carried here.)
+#   "Keep quantized APC checkpoints packed". Exact-APC snapshots keep their
+#   native packed representation through snapshot, disk restore and batch merge,
+#   instead of being dequantized to float on store.
+#   THIS REMOVES THE DOCUMENTED REASON WHY _KV_BITS IS EMPTY ON roomy. The
+#   profile block in start-mlx_qwen3.8.sh says it plainly: apc_adapters.py
+#   called dequantize_for_apc() on snapshot store, so the live cache shrank to
+#   32 KiB/token while the snapshots stayed f16 at 64 -- and KV_BITS=8 cost
+#   22.9 -> 18.7 tok/s decode for a saving that never reached the consumer.
+#   With this patch the snapshots shrink with the live cache. Upstream numbers:
+#     16,384 tokens   float checkpoint 64.00 MiB -> packed 8.25 MiB
+#                     float round trip 5.02 ms   -> packed 0.91 ms
+#   NOT YET MEASURED HERE, and the profile default therefore still stays empty.
+#   The 22.9 -> 18.7 measurement was taken under the old behaviour and no longer
+#   describes this code; it does not yet have a replacement. A/B before flipping
+#   the default -- the decode ceiling in the banner predicts +12% at 65k.
+#
+#   REBASED ONTO 0033, NOT VERBATIM. #2072 (patch 0033) is older than #2090 and
+#   upstream never rebased it, so the two collide -- in exactly one hunk, and it
+#   is a DOCSTRING. Both rewrite the docstring of the batch-merge function:
+#   #2090 replaces the first sentences, #2072 appends a sentence about
+#   consume_sources. The version here carries both. No code hunk conflicts, in
+#   either application order (checked both ways in a scratch copy).
+#   The tests from the PR are not carried; site-packages is not where they run.
 #
 # 0033-pr2072-apc-ownership-transfer-peaks.patch  (PR #2072, @Blaizzy, open)
 #   "Reduce exact APC ownership-transfer peaks". ADDED 2026-09-04 against a
