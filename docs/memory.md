@@ -520,7 +520,7 @@ price (savings relative to a 43k peak prompt):
 | lever | saves | price |
 |---|---|---|
 | lower `APC_ENTRIES` (per step) | **−4.2 GiB** @ 65536 | **higher than long assumed.** The assumption was "small, the SSD tier catches it". Measured over 810 prefills, `APC_ENTRIES=1` cost up to **72.7 min** of cold prefill through eviction — the tier only catches it when it is not thrashing at its own cap (see "The cap is per namespace") |
-| `KV_BITS=8 QUANT_KV_START=8192` | **−4.2 GiB** | still not measured on MLX, but no longer a blind bet: the ceiling calculation predicts decode **+12 % at 65k** (13.5 → 15.1 tok/s), against the llama.cpp figure of up to 8× prefill and 1.9× decode *lost*. Those point in opposite directions, which is exactly why it needs an A/B rather than a decision |
+| `KV_BITS=8 QUANT_KV_START=8192` | **−4.2 GiB**, and now also on the snapshots | the objection that killed this is gone. Patch `0034` (PR #2090) stops dequantizing exact-APC snapshots on store, so they shrink with the live cache — the 22.9 → 18.7 tok/s measurement was taken under the old behaviour and no longer applies. The ceiling predicts **+12 % decode at 65k** (13.5 → 15.1 tok/s); the llama.cpp figure of up to 8× prefill and 1.9× decode *lost* points the other way. Still an A/B, not a decision |
 | `context_length` 49152 → 32768 | −2.6 GiB | shorter runs before compaction |
 | `PREFILL_STEP=512` | ~−0.2 GiB | practically none (prefill is compute-bound, not chunk-bound) |
 | weights `mxfp4` instead of `4bit` | −0.78 GiB | `mlx-community/Qwen3.8-27B-mxfp4` = 14.17 instead of 14.95 GiB, supported by mlx 0.32; quality not compared |

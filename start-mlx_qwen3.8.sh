@@ -302,6 +302,19 @@ case "$PROFILE" in
   # the live cache shrinks to 32 KiB/token, the snapshots stay f16 at 64. It cost
   # 22.9 -> 18.7 tok/s decode (mean of 6 and 8 requests respectively).
   # That is why _KV_BITS stays empty here.
+  #
+  # THAT REASON IS GONE SINCE PATCH 0034 (2026-09-04, upstream PR #2090, merged
+  # after the pinned tag): exact-APC snapshots keep their packed representation
+  # instead of being dequantized on store, so they now shrink with the live
+  # cache. Upstream measured a 16,384-token checkpoint going 64.00 -> 8.25 MiB
+  # and its round trip 5.02 -> 0.91 ms.
+  # THE DEFAULT STILL STAYS EMPTY, deliberately. The 22.9 -> 18.7 figure was
+  # taken under the old behaviour and no longer describes this code -- but it has
+  # no replacement yet, and a default should not flip on an argument. What the
+  # decode ceiling in the banner does predict is +12% at 65k context (13.5 ->
+  # 15.1 tok/s), because the KV read per token halves. A/B first:
+  #     KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh
+  # and compare decode t/s from the log against the same prompts without it.
   roomy)
     _APC_ENTRIES=2
     if [[ "${_WIRED_MB:-0}" -ge 40960 ]]; then _PREFILL=2048; else _PREFILL=512; fi
