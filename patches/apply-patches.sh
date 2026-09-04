@@ -12,10 +12,16 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-02: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
+# STATE 2026-09-04: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
 # 0.32.2. Nine patches. All nine apply to the tag unchanged.
 #   - 0013 was REWRITTEN (it had never once fired on the server; see below).
-#   - 0032 is NEW, carrying the still-open upstream PR #2096.
+#   - 0032 came and went inside a day: measured, then removed for its memory
+#     cost. See DONE / OBSOLETE.
+#   - 0033 is NEW, carrying the still-open upstream PR #2072 against the APC
+#     snapshot-clone peak that produced three OOMs in two days.
+#   - 0031 is now ORPHANED: upstream closed PR #1835 unmerged on 2026-09-03 in
+#     favour of #2152, which is merged. The effect is upstream, so this patch
+#     goes at the next move past the tag.
 #
 # Careful when moving past the tag: main has since drifted in models/base.py
 # (0b73936, 9606b86, efd0479, all quantized-KV work, plus #1822 merged
@@ -204,48 +210,26 @@
 #   decoding with quantized batch cache") change the same two files with the same
 #   content. Only one will merge -- this patch covers both.
 #
-# 0032-pr2096-chunked-prefill-drafter-priming.patch  (PR #2096, @Lazarus-931, open)
-#   "Prime speculative drafters from the whole prompt during chunked prefill",
-#   fixes upstream #2022. THIS ONE IS NORMAL OPERATION HERE, not a precaution.
-#   Chunked prefill requested the speculative capture kwargs only on the FINAL
-#   prefill call. Drafters that read target hidden past the last prompt position
-#   were therefore primed from a one-token prompt -- and DFlash 2, our default,
-#   cross-attends its first draft block over exactly that prompt hidden.
-#   PROFILE=roomy runs PREFILL_STEP=2048, so every prompt above 2048 tokens is
-#   chunked and lands in this. The cost is invisible in the decode rate on its
-#   own; it only shows against a short, unchunked prompt.
-#   Upstream numbers (Qwen3.5-9B, prefill_step_size 512, % of drafted accepted):
-#     prompt 2048   unchunked 82.3%   chunked before 57.1%   chunked after 82.3%
-#     prompt 4096   unchunked 64.9%   chunked before 55.4%   chunked after 82.3%
-#
-#   MEASURED HERE 2026-09-03 with ./measure-drafter-acceptance.py, n=12 per arm,
-#   one server restart per arm, 400 generated tokens, temperature 0:
-#     prompt 1024 (unchunked)   48.6% -> 53.9%   (+5.3 pp)
-#     prompt 4096               46.5% -> 54.7%   (+8.2 pp)
-#     prompt 8192               49.4% -> 55.4%   (+6.1 pp)
-#     pooled                    48.2% -> 54.7%   (+6.5 pp, Welch t = 6.34)
-#   Target passes per 400 tokens fall by about 6% (202->192, 206->191, 201->190).
-#
-#   TWO THINGS THE MEASUREMENT DOES NOT SHOW, both worth knowing before quoting
-#   the upstream framing:
-#     - DECODE THROUGHPUT DOES NOT MOVE: -3.2% / +1.0% / +1.2% across the three
-#       lengths, inside the noise. Six percent fewer target passes should have
-#       been worth roughly six percent; something absorbs it, and this has not
-#       been isolated.
-#     - THE UNCHUNKED CONTROL IMPROVES TOO (+5.3 pp at 1024, below PREFILL_STEP).
-#       Upstream reports an unchanged control and a gap that closes only for
-#       chunked prompts. So the effect here is not purely the chunked-prefill
-#       defect -- the patch also routes speculative_prompt_ids differently, which
-#       applies to every prompt.
-#   KEPT anyway: it restores the upstream-intended priming, acceptance is up
-#   reproducibly, and nothing regressed.
-#   The tests from the PR are NOT carried (test_generate.py, test_models.py):
-#   site-packages is not where they run.
-#   SIDE EFFECT worth knowing: the PR deletes qwen3_5's own
-#   chunked_prefill_policy and replaces four per-model copies of the predicate
-#   with one capability check on rollback_speculative_cache in
-#   generate/common.py. Checked here: chunked prefill stays enabled for dflash,
-#   mtp and no drafter -- the RAM lever is not touched.
+# 0033-pr2072-apc-ownership-transfer-peaks.patch  (PR #2072, @Blaizzy, open)
+#   "Reduce exact APC ownership-transfer peaks". ADDED 2026-09-04 against a
+#   measured failure, not as a precaution.
+#   The exact-APC snapshot store clones the live prompt cache
+#   (_clone_prompt_cache_for_apc) and evaluates the copy. At a 32,256-token
+#   prompt that is a second 1.97 GiB of KV, asked for at the moment the working
+#   set already stands at 95%. Three OOMs in two days sit at exactly this call
+#   site -- see the APC_ENTRIES block in start-mlx_qwen3.8.sh for the trace.
+#   The PR transfers restored exact-cache ownership to the batch generator,
+#   materialises and requantises ONE restored layer at a time and releases its
+#   source before the next, promotes a consumed single KVCache row to
+#   BatchKVCache without copying, and stops cloning an already-detached snapshot
+#   a second time on the way into the APC manager. The non-consuming merge and
+#   the defensive store-copy remain available to callers that do not transfer
+#   ownership, so the default path is unchanged for anyone who does not opt in.
+#   Touches apc.py, apc_adapters.py, apc_coordinator.py and generate/ar.py --
+#   the last one alongside patches 0010 and 0014, and it applies cleanly.
+#   NOT YET MEASURED HERE. The immediate lever against the same failure was
+#   APC_ENTRIES 3 -> 2; if this patch holds up, the 3 can come back.
+#   The tests from the PR are not carried; site-packages is not where they run.
 #
 # 0031-pr1835-recurrent-cache-no-trim.patch    (PR #1835, @kylesyx, open)
 #   "Decline prefix-cache reuse for non-trimmable recurrent caches".
@@ -273,6 +257,30 @@
 #   PR page is the stale Aug 20 run.
 #
 # ── DONE / OBSOLETE ──────────────────────────────────────────────────────────
+#
+# 0032-pr2096-chunked-prefill-drafter-priming.patch   REMOVED 2026-09-04,
+#   one day after it was added. Carried upstream PR #2096 ("Prime speculative
+#   drafters from the whole prompt during chunked prefill"), which is still open.
+#   It works, and it was still the wrong trade for this machine.
+#   MEASURED 2026-09-03 (n=12 per arm, one server restart each, 400 generated
+#   tokens, temperature 0): acceptance 48.2% -> 54.7%, +6.5 pp pooled, Welch
+#   t = 6.34, and target passes per 400 tokens down about 6%. Decode throughput
+#   did NOT move: -3.2% / +1.0% / +1.2% across 1024/4096/8192, inside the noise.
+#   The unchunked 1024 control improved too (+5.3 pp), which upstream's framing
+#   does not predict -- the patch also routes speculative_prompt_ids differently
+#   and that applies to every prompt.
+#   WHAT KILLED IT was the memory side, which was never measured before it went
+#   in. DFlash captures five target layers (5, 19, 33, 47, 61) at hidden_size
+#   5120, i.e. 50 KiB per token across them in bf16. Without the patch only the
+#   final chunk is captured (~100 MiB). With it, every chunk's capture is held
+#   and then concatenated by splice_prompt_hidden:
+#     32,256 tokens  ~1.5 GiB held, ~3 GiB through the concatenation
+#     65,536 tokens  ~3.1 GiB held, ~6 GiB
+#   On a machine running at 95% of its working set that is decisive, and the OOM
+#   on 2026-09-03 21:39:18 sits exactly at its mx.eval(chunk_hidden) in
+#   prompt_step(). +6.5 pp acceptance, no throughput, 1.5-3 GiB of peak: a bad
+#   trade here. Reopen it when memory is not the binding constraint.
+#   It lives in this repository's git history.
 #
 # 0040-pr1959-dflash2.patch   REMOVED 2026-08-25.
 #   Carried upstream PR #1959 ("Add DFlash 2 speculative decoding"). That PR was

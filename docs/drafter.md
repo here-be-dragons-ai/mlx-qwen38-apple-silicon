@@ -3,12 +3,11 @@
 Background and measurements for the drafter. The README states only that DFlash 2
 is the default and how to switch back.
 
-> **The throughput numbers on this page predate patch `0032` (2026-09-02), and
-> measurement says they still stand.** The patch fixes the drafter being primed
-> from a one-token prompt under chunked prefill. Measured on 2026-09-03 it
-> raises the acceptance rate by 6.5 pp and leaves decode throughput unchanged
-> — see "Patch 0032 measured" below. So the tables here are not invalidated;
-> read them as slightly pessimistic on acceptance and correct on tok/s.
+> **The throughput numbers on this page stand.** Patch `0032` was added on
+> 2026-09-02, measured on 09-03 and removed again on 09-04: it raised acceptance
+> by 6.5 pp, left decode throughput unchanged, and cost 1.5–3 GiB of peak memory
+> on long prompts. See "Patch 0032 measured, and reverted" below. The drafter
+> configuration these tables describe is the one running again.
 
 ## Status since mlx-vlm 0.6.16 (2026-08-24)
 
@@ -153,7 +152,7 @@ the table above, where JSON and code reach 44.2 and 42.6 t/s.
 
 ---
 
-### Patch 0032 measured: acceptance up, throughput flat
+### Patch 0032 measured, and reverted
 
 Upstream PR [#2096](https://github.com/Blaizzy/mlx-vlm/pull/2096) fixes chunked
 prefill requesting the speculative capture kwargs only on the *final* prefill
@@ -186,8 +185,27 @@ untouched, yet it gains 5.3 pp. The patch also hands `speculative_prompt_ids`
 through differently, and that applies to every prompt, chunked or not. So the
 effect measured here is not purely the chunked-prefill defect.
 
-Kept regardless: it restores the intended priming, acceptance is reproducibly
-higher, and nothing regressed.
+**Removed again on 2026-09-04, for the side nobody measured: memory.** DFlash
+captures five target layers (`target_layer_ids: [5, 19, 33, 47, 61]`) at
+`hidden_size` 5120 — 50 KiB per token across them in bf16. Without the patch
+only the final chunk's capture exists, about 100 MiB. With it, every chunk's
+capture is held until the drafter is primed and then concatenated by
+`splice_prompt_hidden`:
+
+| prompt | held | peak through the concatenation |
+|---:|---:|---:|
+| 32,256 | ~1.5 GiB | ~3 GiB |
+| 65,536 | ~3.1 GiB | ~6 GiB |
+
+That is calculated, not measured, but the failure that goes with it is real: the
+OOM on 2026-09-03 21:39:18 sits exactly at this patch's `mx.eval(chunk_hidden)`
+in `prompt_step()`, and this machine runs at 95 % of its working set on ordinary
+22k–32k agent traffic.
+
+So the trade as measured is **+6.5 pp acceptance, no throughput, and 1.5–3 GiB
+of extra peak on precisely the long prompts that were already failing**. On a
+memory-bound machine that is the wrong way round. Reopen it when memory is not
+the binding constraint — the patch itself is sound and still open upstream.
 
 **Method note.** The first version of the measurement script built its filler by
 repeating one sentence. That produced 100 % acceptance at every length — a

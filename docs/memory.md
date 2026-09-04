@@ -464,28 +464,51 @@ quantitative counterweight to the llama.cpp figure in the table below, which is
 the reason KV quantisation has stayed off. Worth an A/B before the next time
 memory gets tight.
 
-### Open: 65k died at a stated budget of 90k
+### The OOM is the APC snapshot clone, not the prefill
 
-Measured 2026-09-03 on `PROFILE=roomy`, fused path genuinely active, `f16` KV.
-Two 32,803-token requests went through at 400–430 tok/s prefill and 19–20 tok/s
-decode. The next request at 65,536 tokens died with
+Three `[METAL] Insufficient Memory` events in two days, classified by call site
+out of the log rather than by where the banner said memory was going:
+
+| when | prompt | call site |
+|---|---:|---|
+| 2026-09-03 21:36:55 | 65,536 | `_clone_prompt_cache_for_apc` |
+| 2026-09-03 21:39:18 | 65,536 | `mx.eval(chunk_hidden)` in `prompt_step()` (patch `0032`) |
+| 2026-09-04 13:29:47 | 32,256 | `_clone_prompt_cache_for_apc` |
+
+**Two of three sit in the exact-APC snapshot store, and none in the prefill.**
+The 32,256-token case is the clearest: the prefill finished — 96.1 % logged —
+with the working set at 95 % (37.99 of 40.00 GiB), and then
 
 ```
-[METAL] Command buffer execution failed: Insufficient Memory
+_store_apc_exact_checkpoints -> store_exact_cache
+  -> _clone_prompt_cache_for_apc -> mx.eval
 ```
 
-The working set had climbed to 40.00 GiB of 40.00 GiB, peak 41.33 GiB, while the
-banner was advertising a context budget of **~89,914 tokens**.
+asked for a *second* copy of the live KV, 1.97 GiB at that length. The `mx` peak
+counter reached 40.69 GiB against a 40.00 GiB working set. The server survived
+and served the next request; only the one generation failed.
 
-**Not yet separated:** whether 65k fails on its own, or only after the APC has
-been filled by earlier long requests. The two 32k requests left three snapshots
-behind, and memory was already at ~30 GiB before the 65k attempt started. A cold
-server has not been tried at 65k. Until it has, the honest reading is that the
-budget line is optimistic by at least 27 % under realistic APC load — which is
-what its own caveat says, but this is the first time the gap has been measured.
+This corrects the earlier reading of the 65k failure, which blamed the context
+length and left the cause open between "APC full" and "65k is too much". The
+call site says neither: it is the clone, and it can fail at half that length.
+
+Three responses, in the order they were taken:
+
+1. **Patch `0032` removed** (2026-09-04). It held every prefill chunk's hidden
+   capture for the drafter — 50 KiB/token across five captured layers, so ~1.5 GiB
+   at 32k and ~3.1 GiB at 65k, plus the concatenation peak. That is the middle
+   row of the table above. See `docs/drafter.md`.
+2. **`APC_ENTRIES` 3 → 2 on `roomy`** (2026-09-04). One snapshot copy fewer:
+   4 copies → 3, computed budget 89,914 → 120,654 tokens. The price is explicit —
+   three pi instances now share two warm slots, so one loses its snapshot on
+   every rotation, caught by the SSD tier in ~350 ms rather than a cold prefill.
+3. **Patch `0033`** (upstream PR #2072) attacks the peak itself: no second clone
+   of an already-detached snapshot, and one layer materialised at a time. Applied,
+   not yet measured. If it holds, the 3 can come back.
 
 Also worth recording, because the repository had no numbers for it: prefill runs
-at ~386 tok/s at 8k and ~400–430 tok/s at 32k.
+at ~386 tok/s at 8k and ~400–430 tok/s at 32k. Real agent traffic on 2026-09-04
+was 22k–32k prompts with `max_tokens=2048`.
 
 ---
 
