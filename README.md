@@ -66,20 +66,20 @@ self-test → patches → model + drafter → `~/.mlx-qwen38/{logs,apc}`.
 Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 
 **Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`,
-**`mlx-vlm 0.7.0rc0`**, `transformers 5.15.1`, `numpy 2.5.2`,
+**`mlx-vlm 0.7.0`**, `transformers 5.15.1`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 
-> Back on a tagged release since 2026-09-01 (previously main @`3fd38f4`).
+> On the `0.7.0` release since 2026-09-07, the day it shipped.
 > Install it with **`--no-deps`**:
 >
 > ```sh
-> uv pip install --python ~/src/mlx/.venv/bin/python --no-deps "mlx-vlm==0.7.0rc0"
+> uv pip install --python ~/src/mlx/.venv/bin/python --no-deps "mlx-vlm==0.7.0"
 > ```
 >
 > Without `--no-deps` the resolver pulls `mlx` from PyPI down to 0.32.1, which
 > silently disables patch `0013` -- see [docs/build-mlx.md](docs/build-mlx.md).
-> All nine patches apply to this tag unchanged. Note the tag (`579cd51`) is
-> behind main: `#1822` and the TurboQuant batch-decode fix are **not** in it.
+> Seven of the ten patches carried over to `0.7.0` unchanged; `0031` and `0034`
+> were superseded by the release itself and `0033` needed one hunk reanchored.
 
 0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
 upstream (PR #2014), and the ArraysCache buffer leak that killed generations at
@@ -235,7 +235,7 @@ SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
 
 ## Patches
 
-Ten patches against `site-packages`, applied by `patches/apply-patches.sh`
+Eight patches against `site-packages`, applied by `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). **They vanish on every
 `pip install -U mlx-vlm`** -- run it again afterwards.
 
@@ -262,10 +262,15 @@ What changed over 2026-09-02 to 09-04:
 - `0033` (upstream PR `#2072`) is new: the exact-APC snapshot store clones the
   live prompt cache, and that clone -- not the prefill -- is where three OOMs in
   two days actually happened. `APC_ENTRIES` on `roomy` went 3 -> 2 alongside it.
-- `0034` (upstream PR `#2090`, merged upstream but after the pinned tag) keeps
-  exact-APC checkpoints packed instead of dequantizing them to float on store.
-  It removes the documented reason `KV_BITS` is off on `roomy` -- the snapshots
-  now shrink with the live cache. The default still waits on an A/B.
+- `0031` and `0034` are **gone** since `0.7.0` (2026-09-07): the release carries
+  `#2152` and `#2090`, which do what they did.
+- The same release carries `#1822`, and that one matters. Until it, `--kv-bits`
+  was **silently ignored** on any server running a drafter with a single
+  sequence -- which is this setup. Confirmed here from the safetensors headers
+  of our own APC snapshots: all 16 full-attention layers stored dense while the
+  banner advertised 32 KiB/token (upstream issue `#2093`). KV quantisation only
+  became measurable with `0.7.0`, and it is still off by default -- see
+  `docs/memory.md`.
 
 ```sh
 ./patches/apply-patches.sh --check

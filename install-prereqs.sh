@@ -42,23 +42,36 @@ for a in "$@"; do
   esac
 done
 
-# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-08-25).
-# mlx-vlm 0.6.16 is the version the patches in patches/ are written against.
-# 0.6.16 matters for three reasons: DFlash 2 ships upstream (PR #2014, which
-# made local patch 0040 obsolete), the ArraysCache buffer leak that killed
-# generations at ~10.3k tokens is fixed (#1972 via PR #1984), and Qwen3.8-27B
-# support landed (#1899).
+# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-09-07).
+# mlx-vlm 0.7.0 is the version the patches in patches/ are written against.
+# It shipped on 2026-09-07, 46 commits past the 0.7.0rc0 tag, and three of those
+# commits changed this repository's patch set:
+#   #1822  make_speculative_prompt_cache no longer bypasses the cache factory at
+#          batch_size == 1. Until then --kv-bits was SILENTLY IGNORED on any
+#          server running a drafter with one sequence, which is this setup --
+#          see upstream issue #2093, confirmed here from the snapshot headers.
+#          KV quantisation only became measurable with this release.
+#   #2090  packed exact-APC checkpoints  -> local patch 0034 deleted
+#   #2152  ArraysCache trim guard        -> local patch 0031 deleted
+# Seven of the ten patches applied to 0.7.0 unchanged; only 0033 needed one hunk
+# reanchored, because upstream had meanwhile factored out the helper it calls.
+#
 # mlx 0.32.2 is on PyPI since 2026-08-25, including mlx-metal and
 # macosx_26_0_arm64 wheels -- the source build documented in docs/build-mlx.md
 # is no longer needed. Patch 0013 is still required (the default dispatch still
-# does not route to force_fused) and applies unchanged.
+# does not route to force_fused) and applies unchanged; re-verified on 0.7.0,
+# 181 MiB against ~2362 MiB unfused at qL=2048 / kL=22747.
+#
+# UPGRADE CAREFULLY: `uv pip install -U mlx-vlm` without --no-deps drags mlx
+# down to 0.32.1 and silently disables patch 0013. Every install also wipes the
+# patches out of site-packages -- run ./patches/apply-patches.sh afterwards.
 # --latest gets you something newer; apply-patches.sh may then report "CONFLICT"
 # (meaning: merged upstream -> delete the patch) and the measured values in the
 # start script no longer hold unexamined.
 PINS=(
   "mlx==0.32.2"
   "mlx-lm==0.31.3"
-  "mlx-vlm==0.7.0rc0"
+  "mlx-vlm==0.7.0"
   "transformers==5.15.1"
   "numpy==2.5.2"
   "huggingface-hub==1.27.0"

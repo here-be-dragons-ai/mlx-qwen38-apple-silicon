@@ -1,8 +1,6 @@
-diff --git a/mlx_vlm/apc.py b/mlx_vlm/apc.py
-index 103bc9143..19ce7a9f7 100644
 --- a/mlx_vlm/apc.py
 +++ b/mlx_vlm/apc.py
-@@ -3136,14 +3136,24 @@ def store_exact_cache(
+@@ -3142,14 +3142,24 @@
          prompt_cache: Sequence[Any],
          *,
          extra_hash: int = 0,
@@ -29,7 +27,7 @@ index 103bc9143..19ce7a9f7 100644
          if copied is None:
              types = [type(c).__name__ for c in prompt_cache]
              logger.warning(
-@@ -3847,11 +3857,17 @@ def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
+@@ -3853,11 +3863,17 @@
  def _merge_exact_cache_entries(
      entries: Sequence[Any],
      prefix_lens: Sequence[int],
@@ -48,7 +46,7 @@ index 103bc9143..19ce7a9f7 100644
  
  
  def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
-@@ -3876,6 +3892,33 @@ def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) ->
+@@ -3882,6 +3898,33 @@
      )
  
  
@@ -82,9 +80,9 @@ index 103bc9143..19ce7a9f7 100644
  def _align_exact_batch_caches_to_kv_policy(
      caches: List[Any],
      kv_quant_config: dict,
-@@ -3888,46 +3931,32 @@ def _align_exact_batch_caches_to_kv_policy(
-     marks, float last layer when n > 2). Hybrid non-KV types
-     (``ArraysCache``, ``BatchRotatingKVCache``, …) are left unchanged.
+@@ -3892,46 +3935,32 @@
+     and pass through unchanged. Older float snapshots still need conversion
+     so continuous-batching joins use the same per-layer types as cold rows.
      """
 -    from .models.cache import BatchKVCache, should_quantize_kv_layer
 -
@@ -132,17 +130,17 @@ index 103bc9143..19ce7a9f7 100644
  ) -> Tuple[Optional[List[Any]], int]:
      """Merge single-row exact-cache snapshots into batch-aware caches.
  
-     When *kv_quant_config* is provided, full-attention ``BatchKVCache`` layers
-     are re-quantized to match live ``_make_cache`` via
-     ``should_quantize_kv_layer`` (last layer stays float when n > 2). Hybrid
--    non-KV entries are unchanged. On-disk exact snapshots remain float.
-+    non-KV entries are unchanged. On-disk exact snapshots remain float. When
-+    *consume_sources* is true, each row must be a list; its entries are cleared
-+    as their materialized batch layers take ownership of the restored state.
+     Native quantized rows are merged in their packed representation. When
+     *kv_quant_config* is provided, legacy float ``BatchKVCache`` snapshots are
+     converted to match live ``_make_cache``. Hybrid non-KV entries are
+-    unchanged.
++    unchanged. When *consume_sources* is true, each row must be a list; its
++    entries are cleared as their materialized batch layers take ownership of
++    the restored state.
      """
  
      if not row_caches:
-@@ -3937,25 +3966,45 @@ def make_warm_batch_exact_cache_multi(
+@@ -3941,25 +3970,45 @@
      num_entries = len(row_caches[0])
      if any(len(row) != num_entries for row in row_caches):
          return None, 0
@@ -169,12 +167,6 @@ index 103bc9143..19ce7a9f7 100644
 -
 -    if kv_quant_config is not None:
 -        out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
--
--    eval_targets: List[mx.array] = []
--    for c in out:
--        _collect_mx_arrays(c.state, eval_targets)
--    if eval_targets:
--        mx.eval(eval_targets)
 +        if consume_sources:
 +            eval_targets: List[mx.array] = []
 +            _collect_mx_arrays(merged.state, eval_targets)
@@ -185,7 +177,12 @@ index 103bc9143..19ce7a9f7 100644
 +                    raise TypeError("consume_sources requires mutable cache-row lists")
 +                row[entry_idx] = None
 +            mx.clear_cache()
-+
+ 
+-    eval_targets: List[mx.array] = []
+-    for c in out:
+-        _collect_mx_arrays(c.state, eval_targets)
+-    if eval_targets:
+-        mx.eval(eval_targets)
 +    if not consume_sources:
 +        if kv_quant_config is not None:
 +            out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
@@ -197,14 +194,13 @@ index 103bc9143..19ce7a9f7 100644
      return out, max(prefix_lens) if prefix_lens else 0
  
  
-diff --git a/mlx_vlm/apc_adapters.py b/mlx_vlm/apc_adapters.py
-index 0d261997a..329edfb26 100644
 --- a/mlx_vlm/apc_adapters.py
 +++ b/mlx_vlm/apc_adapters.py
-@@ -391,6 +391,21 @@ def merge_rows(self, caches, prefix_lens):
+@@ -390,6 +390,21 @@
+         from .models import cache as lm
  
          return lm.BatchKVCache.merge(caches)
- 
++
 +    def merge_rows_consuming(self, caches, prefix_lens):
 +        """Transfer a single detached row into its batch cache without copying."""
 +        from .models import cache as lm
@@ -219,11 +215,10 @@ index 0d261997a..329edfb26 100644
 +            out._idx = offset
 +            return out
 +        return self.merge_rows(caches, prefix_lens)
-+
+ 
  
  class RotatingKVCacheCloneAdapter:
-     capability = Capability.WINDOWED
-@@ -622,7 +637,8 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
+@@ -625,7 +640,8 @@
      return None
  
  
@@ -233,7 +228,7 @@ index 0d261997a..329edfb26 100644
      from .models import cache as lm
  
      if not entries:
-@@ -634,16 +650,26 @@ def merge_cache_entries(entries, prefix_lens):
+@@ -644,16 +660,26 @@
          else:
              ok = all(isinstance(c, typ) for c in entries)
          if ok:
@@ -262,11 +257,9 @@ index 0d261997a..329edfb26 100644
              for i in range(len(first))
          ]
          return None if any(m is None for m in merged) else lm.CacheList(*merged)
-diff --git a/mlx_vlm/apc_coordinator.py b/mlx_vlm/apc_coordinator.py
-index 2bfd85eff..7019bf221 100644
 --- a/mlx_vlm/apc_coordinator.py
 +++ b/mlx_vlm/apc_coordinator.py
-@@ -109,13 +109,18 @@ def merge_rows(
+@@ -109,13 +109,18 @@
  
          if self.is_checkpoint:
              row_caches = [
@@ -286,7 +279,7 @@ index 2bfd85eff..7019bf221 100644
              )
          return make_warm_batch_kv_cache_multi(
              list(picks),
-@@ -157,7 +162,10 @@ def store_checkpoint(
+@@ -157,7 +162,10 @@
          if snapshot is None:
              return False
          return self.manager.store_exact_cache(
@@ -298,11 +291,9 @@ index 2bfd85eff..7019bf221 100644
          )
  
      def commit(
-diff --git a/mlx_vlm/generate/ar.py b/mlx_vlm/generate/ar.py
-index d5f11ff50..6cff1aa15 100644
 --- a/mlx_vlm/generate/ar.py
 +++ b/mlx_vlm/generate/ar.py
-@@ -1922,21 +1922,23 @@ def _store_apc_exact_checkpoints(self) -> None:
+@@ -2002,21 +2002,23 @@
                  continue
              if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                  continue
@@ -330,7 +321,7 @@ index d5f11ff50..6cff1aa15 100644
                  )
              meta["checkpoint_done"] = True
  
-@@ -2184,6 +2186,7 @@ def generate(
+@@ -2264,6 +2266,7 @@
                                  meta["full_input_ids"],
                                  prompt_cache,
                                  extra_hash=meta.get("extra_hash", 0),
@@ -338,7 +329,7 @@ index d5f11ff50..6cff1aa15 100644
                              )
                          self._apc_manager.release(meta.get("apc_blocks", []))
                      else:
-@@ -2574,13 +2577,18 @@ def _build_mixed_prompt_batch(
+@@ -2652,13 +2655,18 @@
              )
          elif apc_mode == "exact":
              row_caches = [
