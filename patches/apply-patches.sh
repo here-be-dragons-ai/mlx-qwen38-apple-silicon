@@ -12,24 +12,21 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-04: verified against mlx-vlm 0.7.0rc0 (tag 579cd51) and mlx
-# 0.32.2. Ten patches. All ten apply to the tag.
-#   - 0013 was REWRITTEN (it had never once fired on the server; see below).
-#   - 0032 came and went inside a day: measured, then removed for its memory
-#     cost. See DONE / OBSOLETE.
-#   - 0033 is NEW, carrying the still-open upstream PR #2072 against the APC
-#     snapshot-clone peak that produced three OOMs in two days.
-#   - 0034 is NEW, carrying the already-merged PR #2090 (packed APC
-#     checkpoints), which lands after the tag. It removes the reason _KV_BITS is
-#     empty on roomy; the default still waits on a measurement.
-#   - 0031 is now ORPHANED: upstream closed PR #1835 unmerged on 2026-09-03 in
-#     favour of #2152, which is merged. The effect is upstream, so this patch
-#     goes at the next move past the tag.
+# STATE 2026-09-07: verified against mlx-vlm 0.7.0 (released the same day) and
+# mlx 0.32.2. Eight patches, down from ten.
+#   - The upgrade off the 0.7.0rc0 tag cost almost nothing: seven of ten patches
+#     applied unchanged, including 0013, which I had expected to need work.
+#   - 0031 and 0034 are GONE, both superseded by the release (#2152 and #2090).
+#   - 0033 needed ONE hunk reanchored: upstream had meanwhile factored out
+#     _align_exact_batch_cache_to_kv_policy, which is exactly the helper #2072
+#     wants to delegate to, so the patch now calls what already exists.
+#   - #1822 came with the release and is the reason KV quantisation is worth
+#     measuring at all now -- see the 0014 entry.
 #
-# Careful when moving past the tag: main has since drifted in models/base.py
-# (0b73936, 9606b86, efd0479, all quantized-KV work, plus #1822 merged
-# 2026-09-01) and patch 0013 no longer applies there -- context drift only,
-# mechanical to reanchor.
+# That warning about models/base.py drift is retired: the release carries the
+# quantized-KV work and #1822, and patch 0013 applied to it without a change.
+# Re-verified on 0.7.0 through the patched entry point: 181 MiB at qL=2048 /
+# kL=22747, against ~2362 MiB unfused.
 #
 # The APC redesign (PR #1960, merged 2026-08-28) removed two of them:
 #   0021  obsolete. _run_speculative is gone; non-MTP drafters no longer take a
@@ -125,6 +122,22 @@
 #     without patch  prefill_length=1000  -> BatchQuantizedKVCache  (wrong)
 #     with    patch  prefill_length=1000  -> BatchKVCache           (f16)
 #                    prefill_length=20000 -> BatchQuantizedKVCache
+#   UNTIL 2026-09-07 THIS PATCH COULD NOT FIRE ON A SERVER WITH A DRAFTER, and
+#   neither could --kv-bits itself. make_speculative_prompt_cache returned the
+#   model's plain dense cache at batch_size == 1 and dropped the _make_cache
+#   factory that carries kv_bits -- upstream issue #2093, which we confirmed
+#   here from the safetensors headers of our own APC snapshots (all 16
+#   full-attention layers stored dense while the banner advertised 32 KiB/token).
+#   mlx-vlm 0.7.0 ships #1822, which removes that bypass: every drafter now
+#   builds its prompt cache through make_cache. So this patch, and KV
+#   quantisation in general, became reachable on this setup with that release.
+#   STILL UNMEASURED, and deliberately so: once quantisation actually engages,
+#   attention takes the hasattr(cache, "bits") branch and never reaches the
+#   fused kernels of patch 0013. Upstream #2163 reports what that path then does
+#   at long context -- the full L x S score matrix in one allocation, a higher
+#   peak than f16 below ~50k, and OOM at 200k -- on this exact model and these
+#   versions. Measure before enabling; do not set it as a profile default.
+#
 #   AFFECTS PROFILE=lean in normal operation: KV_BITS=8 is the default there, and
 #   since DFlash 2 became the default the start script sets
 #   MLX_VLM_SPECULATIVE_BATCH=1 -- so the batch path no longer runs only at
@@ -188,11 +201,11 @@
 #   CHECKED: PR #1959 does NOT have this guard -- the spot is open upstream.
 #
 # ── FOREIGN UPSTREAM PRs (cherry-picked) ─────────────────────────────────────
-# Other people's bugfixes. Most are still open upstream; as soon as they are
-# merged, this script reports "CONFLICT" -- remove them then.
-# ONE OF THEM (0034) IS ALREADY MERGED and is carried only because it landed
-# AFTER the pinned tag. That one goes as soon as the pin moves past it, and it
-# is the reason each entry below states open/merged explicitly.
+# Other people's bugfixes that are still open upstream. As soon as they are
+# merged, this script reports "CONFLICT" -- remove them then, which is exactly
+# what happened to 0031 and 0034 with the 0.7.0 release.
+# Only ONE is left: 0033. It is the last thing standing between this repository
+# and a patch set that is entirely local work.
 #
 # 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, open)
 #   "Fix speculative decoding against a quantized KV cache".
@@ -216,32 +229,6 @@
 #   decoding with quantized batch cache") change the same two files with the same
 #   content. Only one will merge -- this patch covers both.
 #
-# 0034-pr2090-packed-apc-checkpoints.patch  (PR #2090, @Blaizzy, MERGED upstream
-#   2026-09-02, but AFTER the v0.7.0rc0 tag -- hence carried here.)
-#   "Keep quantized APC checkpoints packed". Exact-APC snapshots keep their
-#   native packed representation through snapshot, disk restore and batch merge,
-#   instead of being dequantized to float on store.
-#   THIS REMOVES THE DOCUMENTED REASON WHY _KV_BITS IS EMPTY ON roomy. The
-#   profile block in start-mlx_qwen3.8.sh says it plainly: apc_adapters.py
-#   called dequantize_for_apc() on snapshot store, so the live cache shrank to
-#   32 KiB/token while the snapshots stayed f16 at 64 -- and KV_BITS=8 cost
-#   22.9 -> 18.7 tok/s decode for a saving that never reached the consumer.
-#   With this patch the snapshots shrink with the live cache. Upstream numbers:
-#     16,384 tokens   float checkpoint 64.00 MiB -> packed 8.25 MiB
-#                     float round trip 5.02 ms   -> packed 0.91 ms
-#   NOT YET MEASURED HERE, and the profile default therefore still stays empty.
-#   The 22.9 -> 18.7 measurement was taken under the old behaviour and no longer
-#   describes this code; it does not yet have a replacement. A/B before flipping
-#   the default -- the decode ceiling in the banner predicts +12% at 65k.
-#
-#   REBASED ONTO 0033, NOT VERBATIM. #2072 (patch 0033) is older than #2090 and
-#   upstream never rebased it, so the two collide -- in exactly one hunk, and it
-#   is a DOCSTRING. Both rewrite the docstring of the batch-merge function:
-#   #2090 replaces the first sentences, #2072 appends a sentence about
-#   consume_sources. The version here carries both. No code hunk conflicts, in
-#   either application order (checked both ways in a scratch copy).
-#   The tests from the PR are not carried; site-packages is not where they run.
-#
 # 0033-pr2072-apc-ownership-transfer-peaks.patch  (PR #2072, @Blaizzy, open)
 #   "Reduce exact APC ownership-transfer peaks". ADDED 2026-09-04 against a
 #   measured failure, not as a precaution.
@@ -261,34 +248,34 @@
 #   the last one alongside patches 0010 and 0014, and it applies cleanly.
 #   NOT YET MEASURED HERE. The immediate lever against the same failure was
 #   APC_ENTRIES 3 -> 2; if this patch holds up, the 3 can come back.
+#   REANCHORED 2026-09-07 onto mlx-vlm 0.7.0, one hunk of five. #2072 replaces
+#   the body of _align_exact_batch_caches_to_kv_policy with a call to a
+#   per-layer helper -- and 0.7.0 already ships that helper, with the exact
+#   signature the PR expects. So the reanchor removes work rather than adding
+#   it. The consume_sources plumbing in the other four hunks is unchanged.
+#   WATCH #2182: the maintainer opened it on 2026-09-07 against the same call
+#   site, bounding APC memory and reusing divergent prefixes. It would very
+#   likely replace this patch outright.
 #   The tests from the PR are not carried; site-packages is not where they run.
 #
-# 0031-pr1835-recurrent-cache-no-trim.patch    (PR #1835, @kylesyx, open)
-#   "Decline prefix-cache reuse for non-trimmable recurrent caches".
-#   _prefix_cache_trim_amount() only checks whether the prefix is still PRESENT,
-#   not whether the cache is trimmable at all. The ArraysCache of Qwen3.8's 48
-#   GDN layers is neither -- it passes the check and the caller dies on
-#   c.trim(n_drop).
-#   REPRODUCED HERE at unit level with the real cache classes:
-#     without patch  _prefix_cache_trim_amount([ArraysCache, KVCache], 10) = 10
-#                    -> AttributeError: 'ArraysCache' object has no attribute 'trim'
-#     with    patch  = None (reuse declined); a pure KVCache model still returns
-#                    10 -- no regression for attention models.
-#   DOES NOT AFFECT OUR SERVER: _prefix_cache_trim_amount is only called from
-#   dispatch.stream_generate, and the server path does not go through there.
-#   Included as a precaution for mlx_vlm.chat_ui, the generate CLI and own
-#   scripts that pass prompt_cache_state through.
-#   THE PR HAS MOVED ON (checked 2026-09-02): head 08b0c9e is broader than what
-#   this patch carries. @kylesyx found that CacheList and a bare ArraysCache
-#   expose no top-level offset, so cached_len collapses to 0, n_drop to 0, and
-#   both guards are short-circuited -- Qwen3.5/3.6 only got fixed here because a
-#   sibling KVCache contributes a nonzero offset. Affects mamba/mamba2/rwkv7 and
-#   the per-layer-CacheList models. Not our server path, so not re-pulled; do
-#   pull it if this patch ever becomes load-bearing. CI has never run on that
-#   head -- the fork PR is waiting on maintainer approval, so the red X on the
-#   PR page is the stale Aug 20 run.
-#
 # ── DONE / OBSOLETE ──────────────────────────────────────────────────────────
+#
+# 0031-pr1835-recurrent-cache-no-trim.patch   REMOVED 2026-09-07 with the move
+#   to mlx-vlm 0.7.0. Carried PR #1835 (@kylesyx), which upstream CLOSED UNMERGED
+#   on 2026-09-03 in favour of #2152 -- a narrower one-line fix in the same
+#   function, which the release contains: dispatch.py now reads
+#   `c.is_trimmable() and _cache_fully_retained(c)`.
+#   Note what was lost with the broader PR: #2152 still sits behind `if n_drop`,
+#   so a bare ArraysCache or a CacheList with no top-level offset collapses
+#   cached_len to 0, skips the guard and is accepted for reuse. kylesyx had
+#   covered that; upstream took the narrow fix. Not our server path, but the
+#   hole is now unowned.
+#
+# 0034-pr2090-packed-apc-checkpoints.patch   REMOVED 2026-09-07 with the move to
+#   mlx-vlm 0.7.0, which contains PR #2090. It lived exactly five days and never
+#   ran in production: it landed on 09-04, and the server that would have used it
+#   was started before it. Its whole point -- exact-APC snapshots staying packed
+#   instead of being dequantized on store -- is now the release behaviour.
 #
 # 0032-pr2096-chunked-prefill-drafter-priming.patch   REMOVED 2026-09-04,
 #   one day after it was added. Carried upstream PR #2096 ("Prime speculative

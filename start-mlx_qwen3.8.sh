@@ -748,12 +748,17 @@ fi
 #   KV_BITS=8 · 2 slots · drafter        CORRUPT OUTPUT
 # #2113 (clamp ragged batched speculative acceptance) is in this tag and did
 # change the failure mode, but did not fix it. The two PRs that address this
-# combination head-on, #1956 and #1938, are both still open and are not in the
-# tag. No profile ships MAX_NUM_SEQS > 1, so this only triggers on a manual
-# override.
+# combination head-on, #1956 and #1938, are both still open. No profile ships
+# MAX_NUM_SEQS > 1, so this only triggers on a manual override.
+#
+# NOT RE-MEASURED ON 0.7.0 (2026-09-07). #1956 and #1938 are still open, so the
+# guard stays; but 0.7.0 does carry #1822, which changed the cache the drafter
+# runs on, so the symptom may have moved again. Re-measure before trusting the
+# wording above -- the guard itself costs nothing, since no profile sets the
+# combination.
 if [[ -n "$KV_BITS" && "$MAX_NUM_SEQS" -gt 1 && "$ENABLE_SPEC_DECODE" != "0" ]]; then
   echo "ERROR: KV_BITS + MAX_NUM_SEQS>1 + drafter returns corrupted text on this" >&2
-  echo "       mlx-vlm (0.7.0rc0). It used to fault the GPU; now it fails silently." >&2
+  echo "       mlx-vlm. It used to fault the GPU; on 0.7.0rc0 it failed silently." >&2
   echo "       Pick one: drop KV_BITS, set MAX_NUM_SEQS=1, or ENABLE_SPEC_DECODE=0." >&2
   echo "       Upstream: Blaizzy/mlx-vlm#1956 and #1938, both open." >&2
   exit 1
