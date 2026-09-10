@@ -6,22 +6,22 @@
  
 -    defer_turbo = (
 -        use_turbo and quantized_kv_start > 0 and prefill_length < quantized_kv_start
-+    # ── quantized_kv_start gilt jetzt auch fuer uniform (lokaler Patch 0014)
-+    # Upstream wertet quantized_kv_start ausschliesslich im TurboQuant-Zweig aus
-+    # (defer_turbo). Auf dem uniform-Pfad — also bei --kv-bits ohne
-+    # --kv-quant-scheme turboquant, unserem Default — wurde ab Token 0
-+    # quantisiert, egal was --quantized-kv-start sagt. Sichtbar wird das erst,
-+    # seit DFlash 2 Default ist: das Start-Skript setzt dafuer
-+    # MLX_VLM_SPECULATIVE_BATCH=1, und damit laeuft der Batch-Pfad im
-+    # Normalbetrieb, nicht mehr nur bei MAX_NUM_SEQS > 1.
-+    # Semantik wie bei defer_turbo: die Entscheidung faellt EINMAL beim Anlegen
-+    # des Cache anhand der Promptlaenge, es wird nicht mitten im Request
-+    # umgeschaltet. Kurze Turns bleiben damit f16, lange werden quantisiert.
-+    # ACHTUNG: dadurch haengt der Cache-TYP an der Promptlaenge. Bei
-+    # MAX_NUM_SEQS > 1 koennen zwei gleichzeitige Requests unterschiedliche
-+    # Typen bekommen, die `extend` nicht zusammenfuehren kann — dieselbe
-+    # Eigenschaft hat defer_turbo upstream schon. Wir fahren MAX_NUM_SEQS=1.
-+    # Rollback: QUANT_KV_START=0 (dann ist der Zweig wie vorher inert).
++    # ── quantized_kv_start now applies to uniform as well (local patch 0014)
++    # Upstream evaluates quantized_kv_start only inside the TurboQuant branch
++    # (defer_turbo). On the uniform path — i.e. --kv-bits without
++    # --kv-quant-scheme turboquant, our default — quantisation started at
++    # token 0, no matter what --quantized-kv-start said. That only became
++    # visible once DFlash 2 became the default: the start script sets
++    # MLX_VLM_SPECULATIVE_BATCH=1 for it, so the batch path now runs in
++    # normal operation rather than only at MAX_NUM_SEQS > 1.
++    # Semantics as in defer_turbo: the decision is taken ONCE, when the cache
++    # is created, from the prompt length -- it does not switch in the middle
++    # of a request. Short turns therefore stay f16, long ones get quantised.
++    # CAREFUL: this makes the cache TYPE depend on the prompt length. At
++    # MAX_NUM_SEQS > 1 two concurrent requests can end up with different
++    # types that `extend` cannot merge — defer_turbo upstream has exactly
++    # that property already. We run MAX_NUM_SEQS=1.
++    # Rollback: QUANT_KV_START=0 (the branch is then inert, as before).
 +    defer_quant = (
 +        kv_bits is not None
 +        and quantized_kv_start > 0
