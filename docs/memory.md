@@ -17,6 +17,14 @@ Qwen3.8-27B is a **hybrid**: only 16 of the 64 layers are full attention (those
 pay KV per token), the other 48 are Gated DeltaNet with a constant recurrent
 state. And it is **dense** — no MoE, every token reads all ~15 GiB.
 
+A packed 4-bit KV would cut that 64 KiB/token to roughly a quarter, which is why
+`#2172` was read closely here before it was closed. Whether such a path can be
+*reached* from this server at all is now upstream request
+[`#2215`](https://github.com/Blaizzy/mlx-vlm/issues/2215) — the batch path's mask
+is always an `mx.array`, and our verify length is `block_size + 1 = 5`, so both
+of the routing conditions that a packed path published are violated here. See
+[issue-affine4-kernel-request-draft.md](issue-affine4-kernel-request-draft.md).
+
 The KV item is paid **per copy**: once for the running sequence, once per
 prefix-cache snapshot. With `APC_ENTRIES=3` that is 4 copies:
 
@@ -509,6 +517,45 @@ Three responses, in the order they were taken:
 Also worth recording, because the repository had no numbers for it: prefill runs
 at ~386 tok/s at 8k and ~400–430 tok/s at 32k. Real agent traffic on 2026-09-04
 was 22k–32k prompts with `max_tokens=2048`.
+
+### The warm APC hit is free with the drafter, and −37% without it
+
+Upstream issue `#2210` reports that a warm exact-APC hit *decodes* slower than a
+cold request at the same context: the single-row snapshot is merged into
+batch-aware caches, and the model then copies the whole KV plus recurrent state
+per decode token. Filed against 0.6.17 (6.5 against 9.9 tok/s at 33k), explicitly
+not re-measured on 0.7.0.
+
+Measured here on 2026-09-10 with `./measure-apc-warm-decode.py`, 28,590-token
+prompt, 300 decoded tokens, `temperature 0`, `PROFILE=roomy` (f16 KV), pairs of
+identical prompts where only the cold arm carries a nonce:
+
+| speculative decoding | patches `0010`/`0033` | cold tok/s | warm tok/s | warm/cold |
+|---|---|---:|---:|---:|
+| DFlash 2, `block_size 4` | applied | 20.44 / 20.11 / 20.80 | 20.69 / 20.07 / 20.87 | **1.003** |
+| DFlash 2, `block_size 4` | reverted | 20.73 / 20.90 | 20.81 / 21.01 | **1.004** |
+| off | applied | 15.96 / 15.73 | 10.28 / 10.16 | **0.645** |
+| off | reverted | 15.73 / 15.50 | 9.58 / 10.03 | **0.628** |
+
+So the defect is real on 0.7.0 and it is upstream's, not ours — it survives
+reverting both local patches that touch this path. But **it does not touch this
+setup in normal operation**, because the drafter is on in every profile, and with
+it the ratio is 1.00 across five pairs. That is why no patch was taken: the
+repository does not carry patches for code paths it does not execute. What it
+does change is the cost of `ENABLE_SPEC_DECODE=0`, which is now documented in the
+README as a diagnostic switch rather than an operating mode.
+
+Read the arithmetic before believing the "amortised" explanation: at `block_size 4`
+and 47 % acceptance a target pass yields ~2.9 tokens, so a 35 % per-token penalty
+paid once per pass should still surface as roughly −15 %. Nothing surfaces. The
+speculative path apparently does not take the shortcut at all rather than taking
+it less often — untested speculation, recorded as such.
+
+**On memory this measurement says nothing usable.** Peak `sum` inside the request
+window was 23.1–25.2 GiB on the cold arms, and on the warm arms 21.5, 34.9, 33.8
+and 23.4 GiB — one high and one low sample in *both* patch arms. The spread is
+larger than any effect, so patch `0033` stays unmeasured; the 33–35 GiB
+excursions are worth a second look on their own, against a 40 GiB working set.
 
 ---
 

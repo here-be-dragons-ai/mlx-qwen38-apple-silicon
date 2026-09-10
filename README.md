@@ -156,6 +156,15 @@ A profile sets *defaults* only; individual env variables still win.
 | `MODEL_ALIAS` | `Qwen3.8-27B-local` | **must** match the model name in the request |
 | `STATE_DIR` | `~/.mlx-qwen38` | log and SSD prefix cache |
 
+> **`ENABLE_SPEC_DECODE=0` costs more than the drafter's own speedup, once the
+> prefix cache hits.** Measured 2026-09-10 at 28,590 tokens, 300 decoded tokens:
+> with the drafter a warm APC hit decodes exactly as fast as a cold request
+> (ratio 1.003 over three pairs). Without it the warm hit falls to 9.6-10.3 tok/s
+> against 15.5-16.0 cold -- **-35 to -39%**. That is upstream issue `#2210`, it
+> survives reverting our own APC patches, and it makes `ENABLE_SPEC_DECODE=0` a
+> diagnostic switch rather than an operating mode. Instrument:
+> `./measure-apc-warm-decode.py`.
+
 On start the script prints the computed budget of this machine. The
 `CONTEXT BUDGET` line is an **upper bound, not a promise** -- the `mem` lines in
 the log are authoritative. Details in [docs/memory.md](docs/memory.md).
@@ -226,6 +235,11 @@ Dense: every decode step reads ~15 GiB, so this is memory bandwidth.
 | decode raw | 17.5–18.4 t/s | ~8–10 t/s |
 | decode with spec-dec | 26.9–41.5 t/s | ~13–20 t/s |
 | prefill | 420–470 t/s | ~180–250 t/s |
+
+Those figures are short-context. At 28,590 tokens the same machine measured
+15.5–16.0 tok/s without the drafter and 20.1–21.0 with it (`temperature 0`, 300
+decoded tokens, 2026-09-10) — the drafter is worth about a third there, not the
++58…132% it is worth on short prompts, because acceptance drops to ~47%.
 
 A **cold** 30k prefill takes 2–3 minutes. That is why the prefix cache and the
 SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
@@ -342,6 +356,7 @@ clear the SSD tier, and only then touch `APC_ENTRIES` or `context_length`.
 | `download-mlx-model.sh` | resumable HuggingFace downloader, with size check |
 | `convert-dflash2-drafter.py` | quantizes the DFlash 2 drafter (bf16 → 4bit) |
 | `measure-drafter-acceptance.py` | acceptance rate across the chunked-prefill boundary (patch `0032`) |
+| `measure-apc-warm-decode.py` | decode rate on an exact-APC warm hit against a cold request (issue `#2210`) |
 | `set-iogpu-wired-limit.sh` | computes `iogpu.wired_limit_mb` from `hw.memsize`, clamps |
 | `install-wired-limit-daemon.sh` | installs helper + LaunchDaemon, idempotent |
 | `patches/apply-patches.sh` | apply / check / revert patches |
