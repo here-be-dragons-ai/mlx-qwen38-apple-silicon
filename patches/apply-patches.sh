@@ -258,6 +258,27 @@
 #   likely replace this patch outright.
 #   The tests from the PR are not carried; site-packages is not where they run.
 #
+# ── CONSIDERED AND DECLINED ──────────────────────────────────────────────────
+#
+# 0035-issue2210-apc-single-row-plain  DECLINED 2026-09-10, before it was ever
+#   written. Upstream issue #2210 (@felix-ab) ships a 25-line fix as a gist:
+#   when the exact-APC hit restores exactly one row and no KV quantisation is
+#   configured, return the plain single-row clone instead of merging it into
+#   batch-aware caches, which stops the per-decode-token copy of the whole KV +
+#   recurrent state.
+#   MEASURED HERE on 0.7.0 (./measure-apc-warm-decode.py, 28,590 tokens, 300
+#   decoded, temperature 0, PROFILE=roomy):
+#     drafter on   warm/cold decode 1.003 (3 pairs) and 1.004 (2 pairs)
+#     drafter off  warm/cold decode 0.645 (2 pairs) and 0.628 (2 pairs)
+#   The second column of each row reverts 0010 and 0033, i.e. the defect is
+#   upstream's and not an artefact of our own APC patches. It is REAL on 0.7.0 --
+#   and invisible on this server, because every profile runs a drafter and the
+#   speculative path does not take the shortcut. A patch against a code path we
+#   never execute is the same bad trade that removed 0032.
+#   REVISIT IF: a profile ever ships ENABLE_SPEC_DECODE=0, or a release changes
+#   which decode path the drafter takes. See docs/memory.md and
+#   docs/issue-2210-comment-draft.md.
+#
 # ── DONE / OBSOLETE ──────────────────────────────────────────────────────────
 #
 # 0031-pr1835-recurrent-cache-no-trim.patch   REMOVED 2026-09-07 with the move

@@ -150,6 +150,22 @@ is leaving drafter throughput on the table.
 Use these as prose-workload numbers. Structured output is the faster case — see
 the table above, where JSON and code reach 44.2 and 42.6 t/s.
 
+#### At 28.6k the drafter is worth a third, and it hides an upstream defect
+
+All numbers above are short-context. Measured 2026-09-10 at 28,590 tokens (300
+decoded tokens, `temperature 0`, `PROFILE=roomy`): **15.5–16.0 t/s without the
+drafter against 20.1–21.0 with it**, i.e. about +33% rather than the +58…132%
+that holds on short prompts — acceptance falls to ~47% at that length.
+
+The second finding is more useful than the first. On a warm exact-APC hit the
+drafter is what keeps decode at the cold rate: warm/cold is 1.003 with it and
+0.63–0.65 without it, which is upstream issue `#2210`. So `ENABLE_SPEC_DECODE=0`
+is not a neutral way to take the drafter out of a measurement — on any request
+that hits the prefix cache it also switches on a −37% decode penalty that has
+nothing to do with speculation. Isolate the drafter with `ENABLE_APC=0` as well,
+or read the ratio and not the absolute rate. Full table in
+[docs/memory.md](memory.md).
+
 ---
 
 ### Patch 0032 measured, and reverted
