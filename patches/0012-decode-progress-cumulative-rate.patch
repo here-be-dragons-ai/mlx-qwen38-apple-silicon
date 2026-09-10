@@ -4,16 +4,16 @@
          debug_enabled = logger.isEnabledFor(logging.DEBUG)
          if debug_enabled:
              logger.debug(
-+                # ── rate= war die MOMENTAN-Rate (lokaler Patch, 2026-08-20)
-+                # token_rate = emitted_tokens / (now - previous_token_at) misst
-+                # den Abstand zweier _log_decode_progress-Aufrufe. Unter
-+                # spekulativer Dekodierung wird ein ganzer akzeptierter Block in
-+                # Mikrosekunden nacheinander ausgegeben => 17 % aller Zeilen
-+                # meldeten > 1000 tok/s (Spitze 162153), im Wechsel mit viel zu
-+                # niedrigen Werten. Das widersprach dem elapsed= derselben Zeile
-+                # und war als Diagnosewert unbrauchbar. rate= ist jetzt die
-+                # kumulative Dekodierrate (dieselbe wie in "Decode completed"),
-+                # die Momentanrate bleibt als inst= erhalten.
++                # ── rate= used to be the INSTANTANEOUS rate (local, 2026-08-20)
++                # token_rate = emitted_tokens / (now - previous_token_at)
++                # measures the gap between two _log_decode_progress calls.
++                # Under speculative decoding a whole accepted block is emitted
++                # back to back in microseconds => 17 % of all lines reported
++                # > 1000 tok/s (peak 162153), alternating with values far too
++                # low. That contradicted the elapsed= on the same line and was
++                # useless as a diagnostic. rate= is now the cumulative decode
++                # rate (the same one as in "Decode completed"); the
++                # instantaneous rate stays available as inst=.
                  "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
 -                "rate=%s token_number=%d token_id=%s text=%r",
 +                "rate=%.1f tok/s inst=%s token_number=%d token_id=%s text=%r",
@@ -28,9 +28,9 @@
              )
          elif crossed_interval and not debug_enabled:
              logger.info(
-+                # Siehe Kommentar im logger.debug-Zweig oben: rate= ist die
-+                # kumulative Rate, inst= die (unter Spekulation sprunghafte)
-+                # Momentanrate.
++                # See the comment in the logger.debug branch above: rate= is
++                # the cumulative rate, inst= the instantaneous one, which
++                # jumps around under speculation.
                  "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
 -                "rate=%s",
 +                "rate=%.1f tok/s inst=%s",

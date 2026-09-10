@@ -12,35 +12,35 @@
          ):
              template_kwargs["thinking_mode"] = "enabled"
  
-+        # ── Rollen-Kompatibilitaet (lokaler Patch, 2026-08-17) ────────────────
-+        # Qwen3.8 akzeptiert im chat_template NUR system/user/assistant/tool und
-+        # wirft bei allem anderen raise_exception('Unexpected message role.') —
-+        # in mlx-vlm ein HTTP 500. Qwen3.6 war toleranter und akzeptierte
-+        # zusaetzlich 'developer'. Beim Modellwechsel bricht damit jeder Client,
-+        # der eine der beiden Alt-Rollen schickt (bei Hermes laesst
-+        # _VALID_API_ROLES sowohl 'function' als auch 'developer' durch).
++        # ── Role compatibility (local patch, 2026-08-17) ──────────────────────
++        # Qwen3.8's chat_template accepts ONLY system/user/assistant/tool and
++        # raises raise_exception('Unexpected message role.') on anything else —
++        # an HTTP 500 in mlx-vlm. Qwen3.6 was more tolerant and additionally
++        # accepted 'developer'. Switching models therefore breaks every client
++        # that sends either of the two legacy roles (with Hermes,
++        # _VALID_API_ROLES lets both 'function' and 'developer' through).
 +        #
-+        # GENAUE URSACHE (2026-08-17 eingegrenzt): das Request-Schema erlaubt
-+        # user/assistant/system/developer/tool (server/schemas.py:279), das
-+        # Qwen3.8-Template akzeptiert system/user/assistant/tool. Die Schnitt-
-+        # menge laesst GENAU EINE Rolle durch die Validierung und in die
-+        # Template-Ausnahme fallen: 'developer'. Alles andere (function,
-+        # session_meta, admin) wird schon vom Schema mit HTTP 422 abgewiesen
-+        # und erreicht das Template nie.
++        # EXACT CAUSE (isolated 2026-08-17): the request schema allows
++        # user/assistant/system/developer/tool (server/schemas.py:279), the
++        # Qwen3.8 template accepts system/user/assistant/tool. That
++        # intersection lets EXACTLY ONE role pass validation and then fall
++        # into the template's exception: 'developer'. Everything else
++        # (function, session_meta, admin) is rejected by the schema with an
++        # HTTP 422 and never reaches the template at all.
 +        #
-+        # Beide Abbildungen sind semantisch exakt, kein Rateschluss:
-+        #   developer -> system : 'developer' ist OpenAIs neuerer Name fuer die
-+        #                         Systemrolle. Nur wenn das Template die Rolle
-+        #                         nicht selbst kennt (Qwen3.6 kennt sie und
-+        #                         behandelt sie in Zeile 47 identisch zu system).
-+        #                         DAS ist der Fix fuer den 500er.
-+        #   function  -> tool    : 'function' ist die von 'tool' abgeloeste
-+        #                         Vorgaengerrolle. Heute unerreichbar, weil das
-+        #                         Schema vorher 422 wirft — bewusst als Vorsorge
-+        #                         drin, falls das Schema je erweitert wird.
-+        # Alles andere faellt weiterhin durch und wirft — absichtlich, damit
-+        # echte Fehler sichtbar bleiben statt still umgedeutet zu werden.
-+        # Abschalten: MLX_VLM_ROLE_COMPAT=0
++        # Both mappings are semantically exact, not a guess:
++        #   developer -> system : 'developer' is OpenAI's newer name for the
++        #                         system role. Only applied when the template
++        #                         does not know the role itself (Qwen3.6 does,
++        #                         and treats it exactly like system, line 47).
++        #                         THAT one is the fix for the 500.
++        #   function  -> tool    : 'function' is the predecessor role that
++        #                         'tool' replaced. Unreachable today, because
++        #                         the schema throws 422 first — kept on
++        #                         purpose, in case the schema is ever widened.
++        # Everything else still falls through and throws — deliberately, so
++        # that real errors stay visible instead of being quietly reinterpreted.
++        # Disable with: MLX_VLM_ROLE_COMPAT=0
 +        if os.environ.get("MLX_VLM_ROLE_COMPAT", "1").lower() not in (
 +            "0", "false", "no", "off",
 +        ):
