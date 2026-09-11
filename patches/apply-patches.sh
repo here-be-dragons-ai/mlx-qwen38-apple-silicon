@@ -228,6 +228,16 @@
 #   TWO PRs FOR THE SAME THING: #1956 (here) and #1938 ("Fix Qwen speculative
 #   decoding with quantized batch cache") change the same two files with the same
 #   content. Only one will merge -- this patch covers both.
+#   BROADER THAN THIS PATCH (2026-09-11): issue #2033 got an independent
+#   reproduction on the 0.7.0 release -- MTP drafter on a dense qwen3_5 6-bit
+#   target, --max-num-seqs 8, f16 KV, NO --kv-bits anywhere. At concurrency 2 the
+#   output degenerates into token_id=0 ('!') and comes back as HTTP 200 with
+#   corrupt content, non-streaming included; the no-drafter control is correct at
+#   concurrency 1, 2 and 4. So drafter plus concurrency corrupts on its own,
+#   without the quantized cache this patch is about, and nothing above INFO is
+#   logged -- a caller cannot detect it. PR #2197 was tested there and does NOT
+#   fix it. That is the strongest argument yet for the start script refusing
+#   MAX_NUM_SEQS > 1 outright instead of carrying a patch for it.
 #
 # 0033-pr2072-apc-ownership-transfer-peaks.patch  (PR #2072, @Blaizzy, open)
 #   "Reduce exact APC ownership-transfer peaks". ADDED 2026-09-04 against a
