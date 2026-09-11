@@ -298,5 +298,5 @@ echo "       $BUNDLE_DIR/start-mlx_qwen3.8.sh"
 echo "     The start script prints this machine's computed context budget."
 echo
 echo "  3) Configure the client to the budget (context_length,"
-echo "     max_tokens=8192) -- values and rationale in README.md."
+echo "     max_tokens=16384) -- values and rationale in README.md."
 echo "──────────────────────────────────────────────────────────────"

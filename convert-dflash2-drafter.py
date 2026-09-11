@@ -16,8 +16,8 @@ Usage:
                         projections do. Costs ~254 MiB and is the first knob to
                         turn when acceptance is poor.
 
-Prerequisite: the DFlash-2 patch is applied (patches/apply-patches.sh),
-otherwise mlx-vlm does not know the v2 modules.
+Prerequisite: mlx-vlm >= 0.6.16 -- DFlash 2 ships natively in
+speculative/drafters/dflash2/, no local patch is needed.
 """
 
 import argparse
@@ -29,8 +29,14 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
-from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+# The DFlash 2 classes live in the v2 module `dflash2/` (shipped upstream
+# since 0.6.16, PR #2014). The neighbouring `qwen3_dflash/` module is the v1
+# drafter: its config has no selector_rank and its model has no
+# candidate_selector / attention_conv, so converting a DFlash-2 checkpoint
+# through it crashes (AttributeError on selector_rank, then load_weights
+# refusing 23 weights). Do not "simplify" this back to qwen3_dflash.
+from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
 CODEBOOKS = (
     "candidate_selector.predecessor_codebook",
@@ -48,13 +54,13 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg_dict = json.loads((args.source / "config.json").read_text())
-    config = DFlashConfig.from_dict(cfg_dict)
+    config = DFlash2Config.from_dict(cfg_dict)
     if config.selector_rank == 0:
         raise SystemExit(
             "Source is not a DFlash-2 checkpoint (selector_rank missing from dflash_config)."
         )
 
-    model = DFlashDraftModel(config)
+    model = DFlash2DraftModel(config)
     weights: dict = {}
     for f in sorted(args.source.glob("*.safetensors")):
         weights.update(mx.load(str(f)))

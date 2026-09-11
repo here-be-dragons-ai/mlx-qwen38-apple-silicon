@@ -137,7 +137,7 @@ A profile sets *defaults* only; individual env variables still win.
 
 | | `lean` | `balanced` | `roomy` |
 |---|---|---|---|
-| `APC_ENTRIES` | 1 | 2 | 3 |
+| `APC_ENTRIES` | 1 | 2 | 2 |
 | `KV_BITS` | 8 (from 8k tokens) | — (f16) | — (f16) |
 | `PREFILL_STEP` | 512 | 1024 | 2048 |
 | `VISION_CACHE` | 1 | 4 | 20 |
