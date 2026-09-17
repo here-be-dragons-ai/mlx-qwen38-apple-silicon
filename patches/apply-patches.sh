@@ -12,16 +12,30 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-07: verified against mlx-vlm 0.7.0 (released the same day) and
-# mlx 0.32.2. Eight patches, down from ten.
-#   - The upgrade off the 0.7.0rc0 tag cost almost nothing: seven of ten patches
-#     applied unchanged, including 0013, which I had expected to need work.
-#   - 0031 and 0034 are GONE, both superseded by the release (#2152 and #2090).
-#   - 0033 needed ONE hunk reanchored: upstream had meanwhile factored out
-#     _align_exact_batch_cache_to_kv_policy, which is exactly the helper #2072
-#     wants to delegate to, so the patch now calls what already exists.
-#   - #1822 came with the release and is the reason KV quantisation is worth
-#     measuring at all now -- see the 0014 entry.
+# STATE 2026-09-17: verified against mlx-vlm main @ 548b09b (version string
+# 0.7.1, three commits past the 0.7.1 tag) and mlx 0.32.2. SEVEN patches, down
+# from eight.
+#   - NOT the 0.7.1 tag from PyPI, deliberately. The tag carries #2182 but not
+#     its fix #2262, and #2259 is the consequence: on a hybrid model like this
+#     one a SHORT prompt permanently inflates the prefill reserve, after which
+#     exact APC silently stores and restores nothing for the rest of the process
+#     lifetime. Our traffic is short agent turns, so the tag is unusable here.
+#     Install: uv pip install --no-deps \
+#       "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf"
+#     --no-deps is not optional: the resolver otherwise pulls mlx down to 0.32.1
+#     and patch 0013 falls inert.
+#   - 0033 is GONE, superseded by #2262/#2182 -- see the DONE section.
+#   - 0015 was REANCHORED into a different file; upstream moved the function.
+#   - The other six applied unchanged, 0013 included.
+#
+# WHAT #2262 CHANGED FOR US (mlx-vlm PR, merged 2026-09-16). APC sized the
+# prefill reserve from the largest snapshot-bytes/token ratio the process had
+# ever seen, as a monotonic max. Short checkpoints carry the fixed GDN recurrent
+# state and unused KV capacity, so one 37-token request set a ratio ~10x too
+# high and every later prompt over-reserved. Gone with the PR:
+# _bytes_per_token, _cache_size_estimate and both proportional exact-restore
+# estimates; planning now runs through the cache adapters with real tensor
+# dimensions. VERIFIED HERE: those three symbols no longer exist in apc.py.
 #
 # That warning about models/base.py drift is retired: the release carries the
 # quantized-KV work and #1822, and patch 0013 applied to it without a change.
@@ -161,8 +175,27 @@
 #   The patch does NOT change behaviour by itself -- the default stays upstream.
 #   The fusion is switched off by the start script via QWEN38_FUSED_LINEARS=0.
 #   REBASED 2026-08-25: upstream renamed the function to
-#   _decode_quantized_linears_fused in 0.6.16. The floor itself is NOT fixed
-#   upstream -- _qwen3_5_fused_decode_linears is still attached to the module.
+#   _decode_quantized_linears_fused in 0.6.16.
+#   REANCHORED 2026-09-17 INTO A DIFFERENT FILE. 0.7.1 lifted the function out of
+#   models/qwen3_5/language.py into the shared speculative/ops/linear.py, and the
+#   module attribute lost its prefix with it (_qwen3_5_fused_decode_linears ->
+#   _fused_decode_linears). The body is otherwise unchanged, so the patch is the
+#   same two lines in a new place. Two consequences worth knowing:
+#     - The switch is no longer qwen3_5-specific. Every model routed through
+#       _target_verify_linears now sees it. That is harmless because it is opt-in
+#       and off by default upstream, but it is no longer a Qwen-local lever.
+#     - The old anchor is the dangerous part. Against models/qwen3_5/language.py
+#       hunk 1 (import os) still applies while hunk 2 does not, so a --forward
+#       apply outside this script leaves a tree that looks patched and has an
+#       INERT switch -- the exact failure mode patch 0013 sat in for six weeks.
+#       This script dry-runs the whole patch first and reports CONFLICT instead,
+#       and the start script greps the NEW path for the marker.
+#   The floor itself is still NOT fixed upstream: there is no opt-out in
+#   speculative/ops/linear.py, checked on main @ 548b09b.
+#   VERIFIED 2026-09-17 through the real entry point: with fusable 4bit linears
+#   the default path fuses and attaches _fused_decode_linears; with
+#   QWEN38_FUSED_LINEARS=0 it returns None, attaches nothing, and the outputs of
+#   _target_verify_linears are bit-identical (max abs diff 0.0).
 #   Rollback: QWEN38_FUSED_LINEARS=1
 #
 # 0021-speculative-apc-routing.patch   (LOCAL, upstream-PR candidate)
@@ -203,9 +236,11 @@
 # ── FOREIGN UPSTREAM PRs (cherry-picked) ─────────────────────────────────────
 # Other people's bugfixes that are still open upstream. As soon as they are
 # merged, this script reports "CONFLICT" -- remove them then, which is exactly
-# what happened to 0031 and 0034 with the 0.7.0 release.
-# Only ONE is left: 0033. It is the last thing standing between this repository
-# and a patch set that is entirely local work.
+# what happened to 0031 and 0034 with the 0.7.0 release, and to 0033 on
+# 2026-09-17.
+# NONE are left. Since 0033 went, this patch set is entirely local work: seven
+# patches, no upstream PR among them, each one a lever this machine needs and
+# upstream has no reason to ship.
 #
 # 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, open)
 #   "Fix speculative decoding against a quantized KV cache".
@@ -239,35 +274,6 @@
 #   fix it. That is the strongest argument yet for the start script refusing
 #   MAX_NUM_SEQS > 1 outright instead of carrying a patch for it.
 #
-# 0033-pr2072-apc-ownership-transfer-peaks.patch  (PR #2072, @Blaizzy, open)
-#   "Reduce exact APC ownership-transfer peaks". ADDED 2026-09-04 against a
-#   measured failure, not as a precaution.
-#   The exact-APC snapshot store clones the live prompt cache
-#   (_clone_prompt_cache_for_apc) and evaluates the copy. At a 32,256-token
-#   prompt that is a second 1.97 GiB of KV, asked for at the moment the working
-#   set already stands at 95%. Three OOMs in two days sit at exactly this call
-#   site -- see the APC_ENTRIES block in start-mlx_qwen3.8.sh for the trace.
-#   The PR transfers restored exact-cache ownership to the batch generator,
-#   materialises and requantises ONE restored layer at a time and releases its
-#   source before the next, promotes a consumed single KVCache row to
-#   BatchKVCache without copying, and stops cloning an already-detached snapshot
-#   a second time on the way into the APC manager. The non-consuming merge and
-#   the defensive store-copy remain available to callers that do not transfer
-#   ownership, so the default path is unchanged for anyone who does not opt in.
-#   Touches apc.py, apc_adapters.py, apc_coordinator.py and generate/ar.py --
-#   the last one alongside patches 0010 and 0014, and it applies cleanly.
-#   NOT YET MEASURED HERE. The immediate lever against the same failure was
-#   APC_ENTRIES 3 -> 2; if this patch holds up, the 3 can come back.
-#   REANCHORED 2026-09-07 onto mlx-vlm 0.7.0, one hunk of five. #2072 replaces
-#   the body of _align_exact_batch_caches_to_kv_policy with a call to a
-#   per-layer helper -- and 0.7.0 already ships that helper, with the exact
-#   signature the PR expects. So the reanchor removes work rather than adding
-#   it. The consume_sources plumbing in the other four hunks is unchanged.
-#   WATCH #2182: the maintainer opened it on 2026-09-07 against the same call
-#   site, bounding APC memory and reusing divergent prefixes. It would very
-#   likely replace this patch outright.
-#   The tests from the PR are not carried; site-packages is not where they run.
-#
 # ── CONSIDERED AND DECLINED ──────────────────────────────────────────────────
 #
 # 0035-issue2210-apc-single-row-plain  DECLINED 2026-09-10, before it was ever
@@ -280,8 +286,9 @@
 #   decoded, temperature 0, PROFILE=roomy):
 #     drafter on   warm/cold decode 1.003 (3 pairs) and 1.004 (2 pairs)
 #     drafter off  warm/cold decode 0.645 (2 pairs) and 0.628 (2 pairs)
-#   The second column of each row reverts 0010 and 0033, i.e. the defect is
-#   upstream's and not an artefact of our own APC patches. It is REAL on 0.7.0 --
+#   The second column of each row reverts 0010 and 0033 (0033 was still carried
+#   then), i.e. the defect is upstream's and not an artefact of our own APC
+#   patches. It is REAL on 0.7.0 --
 #   and invisible on this server, because every profile runs a drafter and the
 #   speculative path does not take the shortcut. A patch against a code path we
 #   never execute is the same bad trade that removed 0032.
@@ -290,6 +297,39 @@
 #   docs/issue-2210-comment-draft.md.
 #
 # ── DONE / OBSOLETE ──────────────────────────────────────────────────────────
+#
+# 0033-pr2072-apc-ownership-transfer-peaks.patch   REMOVED 2026-09-17 with the
+#   move to main @ 548b09b. Carried PR #2072 ("Reduce exact APC ownership-
+#   transfer peaks"), added 2026-09-04 against a measured failure: the exact-APC
+#   snapshot store cloned the live prompt cache and evaluated the copy, a second
+#   1.97 GiB of KV at a 32,256-token prompt, asked for while the working set
+#   stood at 95%. Three OOMs in two days sat at that call site -- the trace is in
+#   the APC_ENTRIES block of start-mlx_qwen3.8.sh.
+#   #2072 itself is STILL OPEN upstream. It was replaced anyway, by #2182 and
+#   #2262, which attack the same peak from the other end: the manager now sizes
+#   a snapshot before deciding, keeps at most memory_max_bytes resident, and
+#   spills anything larger straight to disk -- explicitly "without a second full
+#   snapshot just to spill", which is the sentence #2072 was carried for.
+#   THE EVIDENCE IS IN THE REJECTS, and it is why this is a deletion and not a
+#   reanchor:
+#     against the 0.7.1 tag   2 of 13 hunks fail
+#     against main @ 548b09b  5 of 13 hunks fail, across all four files
+#       (apc.py 1/5, apc_adapters.py 2/3, apc_coordinator.py 1/2, ar.py 1/3)
+#   The ar.py hunk failed because upstream now contains it VERBATIM: 0.7.1 calls
+#   coordinator.store_checkpoint(self.prompt_cache, batch_idx=...) and lets
+#   snapshot_prompt_cache_row(..., clone=False) do the extraction, which is
+#   exactly what the patch rewrote that call site into. The rest of #2072 was
+#   overwritten by the #2262 planner rewrite. Reanchoring five hunks onto code
+#   that is being rewritten weekly, for a peak the rewrite already bounds, is
+#   the wrong trade.
+#   WHAT IS LOST, honestly: #2072's per-layer requantise-on-restore and the
+#   no-copy promotion of a consumed single KVCache row are NOT upstream. If the
+#   restore path ever shows a peak again, that is where to look first.
+#   THE OPEN QUESTION IT LEAVES BEHIND is unchanged and still unanswered: the
+#   immediate lever against those OOMs was APC_ENTRIES 3 -> 2, and whether the
+#   3 can come back is now a question about the #2182 resident ceiling
+#   (4.0 GiB here) rather than about this patch. Measure before raising it.
+#   It lives in this repository's git history.
 #
 # 0031-pr1835-recurrent-cache-no-trim.patch   REMOVED 2026-09-07 with the move
 #   to mlx-vlm 0.7.0. Carried PR #1835 (@kylesyx), which upstream CLOSED UNMERGED

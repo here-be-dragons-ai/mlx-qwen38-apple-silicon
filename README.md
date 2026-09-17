@@ -66,20 +66,39 @@ self-test → patches → model + drafter → `~/.mlx-qwen38/{logs,apc}`.
 Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 
 **Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`,
-**`mlx-vlm 0.7.0`**, `transformers 5.15.1`, `numpy 2.5.2`,
+**`mlx-vlm` main @ `548b09b`**, `transformers 5.15.1`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 
-> On the `0.7.0` release since 2026-09-07, the day it shipped.
-> Install it with **`--no-deps`**:
+> **A commit, not a release, and on purpose.** Install with **`--no-deps`**:
 >
 > ```sh
-> uv pip install --python ~/src/mlx/.venv/bin/python --no-deps "mlx-vlm==0.7.0"
+> uv pip install --python ~/src/mlx/.venv/bin/python --no-deps \
+>   "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf"
 > ```
 >
 > Without `--no-deps` the resolver pulls `mlx` from PyPI down to 0.32.1, which
 > silently disables patch `0013` -- see [docs/build-mlx.md](docs/build-mlx.md).
-> Seven of the ten patches carried over to `0.7.0` unchanged; `0031` and `0034`
-> were superseded by the release itself and `0033` needed one hunk reanchored.
+>
+> The newest **release**, `0.7.1` (2026-09-14), is the wrong choice here. It
+> carries the APC redesign `#2182` but not its fix `#2262`, and the difference is
+> upstream issue **`#2259`**: the prefill reserve was sized from the largest
+> snapshot-bytes-per-token ratio the process had ever seen, as a monotonic
+> maximum. This model's 48 GDN layers hold a fixed recurrent state that does not
+> scale with tokens, so **one short prompt** sets that ratio ~10x too high, every
+> later prefill over-reserves, and exact APC stops storing *and* restoring for
+> the rest of the process lifetime -- with no error, only `memory_skips` rising
+> in `/metrics`. This server's traffic is short agent turns, so on the tag the
+> prefix cache dies within minutes. `#2262` (merged 2026-09-16, in no tag yet)
+> deletes the mechanism outright.
+>
+> Verified here on 2026-09-17, the exact scenario from the issue: a 19-token
+> prompt first, then the same 5,633-token document twice -- `cached_tokens`
+> 0 -> 5,632, 12.45 s -> 0.66 s. The start script tests for the defect rather
+> than the version, because the tag and this commit both report `0.7.1`.
+>
+> Seven of the eight patches carried over unchanged; `0033` is gone (superseded
+> by `#2182`/`#2262`) and `0015` was reanchored into a file upstream moved it to.
+> Go back to a plain version pin at the next tag.
 
 0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
 upstream (PR #2014), and the ArraysCache buffer leak that killed generations at
@@ -249,9 +268,12 @@ SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
 
 ## Patches
 
-Eight patches against `site-packages`, applied by `patches/apply-patches.sh`
+Seven patches against `site-packages`, applied by `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). **They vanish on every
 `pip install -U mlx-vlm`** -- run it again afterwards.
+
+All seven are now **local work**: since `0033` went on 2026-09-17 there is no
+cherry-picked foreign PR left in the set.
 
 The set shrank from eleven on 2026-08-28 when the APC redesign landed: `0021`
 became obsolete (the separate generation loop it worked around is gone) and
@@ -273,9 +295,10 @@ What changed over 2026-09-02 to 09-04:
   1.5-3 GiB of per-chunk hidden captures on long prompts. On a machine at 95% of
   its working set that is the wrong trade. `./measure-drafter-acceptance.py` is
   the instrument, and it stays.
-- `0033` (upstream PR `#2072`) is new: the exact-APC snapshot store clones the
-  live prompt cache, and that clone -- not the prefill -- is where three OOMs in
-  two days actually happened. `APC_ENTRIES` on `roomy` went 3 -> 2 alongside it.
+- `0033` (upstream PR `#2072`) was added on 09-04 against three OOMs in two
+  days: the exact-APC snapshot store cloned the live prompt cache, and that
+  clone -- not the prefill -- was the call site. `APC_ENTRIES` on `roomy` went
+  3 -> 2 alongside it.
 - `0031` and `0034` are **gone** since `0.7.0` (2026-09-07): the release carries
   `#2152` and `#2090`, which do what they did.
 - The same release carries `#1822`, and that one matters. Until it, `--kv-bits`
@@ -285,6 +308,36 @@ What changed over 2026-09-02 to 09-04:
   banner advertised 32 KiB/token (upstream issue `#2093`). KV quantisation only
   became measurable with `0.7.0`, and it is still off by default -- see
   `docs/memory.md`.
+
+What changed on 2026-09-17, moving to main @ `548b09b`:
+
+- `0033` is **gone**. `#2072` is still open upstream, but `#2182` and `#2262`
+  bound the same peak from the other end: the manager sizes a snapshot before
+  deciding, keeps at most `memory_max_bytes` resident and spills anything larger
+  straight to disk, explicitly without a second clone. The rejects made the call
+  -- 2 of 13 hunks fail against the `0.7.1` tag, **5 of 13 against main**, across
+  all four files, and the `ar.py` hunk fails because upstream now contains it
+  verbatim. Reanchoring five hunks onto a planner being rewritten weekly, for a
+  peak the rewrite already bounds, is the wrong trade. What is genuinely lost:
+  `#2072`'s per-layer requantise-on-restore and the no-copy promotion of a
+  consumed single `KVCache` row.
+- `0015` was **reanchored into another file**. Upstream lifted
+  `_decode_quantized_linears_fused` out of `models/qwen3_5/language.py` into the
+  shared `speculative/ops/linear.py` and dropped the `_qwen3_5_` prefix from the
+  module attribute. The body is unchanged, so the patch is the same two lines in
+  a new place -- but against the **old** anchor hunk 1 still applies while hunk 2
+  does not, which would leave a tree that looks patched and has an inert switch.
+  There is still no opt-out upstream, so the 9 GiB floor remains the default.
+  Re-verified in production after the move: `mem active` 17.07 GiB after five
+  requests with the drafter, against the 26.00 GiB the fusion costs.
+- The other six applied unchanged, `0013` included -- re-probed through the
+  patched entry point with the real server mask, fused at `qL` 512/1024/2048.
+- New in the banner: **`APC resident cap`**. Since `#2182` a snapshot above
+  `min(8 GiB, working_set/10)` is not kept in RAM but on SSD -- 4.0 GiB here,
+  i.e. ~32,768 tokens per snapshot at two entries, *below* the `roomy`
+  `context_length`. It is reported, not fed into the budget arithmetic; the long
+  note above `budget()` in the start script records why that was tried and
+  reverted.
 
 ```sh
 ./patches/apply-patches.sh --check
@@ -308,6 +361,9 @@ rg "mem active" ~/.mlx-qwen38/logs/server.log | tail -20
 # Patch status
 ./patches/apply-patches.sh --check
 
+# Did the cache get REUSED, not just written? (new since upstream #2270)
+curl -s localhost:8888/metrics | python3 -m json.tool | rg "stored_tokens|restored_tokens|memory_skips"
+
 # APC disk tier, per namespace
 du -sh ~/.mlx-qwen38/apc/*/
 
@@ -318,6 +374,7 @@ pmset -g log | grep -E "Entering Sleep state|Wake Requests" | tail -5
 | symptom | cause |
 |---|---|
 | `cached_tokens=0` in turn 2 | mlx-vlm < 0.6.13, or the snapshot was evicted (`APC_ENTRIES`) |
+| `cached_tokens=0` from the first short prompt onwards, `memory_skips` rising | the `0.7.1` **tag** (upstream #2259) -- needs main @ `548b09b`, see above |
 | `cached_tokens=1` on large prompts | mlx-vlm < 0.6.14 (short-prompt bug, PR #1901) |
 | HTTP 401 / HF download on a request | model name ≠ alias symlink |
 | HTTP 500 on every request | `reasoning_effort` outside the accepted set |

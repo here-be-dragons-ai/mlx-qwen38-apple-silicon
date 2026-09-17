@@ -293,9 +293,14 @@ case "$PROFILE" in
   # eviction measurement in docs/memory.md (up to 72.7 min of cold prefill over
   # 810 prefills at APC_ENTRIES=1) is the warning about going further down.
   #
-  # Patch 0033 (upstream PR #2072) attacks the same peak properly, by not
-  # re-cloning an already-detached snapshot and by materialising one layer at a
-  # time. If it holds up in measurement, the 3 can come back.
+  # UPDATED 2026-09-17: patch 0033 (upstream PR #2072) used to stand here as the
+  # proper fix for that peak. It is gone -- #2182 and #2262 bound the same peak
+  # upstream, by sizing a snapshot before deciding and spilling anything over
+  # memory_max_bytes straight to disk without a second clone. So the question
+  # "can the 3 come back" no longer hangs on a patch; it hangs on the resident
+  # ceiling, which is 4.0 GiB on this 40 GiB working set, i.e. ~32,768 tokens
+  # per snapshot at two entries. Above that the third slot would not buy a warm
+  # RAM hit anyway -- it would buy a disk restore. Measure before raising it.
   #
   # Side finding from the same measurement: KV_BITS=8 does NOT attack the
   # consumer. apc_adapters.py:515 calls dequantize_for_apc() on snapshot store --
@@ -569,7 +574,22 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 # ── Patch checks ──────────────────────────────────────────────────────────────
 SITE_PACKAGES=$("$VENV_PY" -c "import mlx_vlm,os;print(os.path.dirname(os.path.dirname(mlx_vlm.__file__)))")
-MLX_VLM_VER=$("$VENV_PY" -c "import importlib.metadata as m;print(m.version('mlx-vlm'))" 2>/dev/null || echo "?")
+# The version string alone is NOT enough to identify this install: the 0.7.1
+# PyPI tag and main @ 548b09b both report "0.7.1", and only one of them keeps its
+# prefix cache (upstream #2259, see the guard below). Append the commit when the
+# package came from git, so the banner and the log say which one ran.
+MLX_VLM_VER=$("$VENV_PY" -c "
+import importlib.metadata as m, json
+v = m.version('mlx-vlm')
+try:
+    raw = m.distribution('mlx-vlm').read_text('direct_url.json')
+    vcs = (json.loads(raw).get('vcs_info') or {}) if raw else {}
+    rev = vcs.get('commit_id') or vcs.get('requested_revision') or ''
+    if rev:
+        v += f' (git {rev[:7]})'
+except Exception:
+    pass
+print(v)" 2>/dev/null || echo "?")
 MLX_VER=$("$VENV_PY" -c "import importlib.metadata as m;print(m.version('mlx'))" 2>/dev/null || echo "?")
 
 # APC capability: semantic_extra_hash() exists from 0.6.13. If it is missing
@@ -579,6 +599,27 @@ if [[ "$ENABLE_APC" == "1" ]] && ! grep -q "def semantic_extra_hash" "$SITE_PACK
   echo "⚠️  WARNING: mlx-vlm $MLX_VLM_VER does not know semantic_extra_hash() (< 0.6.13?)." >&2
   echo "    Prefix caching then hits ONLY on byte-identical prompts." >&2
   echo "    Fix:  uv pip install -U mlx-vlm" >&2
+fi
+# ── Upstream #2259: the version number cannot detect this one ─────────────────
+# The 0.7.1 TAG and main @ 548b09b both report "0.7.1", and on the tag exact APC
+# dies after the first short prompt: #2182 sized the prefill reserve from the
+# largest snapshot-bytes/token ratio the process had ever seen, as a monotonic
+# max, and this model's 48 GDN layers carry a fixed recurrent state that does not
+# scale with tokens. One 37-token agent turn therefore sets a ratio ~10x too
+# high, every later prefill over-reserves, _make_room fails, and the manager
+# stops storing AND restoring for the rest of the process lifetime -- silently,
+# with only memory_skips rising in /metrics.
+# So test for the MECHANISM, not the version: #2262 deleted _bytes_per_token
+# along with _cache_size_estimate. If the symbol is back, so is the defect.
+if [[ "$ENABLE_APC" == "1" ]] && grep -q "_bytes_per_token" "$SITE_PACKAGES/mlx_vlm/apc.py" 2>/dev/null; then
+  echo "⚠️  WARNING: this mlx-vlm ($MLX_VLM_VER) still has the #2259 APC memory" >&2
+  echo "    planner (_bytes_per_token is a monotonic max). On this hybrid model a" >&2
+  echo "    single SHORT prompt then disables exact APC for the whole process --" >&2
+  echo "    no error, just cached_tokens=0 from then on." >&2
+  echo "    Fix:  uv pip install --no-deps \\" >&2
+  echo "            'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf'" >&2
+  echo "          then ./patches/apply-patches.sh" >&2
+  echo "    Stopgap on the tag:  APC_EXACT_MIN_TOKENS=1024 APC_MEMORY_RESERVE_GB=2" >&2
 fi
 # Patch 0010 (single snapshot). Without it APC_SINGLE has no effect and the
 # memory need per conversation is twice what is computed below.
@@ -660,11 +701,17 @@ else
 fi
 
 # ── Fused quantized linears (patch 0015) ─────────────────────────────────────
-# _fused_quantized_linears() holds a SECOND, concatenated copy of the quantized
-# weights on the module permanently. That is the fixed floor which killed the
-# sessions on 2026-08-21/22: it appears on the FIRST generation, is independent
-# of context length (16 tokens trigger it just as much as 44,452) and is never
-# released.
+# _decode_quantized_linears_fused() holds a SECOND, concatenated copy of the
+# quantized weights on the module permanently. That is the fixed floor which
+# killed the sessions on 2026-08-21/22: it appears on the FIRST generation, is
+# independent of context length (16 tokens trigger it just as much as 44,452)
+# and is never released.
+# THE MARKER MOVED ON 2026-09-17: mlx-vlm 0.7.1 lifted the function out of
+# models/qwen3_5/language.py into the shared speculative/ops/linear.py (the
+# module attribute lost its _qwen3_5_ prefix with it). The probe below greps the
+# NEW file -- against the old path it reports "MISSING" on a correctly patched
+# tree, which is the same silent-inert-switch trap that patch 0013 sat in until
+# 2026-09-02.
 # MEASURED on a 40 GiB working set, idle after 5 requests:
 #                       with fusion   without fusion   decode (mean of 5 each)
 #   with spec decode      26.00 GiB       17.00 GiB     26.1 vs 25.7 tok/s
@@ -675,7 +722,7 @@ fi
 export QWEN38_FUSED_LINEARS="${QWEN38_FUSED_LINEARS:-0}"
 QLIN_STATUS="unfused (patch 0015, saves ~9 GiB)"
 if ! grep -q "QWEN38_FUSED_LINEARS" \
-     "$SITE_PACKAGES/mlx_vlm/models/qwen3_5/language.py" 2>/dev/null; then
+     "$SITE_PACKAGES/mlx_vlm/speculative/ops/linear.py" 2>/dev/null; then
   QLIN_STATUS="fused -- patch 0015 MISSING (~9 GiB floor)"
   if [[ "$QWEN38_FUSED_LINEARS" == "0" ]]; then
     echo "⚠️  WARNING: patch 0015 missing -- QWEN38_FUSED_LINEARS=0 has no effect." >&2
@@ -835,6 +882,33 @@ entries_req = int(os.environ["APC_ENTRIES"]) if apc_on else 0
 model_ctx = int(os.environ.get("MODEL_CTX") or 0)
 ctx_hint = int(os.environ.get("CTX_HINT") or 0)
 
+# ── Resident APC ceiling (upstream #2182, refined by #2262) ──────────────────
+# NEW ON 2026-09-17. Until mlx-vlm 0.7.0 a snapshot was as large as the prompt
+# and stayed in RAM. Since #2182 the manager keeps at most memory_max_bytes of
+# snapshots resident -- default min(8 GiB, working_set/10), i.e. 4.0 GiB on this
+# 40 GiB working set -- and spills everything above that to the disk tier,
+# synchronously and without a second clone.
+# THIS IS REPORTED, NOT BUDGETED WITH: see the long note above budget() for why
+# feeding the ceiling into the arithmetic was tried and reverted. What it tells
+# an operator is whether a warm hit will be a RAM clone or a disk restore, and
+# at APC_ENTRIES=2 the boundary here lands at ~32,768 tokens per snapshot --
+# i.e. below the roomy context_length of 65,536. Conversations longer than that
+# keep their snapshot on SSD.
+# Read from the real manager rather than recomputed, because this is exactly the
+# kind of constant that moves under us: #2262 rewrote the surrounding planner
+# eight days after #2182 introduced it. The formula stays as a fallback.
+def _apc_resident_cap():
+    try:
+        import mlx_vlm.apc as _apc
+        return int(_apc.APCManager().memory_max_bytes)
+    except Exception:
+        override = os.environ.get("APC_MEMORY_MAX_GB")
+        if override:
+            return int(float(override) * GiB)
+        return min(8 * GiB, ws // 10)
+
+apc_cap = _apc_resident_cap() if apc_on else 0
+
 # APC_EXACT_CACHE_ENTRIES caps the number of snapshots, not the bytes -- so the
 # memory need is entries * prompt length, independent of patch 0010. The patch
 # only changes HOW MANY CONVERSATIONS fit into those entries (with it: one per
@@ -888,6 +962,26 @@ if os.environ.get("FUSED_OK") == "1":
 else:
     transient_per_tok = INFLIGHT * n_heads * prefill_step * 2
 
+# THE OBVIOUS REWRITE FOR #2182 WAS TRIED ON 2026-09-17 AND REJECTED. Since the
+# manager holds at most apc_cap of snapshots resident, the arithmetically honest
+# model is "1 live copy that scales + a flat apc_cap for all snapshots", which on
+# this machine reads
+#   (40.0 - 16.0 weights - 1.5 reserve - 0.14 recurrent - 4.0 cap) / 64 KiB
+#   = ~300k tokens, clamped to the model's 262,144
+# against the ~120k the formula below produces. It was reverted for two reasons:
+#   1. THE DIRECTION IS WRONG. This budget is already known to be optimistic --
+#      2026-08-21, a request over 13k tokens cost +11.4 GiB where the same
+#      formula computed 1.6. Replacing a cautious number with one 2.2x larger
+#      moves the banner toward "[METAL] Insufficient Memory", which does not
+#      arrive as a clean error.
+#   2. IT WOULD DISARM THE OVERBOOKING GUARD BELOW, whose whole job is to cut
+#      APC_ENTRIES when _CTX_HINT does not fit. At 262,144 it never triggers
+#      again, on any machine -- and its thresholds were set by measurement on a
+#      37.4 GiB working set, not by arithmetic.
+# The resident ceiling is reported as its own banner line instead, because what
+# it really changes is not how much context fits but whether a warm hit is a RAM
+# clone or a disk restore. Revisit if the eviction behaviour is ever measured
+# under the #2262 planner.
 def budget(entries):
     cop = 1 + entries                                    # 1 live + snapshots
     av = ws - weights - reserve - cop * recurrent
@@ -974,8 +1068,14 @@ per_step = int(os.environ["WEIGHTS_KB"]) * 1024 + recurrent
 ceil_0 = bw * 1e9 / per_step if bw else 0.0
 ceil_ctx = bw * 1e9 / (per_step + ctx_hint * per_tok) if (bw and ctx_hint) else 0.0
 
+# Tokens per snapshot that upstream will actually hold in RAM. Above this the
+# snapshot is not lost -- it spills to the SSD tier -- but a warm hit then costs
+# a disk restore instead of a clone.
+apc_resident_tok = int(apc_cap / (entries_used * per_tok)) if (apc_cap and entries_used) else 0
+
 print(f"{ws/GiB:.1f}|{ram/GiB:.0f}|{weights/GiB:.1f}|{avail/GiB:.1f}|{tokens}|{copies}"
       f"|{per_tok//1024}|{entries_used}|{bw:.0f}|{ceil_0:.1f}|{ceil_ctx:.1f}"
+      f"|{apc_cap/GiB:.1f}|{apc_resident_tok}"
       f"|{info['device_name']}")
 PY
 )
@@ -989,7 +1089,9 @@ KV_KIB="${REST%%|*}";  REST="${REST#*|}"
 ENTRIES_USED="${REST%%|*}"; REST="${REST#*|}"
 MEM_BW="${REST%%|*}";  REST="${REST#*|}"
 CEIL_0="${REST%%|*}";  REST="${REST#*|}"
-CEIL_CTX="${REST%%|*}"; DEV_NAME="${REST#*|}"
+CEIL_CTX="${REST%%|*}"; REST="${REST#*|}"
+APC_CAP_GIB="${REST%%|*}"; REST="${REST#*|}"
+APC_RESIDENT_TOK="${REST%%|*}"; DEV_NAME="${REST#*|}"
 
 # If the budget calculation capped the snapshot count, the capped value applies.
 if [[ "$ENABLE_APC" == "1" && "$ENTRIES_USED" != "$APC_ENTRIES" ]]; then
@@ -1049,6 +1151,11 @@ echo "  RAM              : ${RAM_GIB} GiB"
 echo "  Metal working set: ${WS_GIB} GiB   (follows iogpu.wired_limit_mb)"
 echo "  weights          : ${W_GIB} GiB   (+1.5 GiB reserve for activations)"
 echo "  free for KV      : ${AVAIL_GIB} GiB  across ${COPIES} copies (1 live + APC)"
+if [[ "$ENABLE_APC" == "1" && "$APC_RESIDENT_TOK" != "0" ]]; then
+echo "  APC resident cap : ${APC_CAP_GIB} GiB  -> ~${APC_RESIDENT_TOK} tokens per snapshot"
+echo "                     (upstream #2182: min(8 GiB, working_set/10); longer"
+echo "                     snapshots are not lost, they spill to the SSD tier)"
+fi
 echo "  ->  CONTEXT BUDGET: ~${MAX_TOKENS_FIT} tokens  -- UPPER BOUND, not a promise"
 echo "     The calculation assumes (1+APC_ENTRIES) KV copies and underestimates"
 echo "     the real need. Measured 2026-08-21: a request over 13k tokens cost"
