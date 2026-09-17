@@ -42,41 +42,55 @@ for a in "$@"; do
   esac
 done
 
-# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-09-07).
-# mlx-vlm 0.7.0 is the version the patches in patches/ are written against.
-# It shipped on 2026-09-07, 46 commits past the 0.7.0rc0 tag, and three of those
-# commits changed this repository's patch set:
-#   #1822  make_speculative_prompt_cache no longer bypasses the cache factory at
-#          batch_size == 1. Until then --kv-bits was SILENTLY IGNORED on any
-#          server running a drafter with one sequence, which is this setup --
-#          see upstream issue #2093, confirmed here from the snapshot headers.
-#          KV quantisation only became measurable with this release.
-#   #2090  packed exact-APC checkpoints  -> local patch 0034 deleted
-#   #2152  ArraysCache trim guard        -> local patch 0031 deleted
-# Seven of the ten patches applied to 0.7.0 unchanged; only 0033 needed one hunk
-# reanchored, because upstream had meanwhile factored out the helper it calls.
+# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-09-17).
+#
+# mlx-vlm IS PINNED TO A GIT COMMIT, NOT A RELEASE, and that is deliberate.
+# main @ 548b09b reports version 0.7.1 and sits three commits past the 0.7.1
+# tag. The tag itself is unusable for this setup:
+#   #2182  (in the 0.7.1 tag) bounds APC memory and sizes the prefill reserve
+#          from the largest snapshot-bytes/token ratio the process has seen,
+#          as a monotonic max.
+#   #2259  is what that does to a HYBRID model. Qwen3.8-27B carries 48 GDN
+#          layers whose recurrent state does not scale with tokens, so one
+#          short prompt sets a ratio ~10x too high, every later prefill
+#          over-reserves, and exact APC silently stops storing AND restoring
+#          for the rest of the process lifetime. This server's traffic is short
+#          agent turns. On the tag it would lose the prefix cache within
+#          minutes, without an error in the log.
+#   #2262  (merged 2026-09-16, NOT in any tag) removes the mechanism outright:
+#          _bytes_per_token, _cache_size_estimate and both proportional
+#          exact-restore estimates are gone, planning runs through the cache
+#          adapters with real tensor dimensions.
+# So: the newest RELEASE is the wrong choice here and the newest COMMIT is the
+# right one. Revisit at the next tag -- at that point a plain version pin comes
+# back and this comment can go.
 #
 # mlx 0.32.2 is on PyPI since 2026-08-25, including mlx-metal and
 # macosx_26_0_arm64 wheels -- the source build documented in docs/build-mlx.md
 # is no longer needed. Patch 0013 is still required (the default dispatch still
-# does not route to force_fused) and applies unchanged; re-verified on 0.7.0,
-# 181 MiB against ~2362 MiB unfused at qL=2048 / kL=22747.
+# does not route to force_fused) and applies unchanged; re-verified on
+# 548b09b through the patched entry point with the real server mask, fused at
+# qL 512/1024/2048.
 #
-# UPGRADE CAREFULLY: `uv pip install -U mlx-vlm` without --no-deps drags mlx
-# down to 0.32.1 and silently disables patch 0013. Every install also wipes the
-# patches out of site-packages -- run ./patches/apply-patches.sh afterwards.
+# UPGRADE CAREFULLY: mlx-vlm is installed SEPARATELY with --no-deps below.
+# Without it the resolver drags mlx down to 0.32.1 and silently disables patch
+# 0013. Every install also wipes the patches out of site-packages -- run
+# ./patches/apply-patches.sh afterwards.
 # --latest gets you something newer; apply-patches.sh may then report "CONFLICT"
 # (meaning: merged upstream -> delete the patch) and the measured values in the
 # start script no longer hold unexamined.
 PINS=(
   "mlx==0.32.2"
   "mlx-lm==0.31.3"
-  "mlx-vlm==0.7.0"
   "transformers==5.15.1"
   "numpy==2.5.2"
   "huggingface-hub==1.27.0"
   "pillow==12.3.0"
 )
+# Kept out of PINS on purpose: a git requirement in the same resolution would
+# let uv reconsider mlx. Installed on its own, with --no-deps.
+MLXVLM_REF="git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf"
+MLXVLM_PIN="mlx-vlm @ ${MLXVLM_REF}"
 
 MODEL_REPO="mlx-community/Qwen3.8-27B-4bit"
 MODEL_DIR="$MLX_MODELS/Qwen3.8-27B-MLX-4bit"
@@ -192,9 +206,35 @@ echo "[5/8] mlx-vlm & dependencies"
 if (( CHECK_ONLY == 1 )); then
   [[ -x "$VENV_PY" ]] && "$VENV_PY" - <<'PY' || warn "venv missing"
 import importlib.metadata as m
+import json
+
+
+def origin(pkg):
+    """Where did this come from -- PyPI or a git commit?
+
+    mlx-vlm from main @ 548b09b reports version "0.7.1", the SAME string as the
+    PyPI 0.7.1 tag, and the two are not interchangeable here: the tag loses
+    exact APC after the first short prompt (upstream #2259). The version number
+    cannot tell them apart, so read the install origin instead.
+    """
+    try:
+        dist = m.distribution(pkg)
+        raw = dist.read_text("direct_url.json")
+        if not raw:
+            return ""
+        data = json.loads(raw)
+        vcs = data.get("vcs_info") or {}
+        rev = vcs.get("commit_id") or vcs.get("requested_revision") or ""
+        if rev:
+            return f"  <- git {rev[:7]}"
+        return f"  <- {data.get('url', 'local')}"
+    except Exception:
+        return ""
+
+
 for p in ("mlx", "mlx-lm", "mlx-vlm", "transformers", "numpy", "huggingface-hub", "pillow"):
     try:
-        print(f"  · {p:18s} {m.version(p)}")
+        print(f"  · {p:18s} {m.version(p)}{origin(p)}")
     except Exception:
         print(f"  ⚠️  {p:18s} MISSING")
 PY
@@ -202,9 +242,17 @@ else
   if (( PINNED == 1 )); then
     info "pinned state (--latest for the newest versions)"
     VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" "${PINS[@]}"
+    # Separate, and --no-deps: see the PINS block for why mlx-vlm comes from a
+    # commit rather than a release, and what happens to patch 0013 without the
+    # flag.
+    info "mlx-vlm from main @ 548b09b (--no-deps)"
+    VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" --no-deps "$MLXVLM_PIN"
   else
     info "newest versions"
     VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" -U mlx mlx-lm mlx-vlm transformers pillow
+    echo "  ⚠️  --latest took mlx-vlm from PyPI. If that is the 0.7.1 tag, exact APC"
+    echo "      dies after the first short prompt (upstream #2259, fixed only on"
+    echo "      main by #2262). See the PINS block in this script."
   fi
   ok "mlx-vlm $("$VENV_PY" -c 'import importlib.metadata as m;print(m.version("mlx-vlm"))')"
 fi
