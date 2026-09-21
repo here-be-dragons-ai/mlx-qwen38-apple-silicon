@@ -56,9 +56,12 @@ building. **DFlash 2 stays the default.**
 
 ## DFlash 2 is the default drafter
 
-[DFlash 2](https://inco.ai/blog/dflash2/) runs via `patches/0040` (modules,
-= upstream PR [#1959](https://github.com/Blaizzy/mlx-vlm/pull/1959)) and
-`patches/0021` (prefix-cache routing) and has been the default since 2026-08-20.
+[DFlash 2](https://inco.ai/blog/dflash2/) has been the default since
+2026-08-20. It needed two local patches then — `0040` for the drafter modules
+(= upstream PR [#1959](https://github.com/Blaizzy/mlx-vlm/pull/1959)) and
+`0021` for prefix-cache routing — and **needs neither today**: the modules ship
+upstream since 0.6.16 via PR #2014, and the routing became unnecessary with the
+APC redesign. See "The remaining patch dependency" below.
 Back to the MTP head: `DRAFT_KIND=mtp ./start-mlx_qwen3.8.sh`.
 
 Background: up to 0.6.15 and on `main`, mlx-vlm implements only DFlash **v1**,
@@ -166,6 +169,36 @@ nothing to do with speculation. Isolate the drafter with `ENABLE_APC=0` as well,
 or read the ratio and not the absolute rate. Full table in
 [docs/memory.md](memory.md).
 
+#### MTP vs DFlash 2 at long context (2026-09-21, mlx-vlm 0.7.2)
+
+Every head-to-head above is short-context. The agents do not work there. Same
+measurement as the KV arms — `./measure-apc-warm-decode.py --prompt-tokens
+28000 --max-tokens 300 --repeat 2`, 26,690 tokens, f16 KV, APC on, one server
+restart per arm — cold arms of two pairs:
+
+| drafter | decode | accept | peak | drafter size |
+|---|---|---|---|---|
+| **DFlash 2**, `block_size 4` | **21.7 / 21.2 t/s** | 57 / 55 % | 24.5 / 27.2 GiB | 1.01 GiB |
+| MTP | 20.2 / 19.9 t/s | 47 / 46 % | 22.4 / 25.1 GiB | 0.23 GiB |
+
+**DFlash 2 stays the right default, but the margin collapses with context.**
++6.5% here against the +19% the short-prompt sweep against MTP produced. And
+the acceptance ordering *inverts*: on short prose MTP led 57% to 45%, at 26.7k
+DFlash 2 leads 56% to 46%. DFlash 2 holds its acceptance as context grows;
+MTP's short-prompt advantage does not survive.
+
+The practical consequence is for the memory-constrained profiles. MTP runs
+**2.1 GiB lower at the peak** and its checkpoint is 0.78 GiB smaller, for 6.5%
+of decode. On `lean` and `balanced`, where that is directly context,
+`DRAFT_KIND=mtp` is the better trade at long context — which is the opposite of
+what the short-prompt numbers above would suggest, and the reason this section
+exists.
+
+Note on `accept%`: the server's `draft_n_accepted` counts drafts the target
+verified before the stop token cut the reply, so the absolute values are
+slightly high (upstream #2324). The bias is identical in both arms, so the
+comparison holds.
+
 ---
 
 ### Patch 0032 measured, and reverted
@@ -242,9 +275,11 @@ has long been able to do dflash — it is generic over `draft_kind` throughout a
 receives `apc_manager`, `draft_kind` and `draft_block_size` on the same line.
 Only the switch kept dflash away from it.
 
-`patches/0021-speculative-apc-routing.patch` makes the batch path reachable via
-`MLX_VLM_SPECULATIVE_BATCH=1`; the start script sets the variable automatically
-as soon as `DRAFT_KIND != mtp`. Measured (5.8k conversation, turn 2):
+`patches/0021-speculative-apc-routing.patch` made the batch path reachable via
+`MLX_VLM_SPECULATIVE_BATCH=1`. **Both are gone** — the patch was deleted with
+the APC redesign (PR #1960, 2026-08-28), the start script stopped exporting the
+variable on the same day, and mlx-vlm 0.7.2 does not read it anywhere. The
+measurement below is kept because it is what justified the routing at the time:
 
 | | `cached_tokens` | decode 64/66/76 tok | 5767 tok |
 |---|---|---|---|
@@ -260,21 +295,32 @@ two parallel requests with `MAX_NUM_SEQS=2` run cleanly, and MTP is unchanged
 
 ---
 
-### The remaining patch dependency
+### The patch dependency, and how it ended
 
-DFlash 2 still hangs on **two** patches: `0040` for the drafter modules and
-`0021` for prefix-cache routing. A `pip install -U mlx-vlm` without a subsequent
-`apply-patches.sh` makes the drafter unloadable. The start script catches this —
-it checks both and falls back to MTP with a warning if necessary.
+**Resolved as of 2026-09-21. DFlash 2 needs no local patch to run.** Both
+dependencies are gone:
 
-For `0040` the dependency will foreseeably disappear: it *is* the upstream PR.
-For `0021` it will not: the corresponding issue
-[#1966](https://github.com/Blaizzy/mlx-vlm/issues/1966) was **closed** on
-2026-08-20 in favour of
-[#1923](https://github.com/Blaizzy/mlx-vlm/pull/1923) ("conservative DFlash APC
-prefix reuse", `B=1` only, text-only, exact-prefix). The approach used here
-(batch path via `MLX_VLM_SPECULATIVE_BATCH=1`) will therefore not land; until
-#1923 is merged, `0021` stays local.
+- `0040` (drafter modules) was **removed 2026-08-25**: mlx-vlm 0.6.16 ships
+  DFlash 2 itself via PR [#2014](https://github.com/Blaizzy/mlx-vlm/pull/2014).
+  It *was* the upstream PR, so this was the foreseeable outcome.
+- `0021` (prefix-cache routing) was **removed 2026-08-28** with the APC
+  redesign (PR #1960). `_run_speculative` — the second generation loop that
+  never wired up the APC manager — is gone, the batching generator takes every
+  drafter, and `MLX_VLM_SPECULATIVE_BATCH` is read nowhere in mlx-vlm 0.7.2.
+  The start script stopped exporting it the same day.
+
+So the pessimistic prediction here — that `0021` would stay local because issue
+[#1966](https://github.com/Blaizzy/mlx-vlm/issues/1966) was closed in favour of
+[#1923](https://github.com/Blaizzy/mlx-vlm/pull/1923), which is still open —
+was wrong in the useful direction: upstream did not merge #1923, it removed the
+reason for the patch. Confirmed by measurement on 2026-09-21: a smoke test with
+`SpecDec ON (dflash, block_size 4)` returned `cached_tokens=5348` on a repeated
+5,349-token prompt, so exact APC reuse and DFlash 2 work together with no local
+routing at all.
+
+What remains in the DFlash 2 path is `0041`, the bonus-token guard, which is a
+diagnostic and not a load-bearing dependency: without it a corrupt bonus token
+throws `std::bad_cast` instead of naming the value.
 
 ---
 

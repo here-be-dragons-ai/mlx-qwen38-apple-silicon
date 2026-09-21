@@ -12,21 +12,24 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-17: verified against mlx-vlm main @ 548b09b (version string
-# 0.7.1, three commits past the 0.7.1 tag) and mlx 0.32.2. SEVEN patches, down
-# from eight.
-#   - NOT the 0.7.1 tag from PyPI, deliberately. The tag carries #2182 but not
-#     its fix #2262, and #2259 is the consequence: on a hybrid model like this
-#     one a SHORT prompt permanently inflates the prefill reserve, after which
-#     exact APC silently stores and restores nothing for the rest of the process
-#     lifetime. Our traffic is short agent turns, so the tag is unusable here.
-#     Install: uv pip install --no-deps \
-#       "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf"
-#     --no-deps is not optional: the resolver otherwise pulls mlx down to 0.32.1
-#     and patch 0013 falls inert.
+# STATE 2026-09-21: verified against mlx-vlm 0.7.2 (tagged at a74c7de) and
+# mlx 0.32.2. SEVEN patches, unchanged from the 09-17 set.
+#   - Install: uv pip install "mlx-vlm==0.7.2"  (no --no-deps any more; 0.7.2
+#     declares mlx>=0.32.2, a lower bound, so the exact mlx pin survives the
+#     same resolution. Under the previous GIT pin it did not, and patch 0013
+#     fell inert when uv dropped mlx to 0.32.1.)
+#   - All seven applied to a74c7de without fuzz. Expected: the tag's apc.py,
+#     apc_adapters.py, apc_coordinator.py, models/base.py, speculative/ and
+#     server/generation.py are byte-identical to main @ 548b09b, which is what
+#     they were verified against on 09-17.
+#   - NEVER 0.7.1. That tag carries #2182 without its fix #2262, and #2259 is
+#     the consequence: on a hybrid model a SHORT prompt permanently inflates the
+#     prefill reserve, after which exact APC silently stores and restores
+#     nothing for the rest of the process lifetime. Our traffic is short agent
+#     turns. 0.7.2 is the first release without that defect.
 #   - 0033 is GONE, superseded by #2262/#2182 -- see the DONE section.
-#   - 0015 was REANCHORED into a different file; upstream moved the function.
-#   - The other six applied unchanged, 0013 included.
+#   - 0015 was REANCHORED on 09-17 into a different file; upstream moved the
+#     function. Still there in 0.7.2.
 #
 # WHAT #2262 CHANGED FOR US (mlx-vlm PR, merged 2026-09-16). APC sized the
 # prefill reserve from the largest snapshot-bytes/token ratio the process had
@@ -152,10 +155,19 @@
 #   peak than f16 below ~50k, and OOM at 200k -- on this exact model and these
 #   versions. Measure before enabling; do not set it as a profile default.
 #
-#   AFFECTS PROFILE=lean in normal operation: KV_BITS=8 is the default there, and
-#   since DFlash 2 became the default the start script sets
-#   MLX_VLM_SPECULATIVE_BATCH=1 -- so the batch path no longer runs only at
-#   MAX_NUM_SEQS > 1.
+#   AFFECTS PROFILE=lean in normal operation: KV_BITS=8 is the default there.
+#   INERT ON PROFILE=roomy, which is what this machine runs: _KV_BITS is empty
+#   there, so no quantized cache is ever built and this patch has nothing to
+#   do. It becomes load-bearing the moment the KV_BITS A/B below is run.
+#   CORRECTED 2026-09-21: this used to say "since DFlash 2 became the default
+#   the start script sets MLX_VLM_SPECULATIVE_BATCH=1". It does not, and has
+#   not since 2026-08-28 -- see start-mlx_qwen3.8.sh, where the export was
+#   removed together with patch 0021. mlx-vlm 0.7.2 does not read the variable
+#   anywhere (only MLX_VLM_SPEC_BATCH_COALESCE_MS exists). What actually makes
+#   the batch path reachable at MAX_NUM_SEQS=1 is #1822, in 0.7.0: every
+#   drafter now builds its prompt cache through make_cache.
+#   VERIFIED ON 0.7.2: make_speculative_prompt_cache() is a one-liner,
+#   `return make_cache(lm, left_padding)`, with no batch_size == 1 shortcut.
 #   Rollback: QUANT_KV_START=0
 #
 # 0015-optional-fused-quantized-linears.patch   (LOCAL, no upstream PR)
@@ -198,25 +210,39 @@
 #   _target_verify_linears are bit-identical (max abs diff 0.0).
 #   Rollback: QWEN38_FUSED_LINEARS=1
 #
-# 0021-speculative-apc-routing.patch   (LOCAL, upstream-PR candidate)
-#   Makes the prefix cache reachable for non-MTP drafters at all.
-#   server/generation.py routes every drafter except mtp into a second generation
-#   loop (_run_speculative) that builds its own prompt cache and NEVER wires up
-#   the apc_manager -- consequence: cached_tokens=0 on every request, and
-#   APC_TRACE shows not a single lookup. The continuous-batching path has long
-#   been able to do dflash (generic over draft_kind, receives apc_manager,
-#   draft_kind and draft_block_size on the same line); only the switch kept it
-#   away.
-#   The patch makes the batch path reachable via MLX_VLM_SPECULATIVE_BATCH=1,
-#   default unchanged. The start script sets the variable when DRAFT_KIND != mtp.
-#   MEASURED (5.8k conversation, turn 2): cached 0 -> 5748/5788. Decode unchanged
-#   (40.8 instead of 41.5 t/s on average), better on the 5767-token prompt
-#   (38.4 -> 40.9 t/s). --draft-block-size still takes effect, MAX_NUM_SEQS=2
-#   runs, MTP unchanged (cached 5772).
-#   UPSTREAM STATUS: the corresponding issue #1966 was CLOSED on 2026-08-20 --
-#   in favour of PR #1923 ("conservative DFlash APC prefix reuse", B=1 only,
-#   text-only, exact-prefix). This patch will therefore not land in this form;
-#   the dependency remains until #1923 is merged.
+# 0011-role-compat-developer-to-system.patch   (LOCAL, no upstream PR)
+#   Qwen3.8's chat_template accepts only system/user/assistant/tool and calls
+#   raise_exception('Unexpected message role.') on anything else -- an HTTP 500.
+#   The request schema, however, allows developer as well
+#   (server/schemas.py), and that intersection lets EXACTLY ONE role through
+#   validation and into the template's exception: 'developer'. Everything else
+#   (function, session_meta, admin) is rejected by the schema with a 422 and
+#   never reaches the template.
+#   The patch remaps developer -> system, and function -> tool, in
+#   prompt_utils.py before apply_chat_template. Both mappings are the roles'
+#   own history, not a guess: 'developer' is OpenAI's newer name for the system
+#   role, 'function' the predecessor of 'tool'. developer is only remapped when
+#   the template does not know the role itself (Qwen3.6 does and treats it as
+#   system). Anything else still throws, deliberately, so real errors stay
+#   visible. A remap logs once at INFO.
+#   CHECKED ON 0.7.2: clean prompt_utils.py has no developer handling at all.
+#   The ("system", "developer") in server/openai.py is a different path -- it
+#   folds API `instructions` into a leading system message and does not touch
+#   the chat-completions template route our clients use.
+#   Rollback: MLX_VLM_ROLE_COMPAT=0
+#
+# 0012-decode-progress-cumulative-rate.patch   (LOCAL, no upstream PR)
+#   Diagnostics only, no behaviour change. `rate=` in "Decode progress" was the
+#   INSTANTANEOUS rate, emitted_tokens / (now - previous_token_at). Under
+#   speculative decoding a whole accepted block is emitted back to back in
+#   microseconds, so 17% of all lines reported > 1000 tok/s (peak 162153),
+#   alternating with values far too low, and contradicting the elapsed= on the
+#   same line. `rate=` is now the cumulative decode rate -- the same number as
+#   in "Decode completed" -- and the instantaneous one stays as `inst=`.
+#   Upstream has _token_window_rate() (a windowed rate), which is not the same
+#   thing and is not what the progress line prints.
+#   The one patch here that is pure convenience: nothing breaks without it,
+#   the log just stops being readable under a drafter.
 #
 # 0041-dflash2-guard-invalid-bonus-token.patch   (LOCAL, no upstream PR)
 #   Successor to 0022. Rebased on 2026-08-25 onto the upstream DFlash 2 from
@@ -255,11 +281,21 @@
 #   on something that is a tuple under a quantized cache. Both #1956 and #1938
 #   are still open.
 #   CLASSIFICATION CORRECTED ON 2026-08-20 -- this used to say the patch was only
-#   relevant at MAX_NUM_SEQS > 1. That held while MTP was the default. Since
-#   DFlash 2 became the default the start script sets MLX_VLM_SPECULATIVE_BATCH=1,
-#   and _make_cache builds the batch cache even at MAX_NUM_SEQS=1 as soon as
-#   KV_BITS is set (generate/ar.py:796). On PROFILE=lean, KV_BITS=8 is the
-#   default -- so there this is NORMAL OPERATION, not a precaution.
+#   relevant at MAX_NUM_SEQS > 1. That held while MTP was the default; the batch
+#   cache is built even at MAX_NUM_SEQS=1 as soon as KV_BITS is set. On
+#   PROFILE=lean, KV_BITS=8 is the default -- so there this is NORMAL
+#   OPERATION, not a precaution.
+#   WORDING CORRECTED 2026-09-21: the route into the batch path is NOT an
+#   MLX_VLM_SPECULATIVE_BATCH=1 the start script sets (it has not set it since
+#   2026-08-28, and 0.7.2 does not read the variable). It is #1822 in 0.7.0,
+#   which made every drafter build its prompt cache through make_cache.
+#   AND THE DEFECT ITSELF IS GONE IN 0.7.2. models/base.py now carries
+#   kv_sequence_length() and slice_kv_sequence(), whose docstrings name the
+#   (packed, scales, biases) tuple and speculative target verification
+#   explicitly; the keys.shape access this patch was written against no longer
+#   exists in models/qwen3_5/speculative_verifier.py. #1938 and #1956 are
+#   therefore no longer cherry-pick candidates -- upstream solved it its own
+#   way. That is what unblocks the KV_BITS A/B; see patch 0014 above.
 #   TWO PRs FOR THE SAME THING: #1956 (here) and #1938 ("Fix Qwen speculative
 #   decoding with quantized batch cache") change the same two files with the same
 #   content. Only one will merge -- this patch covers both.

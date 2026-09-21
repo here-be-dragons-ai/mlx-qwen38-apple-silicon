@@ -5,3 +5,4 @@
 nohup.out
 plans/
 Agent.md
+__pycache__/

@@ -465,12 +465,70 @@ Perplexity's negative result for speculative decoding does not transfer: on
 their MoE the draft tokens pull in *additional* experts and hand the
 amortisation back, while a dense model has no extra weights to read.
 
-**The one prediction to check.** The table above says `KV_BITS=8` should be
-worth about **+12 % decode at 65k context** (13.5 → 15.1 tok/s), for the same
-−4.2 GiB it already buys. That is derived, not measured — and it is the first
-quantitative counterweight to the llama.cpp figure in the table below, which is
-the reason KV quantisation has stayed off. Worth an A/B before the next time
-memory gets tight.
+**The one prediction to check — checked on 2026-09-21, and it is wrong.** The
+table above says `KV_BITS=8` should be worth about **+12 % decode at 65k**
+(13.5 → 15.1 tok/s). Measured, it costs **−25 %**. See the next section: the
+ceiling is a bandwidth model, and the quantized cache does not run on the path
+the model assumes.
+
+That is the useful lesson about the ceiling itself. It is an upper bound on what
+*a given path* can reach, not a prediction that a configuration change will move
+throughput toward it. Changing the KV representation also changes which kernels
+run, and that dominated the bandwidth it saved.
+
+### KV quantisation measured, both schemes, and rejected
+
+`_KV_BITS` is empty on `roomy`, and the reason recorded in the start script was
+a decode measurement of 22.9 → 18.7 tok/s taken before PR #2090 — under the old
+behaviour where APC snapshots were dequantized on store, so the live cache
+shrank while the snapshots stayed f16. That reason expired: 0.7.2 keeps
+snapshots packed (`_has_explicit_snapshot_contract` is checked before the
+`dequantize_for_apc` fallback in `apc_adapters.py`).
+
+Three other blockers expired with it, which is why this A/B became possible at
+all:
+
+- **#1822** (0.7.0) removed the `batch_size == 1` shortcut, so `--kv-bits` is no
+  longer silently ignored when a drafter is loaded. Verified on 0.7.2:
+  `make_speculative_prompt_cache()` is `return make_cache(lm, left_padding)`.
+- **The verify crash is gone.** `models/base.py` now has `kv_sequence_length()`
+  and `slice_kv_sequence()`, which handle the `(packed, scales, biases)` tuple;
+  the `keys.shape` access that upstream PRs #1938/#1956 were written against no
+  longer exists in `speculative_verifier.py`.
+- **Patch `0014`** makes `--quantized-kv-start` work on the uniform path.
+
+Measured with `./measure-apc-warm-decode.py --prompt-tokens 28000 --max-tokens
+300 --repeat 2`, 26,690-token context, DFlash 2, APC on, one server restart per
+arm, `caffeinate` in front. Two cold/warm pairs each; the table shows the cold
+arms:
+
+| arm | prefill | decode | accept | peak |
+|---|---|---|---|---|
+| **f16 KV** (default) | 62.9 / 67.2 s | **21.7 / 21.2 t/s** | 57 / 55 % | 24.5 / 27.2 GiB |
+| `KV_BITS=8` uniform | 74.4 / 77.2 s | 16.2 / 15.6 t/s | 51 / 51 % | 23.4 / 26.6 GiB |
+| `KV_BITS=8` turboquant | 71.9 / 74.2 s | 16.5 / 16.2 t/s | 51 / 53 % | 23.4 / 26.6 GiB |
+
+**Decode −25 %, prefill +12…16 %, and the peak saving is about 1 GiB.** Not a
+trade-off — a loss on every axis except memory, and even there it is a tenth of
+what the per-token arithmetic suggests, because the KV cache is not what sets
+the peak at this length (the snapshot clone is, see below).
+
+Why the ceiling model missed it: `models/base.py` dispatches a cache with a
+`bits` attribute to `quantized_scaled_dot_product_attention`, which never
+reaches `mx.fast.scaled_dot_product_attention` and therefore never reaches the
+fused kernels patch `0013` exists for. The saved bandwidth is spent on a slower
+attention path several times over.
+
+**TurboQuant was the interesting hypothesis, and it also failed.** That scheme
+has its own fused `prefill_attention`/`decode_attention` kernels and falls back
+through `mx.fast.scaled_dot_product_attention` — on paper the one quantized
+route that keeps patch `0013`. In practice it lands within noise of the uniform
+scheme (16.3 vs 15.9 t/s median). Whatever it saves, it is not what costs the
+25 %.
+
+So `_KV_BITS` stays empty, now for a current reason. Revisit only if context
+headroom becomes the binding constraint, at which point the correct framing is
+"1 GiB of peak for a quarter of the throughput", not "+12 % decode".
 
 ### The OOM is the APC snapshot clone, not the prefill
 

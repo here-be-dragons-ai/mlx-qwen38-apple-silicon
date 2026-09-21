@@ -42,28 +42,41 @@ for a in "$@"; do
   esac
 done
 
-# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-09-17).
+# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-09-21).
 #
-# mlx-vlm IS PINNED TO A GIT COMMIT, NOT A RELEASE, and that is deliberate.
-# main @ 548b09b reports version 0.7.1 and sits three commits past the 0.7.1
-# tag. The tag itself is unusable for this setup:
-#   #2182  (in the 0.7.1 tag) bounds APC memory and sizes the prefill reserve
-#          from the largest snapshot-bytes/token ratio the process has seen,
-#          as a monotonic max.
-#   #2259  is what that does to a HYBRID model. Qwen3.8-27B carries 48 GDN
-#          layers whose recurrent state does not scale with tokens, so one
-#          short prompt sets a ratio ~10x too high, every later prefill
-#          over-reserves, and exact APC silently stops storing AND restoring
-#          for the rest of the process lifetime. This server's traffic is short
-#          agent turns. On the tag it would lose the prefix cache within
-#          minutes, without an error in the log.
-#   #2262  (merged 2026-09-16, NOT in any tag) removes the mechanism outright:
-#          _bytes_per_token, _cache_size_estimate and both proportional
-#          exact-restore estimates are gone, planning runs through the cache
-#          adapters with real tensor dimensions.
-# So: the newest RELEASE is the wrong choice here and the newest COMMIT is the
-# right one. Revisit at the next tag -- at that point a plain version pin comes
-# back and this comment can go.
+# mlx-vlm is back on a PLAIN VERSION PIN. Between 2026-09-17 and 2026-09-21 it
+# was pinned to a git commit (main @ 548b09b) because the 0.7.1 tag carried
+# #2182 (the APC memory planner) without its fix #2262, and on a HYBRID model
+# that combination silently kills exact APC: Qwen3.8-27B carries 48 GDN layers
+# whose recurrent state does not scale with tokens, so one short prompt sets a
+# bytes/token ratio ~10x too high, every later prefill over-reserves, and the
+# manager stops storing AND restoring for the rest of the process (#2259). This
+# server's traffic is short agent turns, so the tag would have lost the prefix
+# cache within minutes of every start, without an error in the log.
+#
+# 0.7.2 (2026-09-21, tagged at a74c7de) ends that. Checked before switching, by
+# diffing the tag against the commit that had been running:
+#     apc.py  apc_adapters.py  apc_coordinator.py
+#     models/base.py  speculative/  server/generation.py
+#   -> no differences at all.
+# The entire APC and speculative-decoding surface -- everything the seven
+# patches touch, and everything #2259 was about -- is byte-identical to
+# 548b09b. This upgrade is therefore administrative: the same code, from a
+# release instead of a commit. All seven patches apply to a74c7de without fuzz.
+#
+# What the tag adds on top of the commit: #2291 (Anthropic tool-call turns with
+# no text no longer crash the chat template), #2260 (Chat/Responses parity),
+# #2320 (400 instead of a TypeError when a chat model is sent to /v1/audio/*),
+# #2286 (a named error instead of AttributeError for caches that cannot batch),
+# plus new models. One behaviour change to know about: model discovery now runs
+# by DEFAULT, so /v1/models also lists what is in the HF cache, and the
+# --model-discovery flag is gone (--model-dir replaces it; we use neither).
+# What it does NOT add: #2310, the KV-cache leak in
+# GenerationBatch._eval_pending_state, is still present in 0.7.2.
+#
+# NEVER go back to 0.7.1 -- it is the one release this setup cannot run. The
+# start script tests for the MECHANISM (_bytes_per_token in apc.py) rather than
+# the version string, and warns.
 #
 # mlx 0.32.2 is on PyPI since 2026-08-25, including mlx-metal and
 # macosx_26_0_arm64 wheels -- the source build documented in docs/build-mlx.md
@@ -72,25 +85,25 @@ done
 # 548b09b through the patched entry point with the real server mask, fused at
 # qL 512/1024/2048.
 #
-# UPGRADE CAREFULLY: mlx-vlm is installed SEPARATELY with --no-deps below.
-# Without it the resolver drags mlx down to 0.32.1 and silently disables patch
-# 0013. Every install also wipes the patches out of site-packages -- run
-# ./patches/apply-patches.sh afterwards.
+# UPGRADE CAREFULLY: every install wipes the patches out of site-packages --
+# run ./patches/apply-patches.sh afterwards.
 # --latest gets you something newer; apply-patches.sh may then report "CONFLICT"
 # (meaning: merged upstream -> delete the patch) and the measured values in the
 # start script no longer hold unexamined.
+# mlx-vlm is back inside PINS since 0.7.2. It declares `mlx>=0.32.2`, a lower
+# bound, so resolving it together with the exact mlx pin below keeps 0.32.2 --
+# the reason the git requirement needed its own --no-deps install (a git
+# requirement let uv reconsider mlx, drop it to 0.32.1, and silently disable
+# patch 0013) no longer applies.
 PINS=(
   "mlx==0.32.2"
   "mlx-lm==0.31.3"
+  "mlx-vlm==0.7.2"
   "transformers==5.15.1"
   "numpy==2.5.2"
   "huggingface-hub==1.27.0"
   "pillow==12.3.0"
 )
-# Kept out of PINS on purpose: a git requirement in the same resolution would
-# let uv reconsider mlx. Installed on its own, with --no-deps.
-MLXVLM_REF="git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf"
-MLXVLM_PIN="mlx-vlm @ ${MLXVLM_REF}"
 
 MODEL_REPO="mlx-community/Qwen3.8-27B-4bit"
 MODEL_DIR="$MLX_MODELS/Qwen3.8-27B-MLX-4bit"
@@ -212,10 +225,12 @@ import json
 def origin(pkg):
     """Where did this come from -- PyPI or a git commit?
 
-    mlx-vlm from main @ 548b09b reports version "0.7.1", the SAME string as the
-    PyPI 0.7.1 tag, and the two are not interchangeable here: the tag loses
-    exact APC after the first short prompt (upstream #2259). The version number
-    cannot tell them apart, so read the install origin instead.
+    Since 0.7.2 the pin is a plain version again, so this normally prints
+    nothing for mlx-vlm. It is kept because a git install is invisible in the
+    version string: main @ 548b09b reported "0.7.1", the SAME string as the
+    PyPI 0.7.1 tag that loses exact APC after the first short prompt (#2259).
+    If a line below grows a "<- git ..." suffix, someone installed from source
+    and the version number alone no longer says what is running.
     """
     try:
         dist = m.distribution(pkg)
@@ -242,17 +257,13 @@ else
   if (( PINNED == 1 )); then
     info "pinned state (--latest for the newest versions)"
     VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" "${PINS[@]}"
-    # Separate, and --no-deps: see the PINS block for why mlx-vlm comes from a
-    # commit rather than a release, and what happens to patch 0013 without the
-    # flag.
-    info "mlx-vlm from main @ 548b09b (--no-deps)"
-    VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" --no-deps "$MLXVLM_PIN"
   else
     info "newest versions"
     VIRTUAL_ENV="$VENV_DIR" uv pip install --python "$VENV_PY" -U mlx mlx-lm mlx-vlm transformers pillow
-    echo "  ⚠️  --latest took mlx-vlm from PyPI. If that is the 0.7.1 tag, exact APC"
-    echo "      dies after the first short prompt (upstream #2259, fixed only on"
-    echo "      main by #2262). See the PINS block in this script."
+    echo "  ⚠️  --latest resolves mlx-vlm freely. 0.7.1 is the one release that"
+    echo "      cannot run here (exact APC dies after the first short prompt,"
+    echo "      upstream #2259); 0.7.2 and later are fine. A new release can"
+    echo "      still move the APC planner -- see the PINS block in this script."
   fi
   ok "mlx-vlm $("$VENV_PY" -c 'import importlib.metadata as m;print(m.version("mlx-vlm"))')"
 fi

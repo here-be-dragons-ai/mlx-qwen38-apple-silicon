@@ -66,39 +66,47 @@ self-test → patches → model + drafter → `~/.mlx-qwen38/{logs,apc}`.
 Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 
 **Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`,
-**`mlx-vlm` main @ `548b09b`**, `transformers 5.15.1`, `numpy 2.5.2`,
+**`mlx-vlm 0.7.2`**, `transformers 5.15.1`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 
-> **A commit, not a release, and on purpose.** Install with **`--no-deps`**:
->
-> ```sh
-> uv pip install --python ~/src/mlx/.venv/bin/python --no-deps \
->   "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf"
-> ```
->
-> Without `--no-deps` the resolver pulls `mlx` from PyPI down to 0.32.1, which
-> silently disables patch `0013` -- see [docs/build-mlx.md](docs/build-mlx.md).
->
-> The newest **release**, `0.7.1` (2026-09-14), is the wrong choice here. It
-> carries the APC redesign `#2182` but not its fix `#2262`, and the difference is
-> upstream issue **`#2259`**: the prefill reserve was sized from the largest
+> **`0.7.1` is the one release this setup cannot run.** Skip it. It carries the
+> APC redesign `#2182` but not its fix `#2262`, and the difference is upstream
+> issue **`#2259`**: the prefill reserve was sized from the largest
 > snapshot-bytes-per-token ratio the process had ever seen, as a monotonic
 > maximum. This model's 48 GDN layers hold a fixed recurrent state that does not
 > scale with tokens, so **one short prompt** sets that ratio ~10x too high, every
 > later prefill over-reserves, and exact APC stops storing *and* restoring for
 > the rest of the process lifetime -- with no error, only `memory_skips` rising
-> in `/metrics`. This server's traffic is short agent turns, so on the tag the
-> prefix cache dies within minutes. `#2262` (merged 2026-09-16, in no tag yet)
-> deletes the mechanism outright.
+> in `/metrics`. This server's traffic is short agent turns, so on that tag the
+> prefix cache dies within minutes.
 >
-> Verified here on 2026-09-17, the exact scenario from the issue: a 19-token
-> prompt first, then the same 5,633-token document twice -- `cached_tokens`
-> 0 -> 5,632, 12.45 s -> 0.66 s. The start script tests for the defect rather
-> than the version, because the tag and this commit both report `0.7.1`.
+> From 2026-09-17 to 09-21 the pin was therefore a git commit, main @ `548b09b`,
+> installed with `--no-deps`. **`0.7.2` (2026-09-21) ends that** and the pin is a
+> plain version again:
 >
-> Seven of the eight patches carried over unchanged; `0033` is gone (superseded
-> by `#2182`/`#2262`) and `0015` was reanchored into a file upstream moved it to.
-> Go back to a plain version pin at the next tag.
+> ```sh
+> uv pip install --python ~/src/mlx/.venv/bin/python "mlx-vlm==0.7.2"
+> ```
+>
+> The upgrade is administrative. Diffed against the commit that had been
+> running, `0.7.2` has **no differences at all** in `apc.py`,
+> `apc_adapters.py`, `apc_coordinator.py`, `models/base.py`, `speculative/` and
+> `server/generation.py` -- the whole APC and speculative surface, and
+> everything the seven patches touch. All seven apply without fuzz.
+>
+> `--no-deps` is no longer needed: `0.7.2` declares `mlx>=0.32.2`, a lower
+> bound, so the exact `mlx` pin survives the same resolution. Under the git
+> requirement it did not, and patch `0013` fell inert when `mlx` slid to 0.32.1
+> -- see [docs/build-mlx.md](docs/build-mlx.md).
+>
+> The start script still tests for the `#2259` **mechanism** (`_bytes_per_token`
+> in `apc.py`) rather than the version, because the failure is silent and a
+> future release can reintroduce a proportional estimate.
+>
+> Two things the tag does not fix: **`#2310`**, a KV-cache leak in
+> `GenerationBatch._eval_pending_state` that fires once per finished request on
+> this profile, and **`#2239`**, the intermittent hang on requests carrying a
+> `tools` array.
 
 0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
 upstream (PR #2014), and the ArraysCache buffer leak that killed generations at
@@ -311,7 +319,8 @@ What changed over 2026-09-02 to 09-04:
 
 What changed on 2026-09-17, moving to main @ `548b09b`:
 
-- `0033` is **gone**. `#2072` is still open upstream, but `#2182` and `#2262`
+- `0033` is **gone**. `#2072`, the PR it carried, was closed unmerged upstream
+  on 2026-09-10, and `#2182` plus `#2262`
   bound the same peak from the other end: the manager sizes a snapshot before
   deciding, keeps at most `memory_max_bytes` resident and spills anything larger
   straight to disk, explicitly without a second clone. The rejects made the call
@@ -338,6 +347,13 @@ What changed on 2026-09-17, moving to main @ `548b09b`:
   `context_length`. It is reported, not fed into the budget arithmetic; the long
   note above `budget()` in the start script records why that was tried and
   reverted.
+
+What changed on 2026-09-21, moving to the `0.7.2` release:
+
+- **Nothing in the patch set.** The same seven patches, applied to `a74c7de`
+  without fuzz. The files they touch are byte-identical to main @ `548b09b`,
+  so the 09-17 verification still stands and none of it was re-measured.
+- The install got simpler: plain version pin, no separate `--no-deps` step.
 
 ```sh
 ./patches/apply-patches.sh --check
@@ -374,7 +390,7 @@ pmset -g log | grep -E "Entering Sleep state|Wake Requests" | tail -5
 | symptom | cause |
 |---|---|
 | `cached_tokens=0` in turn 2 | mlx-vlm < 0.6.13, or the snapshot was evicted (`APC_ENTRIES`) |
-| `cached_tokens=0` from the first short prompt onwards, `memory_skips` rising | the `0.7.1` **tag** (upstream #2259) -- needs main @ `548b09b`, see above |
+| `cached_tokens=0` from the first short prompt onwards, `memory_skips` rising | a downgrade to the `0.7.1` **tag** (upstream #2259) -- needs `0.7.2`, see above |
 | `cached_tokens=1` on large prompts | mlx-vlm < 0.6.14 (short-prompt bug, PR #1901) |
 | HTTP 401 / HF download on a request | model name ≠ alias symlink |
 | HTTP 500 on every request | `reasoning_effort` outside the accepted set |
@@ -413,6 +429,7 @@ clear the SSD tier, and only then touch `APC_ENTRIES` or `context_length`.
 | `download-mlx-model.sh` | resumable HuggingFace downloader, with size check |
 | `convert-dflash2-drafter.py` | quantizes the DFlash 2 drafter (bf16 → 4bit) |
 | `measure-drafter-acceptance.py` | acceptance rate across the chunked-prefill boundary (patch `0032`) |
+| `measure-batch-cache-retention.py` | idle GPU-memory floor between requests -- does a finished request give its KV cache back? (upstream #2310) |
 | `measure-apc-warm-decode.py` | decode rate on an exact-APC warm hit against a cold request (issue `#2210`) |
 | `set-iogpu-wired-limit.sh` | computes `iogpu.wired_limit_mb` from `hw.memsize`, clamps |
 | `install-wired-limit-daemon.sh` | installs helper + LaunchDaemon, idempotent |
