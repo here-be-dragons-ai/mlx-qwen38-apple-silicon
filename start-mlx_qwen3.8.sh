@@ -367,9 +367,11 @@ ENABLE_SPEC_DECODE="${ENABLE_SPEC_DECODE:-1}"
 #           and therefore exactly in the agent workload. The acceptance RATE is
 #           the same for both (median 80% vs 81%); DFlash 2 drafts more tokens
 #           per round (block_size 4 instead of 3) and wins through that.
-#           A block-diffusion drafter with a path selector. Needs local patch
-#           0040 (the upstream PR #1959; it replaced the earlier own patch 0020)
-#           -- mlx-vlm itself implements only DFlash v1.
+#           A block-diffusion drafter with a path selector. SHIPS UPSTREAM
+#           since mlx-vlm 0.6.16 (PR #2014) -- no local patch needed. Until
+#           2026-08-25 this required patch 0040 (upstream PR #1959), which
+#           replaced our own 0020; both are gone. Only patch 0041, the
+#           bonus-token guard, still sits in the DFlash 2 path.
 #           CAREFUL WITH BLOCK SIZE: the checkpoint is designed for block_size 8,
 #           but z-lab recommends <= 5 for quantized MLX models, and our own
 #           kernel measurement shows a dispatch cliff at M=5
