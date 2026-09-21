@@ -12,21 +12,24 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-17: verified against mlx-vlm main @ 548b09b (version string
-# 0.7.1, three commits past the 0.7.1 tag) and mlx 0.32.2. SEVEN patches, down
-# from eight.
-#   - NOT the 0.7.1 tag from PyPI, deliberately. The tag carries #2182 but not
-#     its fix #2262, and #2259 is the consequence: on a hybrid model like this
-#     one a SHORT prompt permanently inflates the prefill reserve, after which
-#     exact APC silently stores and restores nothing for the rest of the process
-#     lifetime. Our traffic is short agent turns, so the tag is unusable here.
-#     Install: uv pip install --no-deps \
-#       "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf"
-#     --no-deps is not optional: the resolver otherwise pulls mlx down to 0.32.1
-#     and patch 0013 falls inert.
+# STATE 2026-09-21: verified against mlx-vlm 0.7.2 (tagged at a74c7de) and
+# mlx 0.32.2. SEVEN patches, unchanged from the 09-17 set.
+#   - Install: uv pip install "mlx-vlm==0.7.2"  (no --no-deps any more; 0.7.2
+#     declares mlx>=0.32.2, a lower bound, so the exact mlx pin survives the
+#     same resolution. Under the previous GIT pin it did not, and patch 0013
+#     fell inert when uv dropped mlx to 0.32.1.)
+#   - All seven applied to a74c7de without fuzz. Expected: the tag's apc.py,
+#     apc_adapters.py, apc_coordinator.py, models/base.py, speculative/ and
+#     server/generation.py are byte-identical to main @ 548b09b, which is what
+#     they were verified against on 09-17.
+#   - NEVER 0.7.1. That tag carries #2182 without its fix #2262, and #2259 is
+#     the consequence: on a hybrid model a SHORT prompt permanently inflates the
+#     prefill reserve, after which exact APC silently stores and restores
+#     nothing for the rest of the process lifetime. Our traffic is short agent
+#     turns. 0.7.2 is the first release without that defect.
 #   - 0033 is GONE, superseded by #2262/#2182 -- see the DONE section.
-#   - 0015 was REANCHORED into a different file; upstream moved the function.
-#   - The other six applied unchanged, 0013 included.
+#   - 0015 was REANCHORED on 09-17 into a different file; upstream moved the
+#     function. Still there in 0.7.2.
 #
 # WHAT #2262 CHANGED FOR US (mlx-vlm PR, merged 2026-09-16). APC sized the
 # prefill reserve from the largest snapshot-bytes/token ratio the process had

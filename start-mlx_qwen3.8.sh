@@ -574,10 +574,11 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 # ── Patch checks ──────────────────────────────────────────────────────────────
 SITE_PACKAGES=$("$VENV_PY" -c "import mlx_vlm,os;print(os.path.dirname(os.path.dirname(mlx_vlm.__file__)))")
-# The version string alone is NOT enough to identify this install: the 0.7.1
-# PyPI tag and main @ 548b09b both report "0.7.1", and only one of them keeps its
-# prefix cache (upstream #2259, see the guard below). Append the commit when the
-# package came from git, so the banner and the log say which one ran.
+# Since 0.7.2 the pin is a plain release again and the version string is enough.
+# The git suffix is still appended when it applies, because it was NOT enough
+# between 09-17 and 09-21: the 0.7.1 PyPI tag and main @ 548b09b both reported
+# "0.7.1" and only one of them kept its prefix cache (#2259, guard below). If a
+# banner ever shows "(git ...)" again, the version number stopped saying what ran.
 MLX_VLM_VER=$("$VENV_PY" -c "
 import importlib.metadata as m, json
 v = m.version('mlx-vlm')
@@ -601,23 +602,26 @@ if [[ "$ENABLE_APC" == "1" ]] && ! grep -q "def semantic_extra_hash" "$SITE_PACK
   echo "    Fix:  uv pip install -U mlx-vlm" >&2
 fi
 # ── Upstream #2259: the version number cannot detect this one ─────────────────
-# The 0.7.1 TAG and main @ 548b09b both report "0.7.1", and on the tag exact APC
-# dies after the first short prompt: #2182 sized the prefill reserve from the
-# largest snapshot-bytes/token ratio the process had ever seen, as a monotonic
-# max, and this model's 48 GDN layers carry a fixed recurrent state that does not
-# scale with tokens. One 37-token agent turn therefore sets a ratio ~10x too
-# high, every later prefill over-reserves, _make_room fails, and the manager
-# stops storing AND restoring for the rest of the process lifetime -- silently,
-# with only memory_skips rising in /metrics.
+# 0.7.2 does not have this defect (its apc.py is byte-identical to main @
+# 548b09b, which carries the #2262 fix), so on the pinned state this guard is
+# quiet. It stays because the failure is silent and the test is one grep:
+# on the 0.7.1 TAG exact APC dies after the first short prompt. #2182 sized the
+# prefill reserve from the largest snapshot-bytes/token ratio the process had
+# ever seen, as a monotonic max, and this model's 48 GDN layers carry a fixed
+# recurrent state that does not scale with tokens. One 37-token agent turn
+# therefore sets a ratio ~10x too high, every later prefill over-reserves,
+# _make_room fails, and the manager stops storing AND restoring for the rest of
+# the process lifetime -- with only memory_skips rising in /metrics.
 # So test for the MECHANISM, not the version: #2262 deleted _bytes_per_token
-# along with _cache_size_estimate. If the symbol is back, so is the defect.
+# along with _cache_size_estimate. If the symbol is back, so is the defect --
+# whether that comes from a downgrade to 0.7.1 or from a future release that
+# reintroduces a proportional estimate.
 if [[ "$ENABLE_APC" == "1" ]] && grep -q "_bytes_per_token" "$SITE_PACKAGES/mlx_vlm/apc.py" 2>/dev/null; then
   echo "⚠️  WARNING: this mlx-vlm ($MLX_VLM_VER) still has the #2259 APC memory" >&2
   echo "    planner (_bytes_per_token is a monotonic max). On this hybrid model a" >&2
   echo "    single SHORT prompt then disables exact APC for the whole process --" >&2
   echo "    no error, just cached_tokens=0 from then on." >&2
-  echo "    Fix:  uv pip install --no-deps \\" >&2
-  echo "            'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@548b09be0390be2149d7e5c0e179e4d5ff4114bf'" >&2
+  echo "    Fix:  uv pip install 'mlx-vlm>=0.7.2'" >&2
   echo "          then ./patches/apply-patches.sh" >&2
   echo "    Stopgap on the tag:  APC_EXACT_MIN_TOKENS=1024 APC_MEMORY_RESERVE_GB=2" >&2
 fi
