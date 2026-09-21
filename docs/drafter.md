@@ -169,6 +169,36 @@ nothing to do with speculation. Isolate the drafter with `ENABLE_APC=0` as well,
 or read the ratio and not the absolute rate. Full table in
 [docs/memory.md](memory.md).
 
+#### MTP vs DFlash 2 at long context (2026-09-21, mlx-vlm 0.7.2)
+
+Every head-to-head above is short-context. The agents do not work there. Same
+measurement as the KV arms — `./measure-apc-warm-decode.py --prompt-tokens
+28000 --max-tokens 300 --repeat 2`, 26,690 tokens, f16 KV, APC on, one server
+restart per arm — cold arms of two pairs:
+
+| drafter | decode | accept | peak | drafter size |
+|---|---|---|---|---|
+| **DFlash 2**, `block_size 4` | **21.7 / 21.2 t/s** | 57 / 55 % | 24.5 / 27.2 GiB | 1.01 GiB |
+| MTP | 20.2 / 19.9 t/s | 47 / 46 % | 22.4 / 25.1 GiB | 0.23 GiB |
+
+**DFlash 2 stays the right default, but the margin collapses with context.**
++6.5% here against the +19% the short-prompt sweep against MTP produced. And
+the acceptance ordering *inverts*: on short prose MTP led 57% to 45%, at 26.7k
+DFlash 2 leads 56% to 46%. DFlash 2 holds its acceptance as context grows;
+MTP's short-prompt advantage does not survive.
+
+The practical consequence is for the memory-constrained profiles. MTP runs
+**2.1 GiB lower at the peak** and its checkpoint is 0.78 GiB smaller, for 6.5%
+of decode. On `lean` and `balanced`, where that is directly context,
+`DRAFT_KIND=mtp` is the better trade at long context — which is the opposite of
+what the short-prompt numbers above would suggest, and the reason this section
+exists.
+
+Note on `accept%`: the server's `draft_n_accepted` counts drafts the target
+verified before the stop token cut the reply, so the absolute values are
+slightly high (upstream #2324). The bias is identical in both arms, so the
+comparison holds.
+
 ---
 
 ### Patch 0032 measured, and reverted

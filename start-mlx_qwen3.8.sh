@@ -313,13 +313,15 @@ case "$PROFILE" in
   # instead of being dequantized on store, so they now shrink with the live
   # cache. Upstream measured a 16,384-token checkpoint going 64.00 -> 8.25 MiB
   # and its round trip 5.02 -> 0.91 ms.
-  # THE DEFAULT STILL STAYS EMPTY, deliberately. The 22.9 -> 18.7 figure was
-  # taken under the old behaviour and no longer describes this code -- but it has
-  # no replacement yet, and a default should not flip on an argument. What the
-  # decode ceiling in the banner does predict is +12% at 65k context (13.5 ->
-  # 15.1 tok/s), because the KV read per token halves. A/B first:
-  #     KV_BITS=8 QUANT_KV_START=8192 ./start-mlx_qwen3.8.sh
-  # and compare decode t/s from the log against the same prompts without it.
+  # THE DEFAULT STAYS EMPTY, AND SINCE 2026-09-21 IT IS MEASURED AGAIN. The A/B
+  # this block used to ask for was run on 0.7.2 at 26,690 tokens, three arms,
+  # one restart each: f16 21.7/21.2 t/s, KV_BITS=8 uniform 16.2/15.6,
+  # KV_BITS=8 turboquant 16.5/16.2. Decode -25%, prefill +12..16%, peak saving
+  # ~1 GiB. The ceiling's +12% prediction does not survive contact with the
+  # dispatch: a cache with a `bits` attribute goes to
+  # quantized_scaled_dot_product_attention and never reaches the fused kernels
+  # of patch 0013. So the replacement figure exists now, and it points the same
+  # way as the old one for a different reason. docs/memory.md has the table.
   roomy)
     _APC_ENTRIES=2
     if [[ "${_WIRED_MB:-0}" -ge 40960 ]]; then _PREFILL=2048; else _PREFILL=512; fi
@@ -752,13 +754,23 @@ fi
 
 # KV_BITS=8 was briefly the roomy default on 2026-08-21 and is out again.
 # The reasoning was: with fused attention the score transient disappears, so the
-# 64 KiB/token dominate, so halve them. The first part is right, the conclusion
-# is not -- apc_adapters.py:515 calls dequantize_for_apc() on snapshot store, so
-# the APC snapshots remain f16. Only the live cache is quantized, and that is not
-# the consumer.
-# MEASURED: decode 22.9 -> 18.7 tok/s (mean of 6 and 8 requests respectively),
-# while active climbed to 37.78 GiB unchanged and the same OOM arrived.
+# 64 KiB/token dominate, so halve them.
+# THE OLD REASON EXPIRED, THE CONCLUSION SURVIVED. Until PR #2090 the objection
+# was that apc_adapters.py dequantized snapshots on store, so only the live
+# cache shrank; 0.7.2 keeps them packed and that argument is void.
+# RE-MEASURED 2026-09-21 on 0.7.2, 26,690 tokens, DFlash 2, APC on, one restart
+# per arm (./measure-apc-warm-decode.py, cold arms of two pairs):
+#   f16 KV (default)         prefill 62.9/67.2 s   decode 21.7/21.2 t/s
+#   KV_BITS=8 uniform        prefill 74.4/77.2 s   decode 16.2/15.6 t/s
+#   KV_BITS=8 turboquant     prefill 71.9/74.2 s   decode 16.5/16.2 t/s
+# Decode -25%, prefill +12..16%, peak saving ~1 GiB. The banner's decode ceiling
+# predicts +12% at 65k and is WRONG here: models/base.py sends a cache with a
+# `bits` attribute to quantized_scaled_dot_product_attention, which never
+# reaches the fused kernels of patch 0013. TurboQuant has its own fused kernels
+# and still lands within noise of the uniform scheme.
+# Full table and reasoning: docs/memory.md, "KV quantisation measured".
 # For anyone who wants it anyway:  KV_BITS=8 QUANT_KV_START=8192 ./start-...
+#                       or TurboQuant:  KV_BITS=8 KV_SCHEME=turboquant ./start-...
 
 # ── Check the drafter ─────────────────────────────────────────────────────────
 # DFlash 2 ships upstream since mlx-vlm 0.6.16 (PR #2014) at
