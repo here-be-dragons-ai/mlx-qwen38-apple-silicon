@@ -429,6 +429,7 @@ clear the SSD tier, and only then touch `APC_ENTRIES` or `context_length`.
 | `download-mlx-model.sh` | resumable HuggingFace downloader, with size check |
 | `convert-dflash2-drafter.py` | quantizes the DFlash 2 drafter (bf16 → 4bit) |
 | `measure-drafter-acceptance.py` | acceptance rate across the chunked-prefill boundary (patch `0032`) |
+| `measure-batch-cache-retention.py` | idle GPU-memory floor between requests -- does a finished request give its KV cache back? (upstream #2310) |
 | `measure-apc-warm-decode.py` | decode rate on an exact-APC warm hit against a cold request (issue `#2210`) |
 | `set-iogpu-wired-limit.sh` | computes `iogpu.wired_limit_mb` from `hw.memsize`, clamps |
 | `install-wired-limit-daemon.sh` | installs helper + LaunchDaemon, idempotent |
