@@ -163,10 +163,13 @@ that holds on short prompts — acceptance falls to ~47% at that length.
 The second finding is more useful than the first. On a warm exact-APC hit the
 drafter is what keeps decode at the cold rate: warm/cold is 1.003 with it and
 0.63–0.65 without it, which is upstream issue `#2210`. So `ENABLE_SPEC_DECODE=0`
-is not a neutral way to take the drafter out of a measurement — on any request
-that hits the prefix cache it also switches on a −37% decode penalty that has
-nothing to do with speculation. Isolate the drafter with `ENABLE_APC=0` as well,
-or read the ratio and not the absolute rate. Full table in
+was not a neutral way to take the drafter out of a measurement — on any request
+that hit the prefix cache it also switched on a −37% decode penalty that had
+nothing to do with speculation. **Fixed by patch `0035` (upstream `#2336`) on
+2026-09-24**: warm/cold without the drafter is now 0.998. Caveat for the
+short-prompt table above: its "no drafter" column is a median of three identical
+prompts, so repeats may have been warm hits and paid the copy. At short context
+that copy is small, but the column may read slightly low; not re-measured. Full table in
 [docs/memory.md](memory.md).
 
 #### MTP vs DFlash 2 at long context (2026-09-21, mlx-vlm 0.7.2)

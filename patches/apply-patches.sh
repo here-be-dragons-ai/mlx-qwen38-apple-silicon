@@ -12,8 +12,8 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-21: verified against mlx-vlm 0.7.2 (tagged at a74c7de) and
-# mlx 0.32.2. SEVEN patches, unchanged from the 09-17 set.
+# STATE 2026-09-24: verified against mlx-vlm 0.7.2 (tagged at a74c7de) and
+# mlx 0.32.2. EIGHT patches: the 09-17 set plus 0035 (upstream PR #2336).
 #   - Install: uv pip install "mlx-vlm==0.7.2"  (no --no-deps any more; 0.7.2
 #     declares mlx>=0.32.2, a lower bound, so the exact mlx pin survives the
 #     same resolution. Under the previous GIT pin it did not, and patch 0013
@@ -264,9 +264,22 @@
 # merged, this script reports "CONFLICT" -- remove them then, which is exactly
 # what happened to 0031 and 0034 with the 0.7.0 release, and to 0033 on
 # 2026-09-17.
-# NONE are left. Since 0033 went, this patch set is entirely local work: seven
-# patches, no upstream PR among them, each one a lever this machine needs and
-# upstream has no reason to ship.
+# 0035-pr2336-qwen35-singleton-kv-borrow.patch   (PR #2336, @samfenwick, open)
+#   Fixes #2210. qwen3_5/language.py's single-row shortcut ran extract() +
+#   merge() on every full-attention BatchKVCache per decode token, i.e. copied
+#   the whole KV prefix (three times over: extract is exactly sized, so the
+#   next update_and_fetch reallocates). The PR borrows keys/values of an
+#   unpadded one-row BatchKVCache for single-token decode and writes them back.
+#   Only reached WITHOUT a drafter: DFlash/MTP verify passes carry
+#   capture_layer_ids, so hidden_sink is set and the shortcut is skipped.
+#   MEASURED 2026-09-24, 26,690 tokens, ENABLE_SPEC_DECODE=0, APC exact:
+#     warm/cold decode 0.658 -> 0.998 (warm 10.4-10.6 -> 16.0-16.1 tok/s),
+#     warm mem_sum 26.8-30.8 -> 20.6 GiB; cold unchanged; greedy output
+#     bit-identical with and without.
+#   Carried because it makes ENABLE_SPEC_DECODE=0 (rollback, and the only way
+#   to use response_format / thinking_budget) usable at long context.
+#   Test files of the PR are stripped (tests are not installed).
+#   Remove when upstream merges it.
 #
 # 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, open)
 #   "Fix speculative decoding against a quantized KV cache".

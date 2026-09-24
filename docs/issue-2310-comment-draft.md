@@ -1,6 +1,8 @@
 # Draft comment for upstream issue #2310
 
-Status: **not posted.** Measured 2026-09-21 on `0.7.2`.
+Status: **not posted, and now moot** — the issue was closed on 2026-09-23 when
+PR #2328 merged. Kept for the measurements, which `upstream-2026-09-21.md` links.
+Measured 2026-09-21 on `0.7.2`.
 
 What it adds to the issue: the reporter measured batch 8/16/32 on a 128 GB M5
 Max and saw 64 GB against an 11 GB working set. This is the other end of the
