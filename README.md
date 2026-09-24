@@ -105,7 +105,8 @@ Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 >
 > Two things the tag does not fix: **`#2310`**, a KV-cache leak in
 > `GenerationBatch._eval_pending_state` that fires once per finished request on
-> this profile, and **`#2239`**, the intermittent hang on requests carrying a
+> this profile (measured harmless here; fixed on main by `#2328` on 09-23, not
+> yet released), and **`#2239`**, the intermittent hang on requests carrying a
 > `tools` array.
 
 0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
@@ -183,14 +184,17 @@ A profile sets *defaults* only; individual env variables still win.
 | `MODEL_ALIAS` | `Qwen3.8-27B-local` | **must** match the model name in the request |
 | `STATE_DIR` | `~/.mlx-qwen38` | log and SSD prefix cache |
 
-> **`ENABLE_SPEC_DECODE=0` costs more than the drafter's own speedup, once the
-> prefix cache hits.** Measured 2026-09-10 at 28,590 tokens, 300 decoded tokens:
-> with the drafter a warm APC hit decodes exactly as fast as a cold request
-> (ratio 1.003 over three pairs). Without it the warm hit falls to 9.6-10.3 tok/s
-> against 15.5-16.0 cold -- **-35 to -39%**. That is upstream issue `#2210`, it
-> survives reverting our own APC patches, and it makes `ENABLE_SPEC_DECODE=0` a
-> diagnostic switch rather than an operating mode. Instrument:
-> `./measure-apc-warm-decode.py`.
+> **`ENABLE_SPEC_DECODE=0` is an operating mode again since patch `0035`.**
+> Without a drafter, a warm exact-APC hit used to decode at two thirds of the
+> cold rate (upstream issue `#2210`): Qwen3.5's single-row shortcut ran
+> `extract()` + `merge()` on every full-attention cache, i.e. copied the whole
+> KV prefix on every decode token. `0035` is upstream PR `#2336`, which borrows
+> the arrays instead. Measured 2026-09-24 at 26,690 tokens, 300 decoded tokens,
+> no drafter: warm/cold **0.658 -> 0.998** (10.4-10.6 -> 16.0-16.1 tok/s), and
+> the warm-hit memory spike (26.8-30.8 GiB) is gone (20.6 GiB). Greedy output is
+> bit-identical with and without it. With the drafter nothing changes: every
+> verify pass carries `capture_layer_ids`, which skips that shortcut entirely.
+> Instrument: `./measure-apc-warm-decode.py`.
 
 On start the script prints the computed budget of this machine. The
 `CONTEXT BUDGET` line is an **upper bound, not a promise** -- the `mem` lines in
@@ -276,12 +280,13 @@ SSD tier are a precondition rather than an optimisation: measured 89,630 ms →
 
 ## Patches
 
-Seven patches against `site-packages`, applied by `patches/apply-patches.sh`
+Eight patches against `site-packages`, applied by `patches/apply-patches.sh`
 (idempotent, `--check` / `--revert`). **They vanish on every
 `pip install -U mlx-vlm`** -- run it again afterwards.
 
-All seven are now **local work**: since `0033` went on 2026-09-17 there is no
-cherry-picked foreign PR left in the set.
+Seven are **local work**. One is a cherry-picked foreign PR again: `0035` is
+upstream `#2336` and fixes `#2210` (see below). It comes out when upstream merges
+it -- `apply-patches.sh` reports `CONFLICT` then.
 
 The set shrank from eleven on 2026-08-28 when the APC redesign landed: `0021`
 became obsolete (the separate generation loop it worked around is gone) and
@@ -347,6 +352,12 @@ What changed on 2026-09-17, moving to main @ `548b09b`:
   `context_length`. It is reported, not fed into the budget arithmetic; the long
   note above `budget()` in the start script records why that was tried and
   reverted.
+
+What changed on 2026-09-24:
+
+- **`0035` added** (upstream PR `#2336`, open). Fixes `#2210` for runs without
+  a drafter; a no-op with one. See the `ENABLE_SPEC_DECODE=0` note above and
+  [docs/upstream-2026-09-24.md](docs/upstream-2026-09-24.md).
 
 What changed on 2026-09-21, moving to the `0.7.2` release:
 

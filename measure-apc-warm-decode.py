@@ -302,8 +302,8 @@ def main():
         else:
             print(
                 "  #2210 does NOT reproduce here: warm and cold decode within 10% "
-                "of each other.\n  The 0.7.0 release closed the per-token copy, or "
-                "this configuration never takes that path."
+                "of each other.\n  Either patch 0035 (upstream #2336) is applied, or "
+                "this configuration never takes that path (a drafter skips it)."
             )
     return 1 if broken else 0
 

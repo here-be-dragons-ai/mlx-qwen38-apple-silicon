@@ -609,6 +609,24 @@ paid once per pass should still surface as roughly −15 %. Nothing surfaces. Th
 speculative path apparently does not take the shortcut at all rather than taking
 it less often — untested speculation, recorded as such.
 
+**Confirmed and fixed on 2026-09-24.** The shortcut sits in
+`qwen3_5/language.py` and requires `hidden_sink is None`; every DFlash and MTP
+verify pass passes `capture_layer_ids`, so `hidden_sink` is a list and the branch
+is skipped. Without a drafter it fires on every decode token and runs
+`extract()` (contiguous copy, exactly sized, so the next `update_and_fetch`
+reallocates and concatenates) plus `merge()` (zeros + copy) on all 16
+full-attention caches. Upstream PR `#2336` borrows the arrays for an unpadded
+single-row `BatchKVCache` instead; it is carried as patch `0035`. Same
+instrument, 26,690 tokens, no drafter, 0.7.2:
+
+| | cold tok/s | warm tok/s | warm/cold | warm `mem_sum` |
+|---|---:|---:|---:|---:|
+| without `0035` | 16.02 / 15.92 | 10.42 / 10.59 | **0.658** | 30.75 / 26.80 GiB |
+| with `0035` | 16.05 / 16.12 | 16.06 / 16.04 | **0.998** | 20.58 / 20.58 GiB |
+
+That also explains the 33–35 GiB warm-arm excursions below: they were the
+per-token copies, and they go with it.
+
 **On memory this measurement says nothing usable.** Peak `sum` inside the request
 window was 23.1–25.2 GiB on the cold arms, and on the warm arms 21.5, 34.9, 33.8
 and 23.4 GiB — one high and one low sample in *both* patch arms. The spread is
