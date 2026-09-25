@@ -66,7 +66,7 @@ self-test → patches → model + drafter → `~/.mlx-qwen38/{logs,apc}`.
 Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 
 **Pinned, verified state:** `mlx 0.32.2`, `mlx-lm 0.31.3`,
-**`mlx-vlm 0.7.2`**, `transformers 5.15.1`, `numpy 2.5.2`,
+**`mlx-vlm 0.7.3`**, `transformers 5.15.1`, `numpy 2.5.2`,
 `huggingface-hub 1.27.0`, `pillow 12.3.0`, Python 3.12.
 
 > **`0.7.1` is the one release this setup cannot run.** Skip it. It carries the
@@ -85,7 +85,7 @@ Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 > plain version again:
 >
 > ```sh
-> uv pip install --python ~/src/mlx/.venv/bin/python "mlx-vlm==0.7.2"
+> uv pip install --python ~/src/mlx/.venv/bin/python "mlx-vlm==0.7.3"
 > ```
 >
 > The upgrade is administrative. Diffed against the commit that had been
@@ -105,8 +105,7 @@ Paths via env: `MLX_HOME` (default `~/src/mlx`), `MLX_MODELS`, `PYTHON_VERSION`.
 >
 > Two things the tag does not fix: **`#2310`**, a KV-cache leak in
 > `GenerationBatch._eval_pending_state` that fires once per finished request on
-> this profile (measured harmless here; fixed on main by `#2328` on 09-23, not
-> yet released), and **`#2239`**, the intermittent hang on requests carrying a
+> this profile (measured harmless here; fixed by `#2328`, released in `0.7.3`), and **`#2239`**, the intermittent hang on requests carrying a
 > `tools` array.
 
 0.6.16 removed two long-standing constraints that still hold: DFlash 2 ships
@@ -352,6 +351,16 @@ What changed on 2026-09-17, moving to main @ `548b09b`:
   `context_length`. It is reported, not fed into the budget arithmetic; the long
   note above `budget()` in the start script records why that was tried and
   reverted.
+
+What changed on 2026-09-25, moving to the `0.7.3` release:
+
+- **Nothing in the patch set.** All eight apply to `573562d` without rejects;
+  the files they touch are unchanged since `0.7.2`. The release brings `#2328`
+  (the `#2310` fix) and new models; it also raises `mlx-audio` to `>=0.5.2`.
+- Re-measured, 26,690 tokens: with DFlash 2 cold 21.6 / 22.5 t/s, warm/cold
+  0.98; without a drafter warm/cold 1.00 with `0035` and 0.655 without it, so
+  `#2210` is still upstream in `0.7.3`. Greedy output unchanged from `0.7.2`.
+  Details in [docs/upstream-2026-09-25.md](docs/upstream-2026-09-25.md).
 
 What changed on 2026-09-24:
 

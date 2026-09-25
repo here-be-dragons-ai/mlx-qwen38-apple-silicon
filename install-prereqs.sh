@@ -42,7 +42,14 @@ for a in "$@"; do
   esac
 done
 
-# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-09-21).
+# Pinned state, VERIFIED as working on an M5 Pro / macOS 26 (2026-09-25).
+#
+# 0.7.3 (2026-09-24, tagged at 573562d) over 0.7.2: for this setup it adds only
+# #2328 (the #2310 closure-cycle fix, measured harmless here). apc*.py,
+# speculative/, models/qwen3_5/, models/cache.py, server/generation.py and
+# tools/ are unchanged; all eight patches apply without rejects. It raises
+# mlx-audio to >=0.5.2 (uv moved 0.4.8 -> 0.5.6, `uv pip check` clean) and keeps
+# mlx>=0.32.2. Re-measured after the move: docs/upstream-2026-09-25.md.
 #
 # mlx-vlm is back on a PLAIN VERSION PIN. Between 2026-09-17 and 2026-09-21 it
 # was pinned to a git commit (main @ 548b09b) because the 0.7.1 tag carried
@@ -98,7 +105,7 @@ done
 PINS=(
   "mlx==0.32.2"
   "mlx-lm==0.31.3"
-  "mlx-vlm==0.7.2"
+  "mlx-vlm==0.7.3"
   "transformers==5.15.1"
   "numpy==2.5.2"
   "huggingface-hub==1.27.0"
