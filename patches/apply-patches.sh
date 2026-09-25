@@ -12,9 +12,11 @@
 #
 # venv Python via env:  MLX_VENV_PY=/path/to/.venv/bin/python ./apply-patches.sh
 #
-# STATE 2026-09-24: verified against mlx-vlm 0.7.2 (tagged at a74c7de) and
-# mlx 0.32.2. EIGHT patches: the 09-17 set plus 0035 (upstream PR #2336).
-#   - Install: uv pip install "mlx-vlm==0.7.2"  (no --no-deps any more; 0.7.2
+# STATE 2026-09-25: verified against mlx-vlm 0.7.3 (tagged at 573562d) and
+# mlx 0.32.2. EIGHT patches: the 09-17 set plus 0035 (upstream PR #2336). All
+# eight apply to 0.7.3 and to main @ ad4a3cc without rejects; the files they
+# touch did not change between 0.7.2 and 0.7.3.
+#   - Install: uv pip install "mlx-vlm==0.7.3"  (no --no-deps any more; 0.7.2
 #     declares mlx>=0.32.2, a lower bound, so the exact mlx pin survives the
 #     same resolution. Under the previous GIT pin it did not, and patch 0013
 #     fell inert when uv dropped mlx to 0.32.1.)
@@ -279,7 +281,12 @@
 #   Carried because it makes ENABLE_SPEC_DECODE=0 (rollback, and the only way
 #   to use response_format / thinking_budget) usable at long context.
 #   Test files of the PR are stripped (tests are not installed).
-#   Remove when upstream merges it.
+#   Remove when upstream merges it -- OR when #2356 lands instead: that PR
+#   fixes the same exact-hit case one level up (APCCoordinator.merge_rows
+#   returns a lone restored row's own cache, so the shortcut is never
+#   entered). Measured 2026-09-25 on 0.7.3, #2356 alone: warm/cold 1.001, same
+#   as 0035. 0035 is kept over it because it also covers a batch that SHRINKS
+#   to one row, which #2356 does not.
 #
 # 0030-pr1956-speculative-quantized-kv.patch   (PR #1956, @Codcore, open)
 #   "Fix speculative decoding against a quantized KV cache".
