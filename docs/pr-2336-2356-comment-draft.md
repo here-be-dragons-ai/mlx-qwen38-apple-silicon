@@ -1,11 +1,10 @@
 # Draft comments for upstream PRs #2336 and #2356
 
-Status: **not posted.** Measured 2026-09-24 (0.7.2) and 2026-09-25 (0.7.3).
-Both PRs ask for independent measurements; these are from a different machine
-and a real 27B checkpoint. Post the first under
-https://github.com/Blaizzy/mlx-vlm/pull/2336 and the second under
-https://github.com/Blaizzy/mlx-vlm/pull/2356, or merge them into one comment on
-`#2210` that links both.
+Status: **posted 2026-09-26** as gtonic, verbatim from the sections below:
+- #2336: https://github.com/Blaizzy/mlx-vlm/pull/2336#issuecomment-5846397310
+- #2356: https://github.com/Blaizzy/mlx-vlm/pull/2356#issuecomment-5846397461
+
+Measured 2026-09-24 (0.7.2) and 2026-09-25 (0.7.3).
 
 ---
 
